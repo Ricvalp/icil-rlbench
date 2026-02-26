@@ -296,6 +296,44 @@ def _plot_denoising_trace_3d(
     return fig
 
 
+def _plot_target_trajectory_3d(target: torch.Tensor, max_items: int = 4) -> Optional[Any]:
+    try:
+        import matplotlib.pyplot as plt
+    except ImportError:
+        return None
+
+    gt = target.detach().float().cpu().numpy()
+    if gt.ndim != 3:
+        return None
+
+    B, H, A = gt.shape
+    n = int(max(1, min(B, max_items)))
+    cols = min(4, n)
+    rows = (n + cols - 1) // cols
+    fig = plt.figure(figsize=(5 * cols, 4 * rows))
+
+    def _xyz(arr: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        x = arr[:, 0] if A >= 1 else np.zeros((H,), dtype=np.float32)
+        y = arr[:, 1] if A >= 2 else np.zeros((H,), dtype=np.float32)
+        z = arr[:, 2] if A >= 3 else np.zeros((H,), dtype=np.float32)
+        return x, y, z
+
+    for i in range(n):
+        ax = fig.add_subplot(rows, cols, i + 1, projection="3d")
+        gx, gy, gz = _xyz(gt[i])
+        ax.plot(gx, gy, gz, color="tab:green", linewidth=2.0, label="target")
+        ax.scatter(gx[0], gy[0], gz[0], color="tab:green", s=18)
+        ax.set_title(f"sample {i}")
+        if i == 0:
+            ax.legend(loc="upper right")
+        ax.set_xlabel("x")
+        ax.set_ylabel("y")
+        ax.set_zlabel("z")
+
+    fig.tight_layout()
+    return fig
+
+
 def train(cfg: ConfigDict) -> None:
     seed = int(cfg.seed)
     _set_seed(seed)
@@ -598,19 +636,25 @@ def train(cfg: ConfigDict) -> None:
                         denoise_trace["timesteps"],
                         max_items=max(1, min(2, wandb_sample_batch)),
                     )
+                fig_target = _plot_target_trajectory_3d(
+                    batch["target_action"],
+                    max_items=wandb_sample_batch,
+                )
                 log_dict: Dict[str, Any] = {
                     "samples/x0_mse": sample_mse,
                     "train/step": step,
                 }
-                if fig is not None or fig_trace is not None:
+                if fig is not None or fig_trace is not None or fig_target is not None:
                     import wandb
 
                     if fig is not None:
                         log_dict["samples/x0_pred_vs_gt_3d"] = wandb.Image(fig)
                     if fig_trace is not None:
                         log_dict["samples/x0_denoising_trace_3d"] = wandb.Image(fig_trace)
+                    if fig_target is not None:
+                        log_dict["samples/target_trajectory_3d"] = wandb.Image(fig_target)
                 wandb_run.log(log_dict, step=step)
-                if fig is not None or fig_trace is not None:
+                if fig is not None or fig_trace is not None or fig_target is not None:
                     try:
                         import matplotlib.pyplot as plt
 
@@ -618,6 +662,8 @@ def train(cfg: ConfigDict) -> None:
                             plt.close(fig)
                         if fig_trace is not None:
                             plt.close(fig_trace)
+                        if fig_target is not None:
+                            plt.close(fig_target)
                     except Exception:
                         pass
 
