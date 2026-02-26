@@ -1,0 +1,85 @@
+# ICIL Perceiver Pretraining
+
+Minimal repo for pretraining and profiling the ICIL Perceiver encoder-decoder diffusion policy from an already cached dense dataset.
+
+## Included Components
+- `icil/pretrain_perceiver_encoder_decoder.py`
+- `icil/profile_pretrain_perceiver_encoder_decoder.py`
+- `icil/inspect_icil_pretrain_cached_dataset.py`
+- `icil/models/perceiver_encoder_decoder.py`
+- `icil/datasets/in_context_imitation_learning/`
+- `configs/pretrain_perceiver_encoder_decoder.py`
+- `configs/profile_pretrain_perceiver_encoder_decoder.py`
+- `env.sh`
+
+## Setup (Pretraining Only)
+```bash
+conda activate icil-rlbench
+cd icil-rlbench
+pip install -e .
+source env.sh
+```
+
+`setup.py` now installs only pretraining dependencies:
+- `numpy`
+- `torch`
+- `absl-py`
+- `ml-collections`
+- `h5py`
+
+Optional extras:
+```bash
+# wandb logging + sample plots
+pip install -e ".[wandb]"
+
+# dataset inspection script
+pip install -e ".[inspect]"
+
+# profiling script progress bars
+pip install -e ".[profile]"
+```
+
+## Pretrain
+```bash
+python -m icil.pretrain_perceiver_encoder_decoder \
+  --config=configs/pretrain_perceiver_encoder_decoder.py
+```
+
+Smoke test:
+```bash
+python -m icil.pretrain_perceiver_encoder_decoder \
+  --config=configs/pretrain_perceiver_encoder_decoder.py \
+  --config.device=cpu \
+  --config.train.num_steps=1 \
+  --config.train.batch_size=1
+```
+
+## Profile (Perfetto JSON)
+```bash
+python -m icil.profile_pretrain_perceiver_encoder_decoder \
+  --train_config=configs/pretrain_perceiver_encoder_decoder.py \
+  --profile_config=configs/profile_pretrain_perceiver_encoder_decoder.py
+```
+
+Trace output path is controlled by:
+- `ICIL_PROFILE_TRACE_DIR`
+- `ICIL_PRETRAIN_PROFILE_TRACE_FILE`
+
+## Inspect Cached Batches
+```bash
+python -m icil.inspect_icil_pretrain_cached_dataset \
+  --cache-root /mnt/external_storage/robotics/rlbench/icil_rlbench/.rlbench_cache_dense \
+  --output-dir inspect_cached_dataset \
+  --num-batches 3 \
+  --batch-size 2 \
+  --samples-per-batch 2 \
+  --num-workers 0 \
+  --H 64 \
+  --stride 3
+```
+
+## Legacy Full RLBench Setup
+The previous full RLBench/PyRep setup file is kept at:
+- `legacy/setup_rlbench_full.py`
+
+Use it only if you want to restore raw RLBench generation/caching workflows.

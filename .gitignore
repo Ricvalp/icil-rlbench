@@ -1,0 +1,92 @@
+# RLBench
+
+urdfs/
+rlbench/
+
+# Python cache and bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+
+# C extensions
+*.so
+
+# Distribution / packaging
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual environments
+.env
+.venv
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+pip-wheel-metadata/
+
+# Testing and coverage
+.pytest_cache/
+nosetests.xml
+coverage.xml
+*.cover
+*.py,cover
+.coverage
+.coverage.*
+.cache
+
+# Type checkers
+.mypy_cache/
+.dmypy.json
+dmypy.json
+.pyre/
+.pytype/
+
+# Notebook state
+.ipynb_checkpoints/
+
+# Logs and experiment artifacts
+logs/
+wandb/
+mlruns/
+checkpoints/
+runs/
+*.log
+*.out
+*.err
+*.pkl
+*.npy
+*.npz
+*.h5
+*.pt
+*.pth
+*.ckpt
+*.onnx
+
+# IDE/editor settings
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS-generated files
+.DS_Store
+Thumbs.db
+
+
+output*
