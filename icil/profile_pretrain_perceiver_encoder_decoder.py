@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+import json
 import os
 import random
 from pathlib import Path
@@ -159,6 +160,59 @@ def _build_profiler_activities(device: torch.device, profile_cfg: ConfigDict) ->
     return activities
 
 
+def _render_memory_timeline_png(memory_json_path: Path, output_png_path: Path) -> None:
+    """
+    Render torch profiler memory timeline JSON ([times, sizes]) to a PNG.
+    """
+    try:
+        import matplotlib.pyplot as plt
+    except ImportError as exc:
+        raise RuntimeError("matplotlib is required to render memory timeline PNG.") from exc
+
+    with memory_json_path.open("r", encoding="utf-8") as file:
+        payload = json.load(file)
+
+    if not isinstance(payload, list) or len(payload) != 2:
+        raise ValueError("Unexpected memory timeline JSON format; expected [times, sizes].")
+
+    times = np.asarray(payload[0], dtype=np.float64)
+    sizes = np.asarray(payload[1], dtype=np.float64)
+    if times.ndim != 1 or sizes.ndim != 2:
+        raise ValueError("Invalid memory timeline shapes; expected times[1D], sizes[2D].")
+    if sizes.shape[0] != times.shape[0]:
+        raise ValueError("Mismatched memory timeline lengths between times and sizes.")
+    if times.shape[0] == 0 or sizes.shape[1] < 2:
+        raise ValueError("Memory timeline is empty or missing category columns.")
+
+    # Timestamps are in microseconds in torch profiler memory timeline.
+    times_ms = (times - times[0]) / 1e3
+    sizes_gib = sizes / float(1024 ** 3)
+
+    # sizes[:,0] is baseline; categories start at column 1.
+    labels = [
+        "PARAMETER",
+        "OPTIMIZER_STATE",
+        "INPUT",
+        "TEMPORARY",
+        "ACTIVATION",
+        "GRADIENT",
+        "AUTOGRAD_DETAIL",
+        "UNKNOWN",
+    ]
+    n_categories = min(len(labels), int(sizes_gib.shape[1] - 1))
+    layers = [sizes_gib[:, idx + 1] for idx in range(n_categories)]
+
+    fig = plt.figure(figsize=(14, 6), dpi=120)
+    plt.stackplot(times_ms, *layers, labels=labels[:n_categories], alpha=0.85)
+    plt.xlabel("Time (ms)")
+    plt.ylabel("Memory (GiB)")
+    plt.title(memory_json_path.name)
+    plt.legend(loc="upper left", ncol=4, fontsize=8)
+    plt.tight_layout()
+    fig.savefig(output_png_path)
+    plt.close(fig)
+
+
 def profile_train(train_cfg: ConfigDict, profile_cfg: ConfigDict) -> Path:
     seed = int(train_cfg.seed)
     _set_seed(seed)
@@ -313,9 +367,12 @@ def profile_train(train_cfg: ConfigDict, profile_cfg: ConfigDict) -> Path:
         # does not prevent JSON export or fail the profiling run.
         memory_json_path = trace_path.with_suffix(".memory.json")
         memory_html_path = trace_path.with_suffix(".memory.html")
+        memory_png_path = trace_path.with_suffix(".memory.png")
+        memory_json_exported = False
 
         try:
             prof.export_memory_timeline(str(memory_json_path), device=memory_device)
+            memory_json_exported = True
         except Exception as exc:  # pragma: no cover - best-effort artifact export
             print(f"[profile] warning: failed to export memory JSON timeline: {exc}")
 
@@ -323,6 +380,12 @@ def profile_train(train_cfg: ConfigDict, profile_cfg: ConfigDict) -> Path:
             prof.export_memory_timeline(str(memory_html_path), device=memory_device)
         except Exception as exc:  # pragma: no cover - best-effort artifact export
             print(f"[profile] warning: failed to export memory HTML timeline: {exc}")
+
+        if memory_json_exported:
+            try:
+                _render_memory_timeline_png(memory_json_path, memory_png_path)
+            except Exception as exc:  # pragma: no cover - best-effort artifact export
+                print(f"[profile] warning: failed to render memory PNG timeline: {exc}")
 
         return trace_path
     finally:
