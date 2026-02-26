@@ -309,19 +309,21 @@ def profile_train(train_cfg: ConfigDict, profile_cfg: ConfigDict) -> Path:
             else "cpu"
         )
         # Optional memory timeline artifacts (viewable separately from Perfetto).
-        # Keep best-effort so profiling still succeeds if unavailable in the local
-        # PyTorch build/runtime.
+        # Export JSON and HTML independently so an HTML backend/runtime issue
+        # does not prevent JSON export or fail the profiling run.
+        memory_json_path = trace_path.with_suffix(".memory.json")
+        memory_html_path = trace_path.with_suffix(".memory.html")
+
         try:
-            prof.export_memory_timeline(
-                str(trace_path.with_suffix(".memory.html")),
-                device=memory_device,
-            )
-            prof.export_memory_timeline(
-                str(trace_path.with_suffix(".memory.json")),
-                device=memory_device,
-            )
-        except Exception:
-            pass
+            prof.export_memory_timeline(str(memory_json_path), device=memory_device)
+        except Exception as exc:  # pragma: no cover - best-effort artifact export
+            print(f"[profile] warning: failed to export memory JSON timeline: {exc}")
+
+        try:
+            prof.export_memory_timeline(str(memory_html_path), device=memory_device)
+        except Exception as exc:  # pragma: no cover - best-effort artifact export
+            print(f"[profile] warning: failed to export memory HTML timeline: {exc}")
+
         return trace_path
     finally:
         store.close()
