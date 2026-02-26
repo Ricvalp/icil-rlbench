@@ -202,7 +202,16 @@ def _resolve_run_id(wandb_run: Optional[Any]) -> str:
     return time.strftime("local-%Y%m%d-%H%M%S")
 
 
-def _plot_pred_vs_gt_3d(pred_x0: torch.Tensor, gt_x0: torch.Tensor, max_items: int = 4) -> Optional[Any]:
+def _plot_pred_vs_gt_3d(
+    pred_x0: torch.Tensor,
+    gt_x0: torch.Tensor,
+    max_items: int = 4,
+    *,
+    include_query_pointcloud: bool = False,
+    query_xyz: Optional[torch.Tensor] = None,
+    query_valid: Optional[torch.Tensor] = None,
+    max_query_points: int = 2048,
+) -> Optional[Any]:
     try:
         import matplotlib.pyplot as plt
     except ImportError:
@@ -212,6 +221,8 @@ def _plot_pred_vs_gt_3d(pred_x0: torch.Tensor, gt_x0: torch.Tensor, max_items: i
     gt = gt_x0.detach().float().cpu().numpy()
     if pred.ndim != 3 or gt.ndim != 3:
         return None
+    qxyz = query_xyz.detach().float().cpu().numpy() if query_xyz is not None else None
+    qvalid = query_valid.detach().bool().cpu().numpy() if query_valid is not None else None
 
     B, H, A = pred.shape
     n = int(max(1, min(B, max_items)))
@@ -227,6 +238,35 @@ def _plot_pred_vs_gt_3d(pred_x0: torch.Tensor, gt_x0: torch.Tensor, max_items: i
 
     for i in range(n):
         ax = fig.add_subplot(rows, cols, i + 1, projection="3d")
+        if include_query_pointcloud and qxyz is not None:
+            # Use last observed query frame as environment context.
+            if qxyz.ndim == 4:  # [B, T_obs, N, 3]
+                pts = qxyz[i, -1]
+                mask = qvalid[i, -1] if (qvalid is not None and qvalid.ndim == 3) else np.ones((pts.shape[0],), dtype=bool)
+            elif qxyz.ndim == 3:  # [B, N, 3]
+                pts = qxyz[i]
+                mask = qvalid[i] if (qvalid is not None and qvalid.ndim == 2) else np.ones((pts.shape[0],), dtype=bool)
+            else:
+                pts = None
+                mask = None
+            if pts is not None:
+                pts = pts[mask]
+                if pts.shape[0] > 0:
+                    pts = pts[np.isfinite(pts).all(axis=1)]
+                if pts.shape[0] > int(max_query_points) and int(max_query_points) > 0:
+                    idx = np.linspace(0, pts.shape[0] - 1, int(max_query_points), dtype=np.int64)
+                    pts = pts[idx]
+                if pts.shape[0] > 0:
+                    ax.scatter(
+                        pts[:, 0],
+                        pts[:, 1],
+                        pts[:, 2],
+                        color="lightgray",
+                        s=1.5,
+                        alpha=0.35,
+                        label="query_pc" if i == 0 else None,
+                    )
+
         gx, gy, gz = _xyz(gt[i])
         px, py, pz = _xyz(pred[i])
         ax.plot(gx, gy, gz, color="tab:green", linewidth=2.0, label="gt")
@@ -457,6 +497,16 @@ def train(cfg: ConfigDict) -> None:
         wandb_sample_eta = float(getattr(cfg.wandb, "sample_eta", 0.0)) if wandb_run is not None else 0.0
         wandb_sample_clip_x0 = float(getattr(cfg.wandb, "sample_clip_x0", 0.0)) if wandb_run is not None else 0.0
         wandb_sample_trace_frames = int(getattr(cfg.wandb, "sample_trace_frames", 8)) if wandb_run is not None else 0
+        wandb_include_query_pc = (
+            _as_bool(getattr(cfg.wandb, "include_query_pointcloud_in_x0_pred_vs_gt_3d", False))
+            if wandb_run is not None
+            else False
+        )
+        wandb_query_pc_max_points = (
+            int(getattr(cfg.wandb, "query_pointcloud_max_points", 2048))
+            if wandb_run is not None
+            else 2048
+        )
 
         step = 0
         resume_path = str(cfg.train.resume_path) if cfg.train.resume_path is not None else ""
@@ -590,6 +640,10 @@ def train(cfg: ConfigDict) -> None:
                     pred_x0=pred_x0,
                     gt_x0=batch["target_action"],
                     max_items=wandb_sample_batch,
+                    include_query_pointcloud=wandb_include_query_pc,
+                    query_xyz=batch.get("query_xyz", None),
+                    query_valid=batch.get("query_valid", None),
+                    max_query_points=wandb_query_pc_max_points,
                 )
                 fig_trace = None
                 if denoise_trace is not None:
