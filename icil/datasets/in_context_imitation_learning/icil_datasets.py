@@ -121,10 +121,10 @@ class ICILSamplerCore:
         # Causal alignment:
         # obs_idx uses stride spacing:
         #   obs_idx = t0 + [0, stride, ..., (T_obs-1)*stride]
-        # act_idx starts at the last observed step and also uses stride:
-        #   act_idx = obs_idx[-1] + [0, stride, ..., (H-1)*stride]
-        # required raw timesteps = 1 + ((T_obs + H - 2) * stride)
-        required = 1 + ((self.cfg.T_obs + self.cfg.H - 2) * self.cfg.stride)
+        # act_idx starts strictly AFTER the last observed step:
+        #   act_idx = obs_idx[-1] + stride * [1, 2, ..., H]
+        # required raw timesteps = 1 + ((T_obs + H - 1) * stride)
+        required = 1 + ((self.cfg.T_obs + self.cfg.H - 1) * self.cfg.stride)
         max_t0 = T - required
         if max_t0 < 0:
             return None
@@ -133,7 +133,7 @@ class ICILSamplerCore:
     def _build_obs_act_indices(self, t0: int) -> Tuple[np.ndarray, np.ndarray]:
         cfg = self.cfg
         obs_idx = t0 + np.arange(0, cfg.T_obs * cfg.stride, cfg.stride, dtype=np.int64)
-        act_start = int(obs_idx[-1])
+        act_start = int(obs_idx[-1] + cfg.stride)
         act_idx = act_start + np.arange(0, cfg.H * cfg.stride, cfg.stride, dtype=np.int64)
         return obs_idx, act_idx
 
