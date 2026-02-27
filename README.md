@@ -83,3 +83,27 @@ The previous full RLBench/PyRep setup file is kept at:
 - `legacy/setup_rlbench_full.py`
 
 Use it only if you want to restore raw RLBench generation/caching workflows.
+
+## Optional: Headless RLBench Generation (Known Working Command)
+If you need to regenerate raw RLBench data on a headless machine, the following command has been verified to work:
+
+```bash
+conda activate icil-rlbench
+
+PYTHONUNBUFFERED=1 \
+COPPELIASIM_ROOT="$HOME/CoppeliaSim" \
+LD_LIBRARY_PATH="$HOME/CoppeliaSim:${LD_LIBRARY_PATH:-}" \
+QT_QPA_PLATFORM_PLUGIN_PATH="$HOME/CoppeliaSim" \
+QT_QPA_PLATFORM=xcb \
+DISPLAY=:99 \
+python -u -m rlbench.dataset_generator_pc \
+  --save_path /mnt/external_storage/robotics/rlbench/icil_rlbench \
+  --episodes_per_task 15 \
+  --variations 15 \
+  --image_size 128 128 \
+  --renderer opengl \
+  --processes 4 \
+  --tasks beat_the_buzz change_channel ...
+```
+
+If your CoppeliaSim installation is not at `$HOME/CoppeliaSim`, replace that path in the command.
