@@ -116,11 +116,33 @@ def _infer_dims(store: VariationStore) -> Tuple[int, int]:
     raise RuntimeError("Could not infer state/action dims from cache (no non-empty episodes found).")
 
 
-def _build_model_cfg(cfg: ConfigDict) -> DP3Config:
+def _build_model_cfg(cfg: ConfigDict, dataset_cfg: ICILConfig) -> DP3Config:
+    # Keep model temporal settings aligned with dataset slicing.
+    horizon = int(dataset_cfg.H)
+    n_action_steps = int(dataset_cfg.H)
+    n_obs_steps = int(dataset_cfg.T_obs)
+    if int(cfg.horizon) != horizon:
+        logging.warning(
+            "Overriding cfg.model.horizon=%d to dataset.H=%d for consistency.",
+            int(cfg.horizon),
+            horizon,
+        )
+    if int(cfg.n_action_steps) != n_action_steps:
+        logging.warning(
+            "Overriding cfg.model.n_action_steps=%d to dataset.H=%d for consistency.",
+            int(cfg.n_action_steps),
+            n_action_steps,
+        )
+    if int(cfg.n_obs_steps) != n_obs_steps:
+        logging.warning(
+            "Overriding cfg.model.n_obs_steps=%d to dataset.T_obs=%d for consistency.",
+            int(cfg.n_obs_steps),
+            n_obs_steps,
+        )
     return DP3Config(
-        horizon=int(cfg.horizon),
-        n_action_steps=int(cfg.n_action_steps),
-        n_obs_steps=int(cfg.n_obs_steps),
+        horizon=horizon,
+        n_action_steps=n_action_steps,
+        n_obs_steps=n_obs_steps,
         scheduler_type=str(cfg.scheduler_type),
         num_train_timesteps=int(cfg.num_train_timesteps),
         beta_start=float(cfg.beta_start),
@@ -463,7 +485,7 @@ def train(cfg: ConfigDict) -> None:
         )
 
         model = DP3Policy(
-            cfg=_build_model_cfg(cfg.model),
+            cfg=_build_model_cfg(cfg.model, dataset_cfg),
             state_dim=state_dim,
             action_dim=action_dim,
         ).to(device)

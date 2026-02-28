@@ -78,6 +78,43 @@ python -m icil.inspect_icil_pretrain_cached_dataset \
   --stride 3
 ```
 
+## Evaluate in Simulation (Perceiver and DP3)
+### Perceiver policy
+```bash
+PYTHONUNBUFFERED=1 \
+COPPELIASIM_ROOT="$HOME/CoppeliaSim" \
+LD_LIBRARY_PATH="$HOME/CoppeliaSim:${LD_LIBRARY_PATH:-}" \
+QT_QPA_PLATFORM_PLUGIN_PATH="$HOME/CoppeliaSim" \
+QT_QPA_PLATFORM=xcb \
+DISPLAY=:99 \
+python -u -m icil.eval.eval_single_task_perceiver \
+  --config=configs/eval_single_task_perceiver.py \
+  --config.checkpoint_path=/path/to/perceiver_checkpoint.pt \
+  --config.task.name=put_item_in_drawer \
+  --config.task.variation=0 \
+  --config.task.num_eval_episodes=10 \
+  --config.sim.headless=True
+```
+
+### DP3 policy
+```bash
+PYTHONUNBUFFERED=1 \
+COPPELIASIM_ROOT="$HOME/CoppeliaSim" \
+LD_LIBRARY_PATH="$HOME/CoppeliaSim:${LD_LIBRARY_PATH:-}" \
+QT_QPA_PLATFORM_PLUGIN_PATH="$HOME/CoppeliaSim" \
+QT_QPA_PLATFORM=xcb \
+DISPLAY=:99 \
+python -u -m icil.eval.eval_single_task_dp3 \
+  --config=configs/eval_single_task_dp3.py \
+  --config.checkpoint_path=/path/to/dp3_checkpoint.pt \
+  --config.task.name=put_item_in_drawer \
+  --config.task.variation=0 \
+  --config.task.num_eval_episodes=10 \
+  --config.sim.headless=True
+```
+
+If your CoppeliaSim installation is not at `$HOME/CoppeliaSim`, replace that path in the commands.
+
 ## Legacy Full RLBench Setup
 The previous full RLBench/PyRep setup file is kept at:
 - `legacy/setup_rlbench_full.py`

@@ -31,7 +31,7 @@ from icil.models.perceiver_encoder_decoder import (
 
 _CONFIG = config_flags.DEFINE_config_file(
     "config",
-    default="configs/eval_single_task_policy.py",
+    default="configs/eval_single_task_perceiver.py",
     help_string="Path to ml_collections config file.",
 )
 

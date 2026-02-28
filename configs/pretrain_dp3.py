@@ -38,6 +38,8 @@ def get_config():
     cfg.dataset.num_tries_per_item = 100
 
     cfg.model = ConfigDict()
+    # Temporal fields below are kept in sync at runtime by icil/pretrain_dp3.py:
+    # horizon <- dataset.H, n_action_steps <- dataset.H, n_obs_steps <- dataset.T_obs
     cfg.model.horizon = 8
     cfg.model.n_action_steps = 8
     cfg.model.n_obs_steps = 2
@@ -103,11 +105,11 @@ def get_config():
     cfg.wandb.tags = ()
     cfg.wandb.n_loss_steps = 20
     cfg.wandb.n_sample_steps = 200
-    cfg.wandb.sample_batch_items = 4
+    cfg.wandb.sample_batch_items = 16
     cfg.wandb.sample_inference_steps = 50
     cfg.wandb.sample_trace_frames = 8
     cfg.wandb.sample_eta = 0.0
-    cfg.wandb.sample_clip_x0 = 1.0
+    cfg.wandb.sample_clip_x0 = 10.0
     cfg.wandb.include_query_pointcloud_in_x0_pred_vs_gt_3d = False
     cfg.wandb.query_pointcloud_max_points = 4096
 
