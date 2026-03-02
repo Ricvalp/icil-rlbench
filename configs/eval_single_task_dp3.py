@@ -14,7 +14,7 @@ def get_config():
     cfg.task.name = "put_item_in_drawer"
     cfg.task.variation = 0
     cfg.task.num_eval_episodes = 10
-    cfg.task.max_env_steps = 120
+    cfg.task.max_env_steps = 220
 
     cfg.dataset = ConfigDict()
     # If True, these values are read from checkpoint["config"]["dataset"].
@@ -47,7 +47,11 @@ def get_config():
     cfg.inference = ConfigDict()
     cfg.inference.inference_steps = 100
     cfg.inference.eta = 0.0
-    cfg.inference.clip_x0 = 1.0
+    # Scheduler clipping during denoising (independent from checkpoint config).
+    cfg.inference.clip_sample = False
+    cfg.inference.scheduler_clip_sample_range = 10.0
+    # Final action clamp after denoising.
+    cfg.inference.clip_x0 = 10.0
 
     cfg.video = ConfigDict()
     cfg.video.enable = True

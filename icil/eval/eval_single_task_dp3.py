@@ -649,6 +649,18 @@ def evaluate(cfg: ConfigDict) -> None:
     model.load_state_dict(state_dict, strict=True)
     model.eval()
 
+    # Eval-time scheduler clipping is driven by eval config (not checkpoint model config).
+    sched_clip_sample = bool(cfg.inference.clip_sample)
+    sched_clip_range = float(cfg.inference.scheduler_clip_sample_range)
+    if hasattr(model.noise_scheduler, "register_to_config"):
+        model.noise_scheduler.register_to_config(
+            clip_sample=sched_clip_sample,
+            clip_sample_range=sched_clip_range,
+        )
+    else:  # pragma: no cover - defensive for unexpected scheduler implementations
+        model.noise_scheduler.config.clip_sample = sched_clip_sample
+        model.noise_scheduler.config.clip_sample_range = sched_clip_range
+
     if action_dim != 8:
         raise ValueError(
             f"Current eval pipeline expects action_dim=8 (gripper_pose[7] + gripper_open[1]), got {action_dim}."
@@ -665,6 +677,11 @@ def evaluate(cfg: ConfigDict) -> None:
 
     logging.info("Loading task='%s' variation=%d", task_name, variation)
     logging.info("Checkpoint=%s", checkpoint_path)
+    logging.info(
+        "Scheduler clipping (eval config): clip_sample=%s | clip_sample_range=%.6f",
+        sched_clip_sample,
+        sched_clip_range,
+    )
     logging.info(
         "Dataset cfg: K=%d L=%d T_obs=%d H=%d stride=%d",
         dataset_cfg.K,

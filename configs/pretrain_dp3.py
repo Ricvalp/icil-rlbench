@@ -109,7 +109,7 @@ def get_config():
     cfg.wandb.sample_inference_steps = 50
     cfg.wandb.sample_trace_frames = 8
     cfg.wandb.sample_eta = 0.0
-    cfg.wandb.sample_clip_x0 = 10.0
+    cfg.wandb.sample_clip_x0 = 1.0
     cfg.wandb.include_query_pointcloud_in_x0_pred_vs_gt_3d = False
     cfg.wandb.query_pointcloud_max_points = 4096
 
