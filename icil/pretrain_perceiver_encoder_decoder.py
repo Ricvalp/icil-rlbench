@@ -61,6 +61,15 @@ def _unwrap_batch(batch_list: List[Dict[str, Any]]) -> Dict[str, Any]:
     return batch_list[0]
 
 
+def _drop_mask_ids_if_disabled(batch: Dict[str, Any], use_mask_id: bool) -> Dict[str, Any]:
+    if use_mask_id:
+        return batch
+    out = dict(batch)
+    out.pop("cond_mask_id", None)
+    out.pop("query_mask_id", None)
+    return out
+
+
 def _discover_cached_tasks(cache_root: Path) -> List[str]:
     tasks: List[str] = []
     if not cache_root.is_dir():
@@ -127,10 +136,12 @@ def _build_model_cfg(cfg: ConfigDict) -> ModelConfig:
         frame_tokenizer_layers=int(cfg.frame_tokenizer_layers),
         M_demo_latents=int(cfg.M_demo_latents),
         demo_perceiver_layers=int(cfg.demo_perceiver_layers),
+        ignore_demos=_as_bool(getattr(cfg, "ignore_demos", False)),
         denoiser_layers=int(cfg.denoiser_layers),
         denoiser_mlp_mult=int(cfg.denoiser_mlp_mult),
         dropout=float(cfg.dropout),
         mask_hash_buckets=int(cfg.mask_hash_buckets),
+        use_mask_id=_as_bool(getattr(cfg, "use_mask_id", True)),
         role_embed_max_K=int(cfg.role_embed_max_K),
         role_embed_max_L=int(cfg.role_embed_max_L),
         role_embed_max_Tobs=int(cfg.role_embed_max_Tobs),
@@ -507,6 +518,7 @@ def train(cfg: ConfigDict) -> None:
             if wandb_run is not None
             else 2048
         )
+        use_mask_id = _as_bool(getattr(cfg.model, "use_mask_id", True))
 
         step = 0
         resume_path = str(cfg.train.resume_path) if cfg.train.resume_path is not None else ""
@@ -537,8 +549,9 @@ def train(cfg: ConfigDict) -> None:
                 break
 
             batch = _to_device(batch, device)
+            model_batch = _drop_mask_ids_if_disabled(batch, use_mask_id)
             with torch.autocast(device_type=device.type, enabled=use_amp):
-                out = model.forward_loss(batch)
+                out = model.forward_loss(model_batch)
                 loss = out["loss"] / grad_accum
 
             scaler.scale(loss).backward()
@@ -616,8 +629,8 @@ def train(cfg: ConfigDict) -> None:
                         action_horizon=int(batch["target_action"].shape[1]),
                         cond_rgb=batch.get("cond_rgb", None),
                         query_rgb=batch.get("query_rgb", None),
-                        cond_mask_id=batch.get("cond_mask_id", None),
-                        query_mask_id=batch.get("query_mask_id", None),
+                        cond_mask_id=(batch.get("cond_mask_id", None) if use_mask_id else None),
+                        query_mask_id=(batch.get("query_mask_id", None) if use_mask_id else None),
                         cond_valid=batch.get("cond_valid", None),
                         query_valid=batch.get("query_valid", None),
                         inference_steps=(

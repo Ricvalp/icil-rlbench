@@ -24,10 +24,16 @@ def get_config():
     cfg.dataset.T_obs = 2
     cfg.dataset.H = 16
     cfg.dataset.stride = 2
+    # Controls how query windows are built from eval history:
+    # - "dataset": use dataset stride spacing (default)
+    # - "consecutive": use adjacent history frames (no extra striding)
+    cfg.dataset.query_stride_mode = "consecutive"
 
     cfg.conditioning = ConfigDict()
     cfg.conditioning.regenerate_demos_each_episode = False
     cfg.conditioning.use_rgb = True
+    # Fallback for old checkpoints that do not store model.use_mask_id.
+    # New checkpoints use checkpoint["config"]["model"]["use_mask_id"].
     cfg.conditioning.use_mask_id = True
     cfg.conditioning.num_points = 4096
 
@@ -40,14 +46,14 @@ def get_config():
     cfg.sim.collision_checking = False
 
     cfg.control = ConfigDict()
-    cfg.control.execute_actions_per_plan = 8
+    cfg.control.execute_actions_per_plan = 2
     cfg.control.normalize_quaternion = True
     cfg.control.discretize_gripper = True
 
     cfg.inference = ConfigDict()
     cfg.inference.inference_steps = 100
     cfg.inference.eta = 0.0
-    cfg.inference.clip_x0 = 1.0
+    cfg.inference.clip_x0 = 10.0
 
     cfg.video = ConfigDict()
     cfg.video.enable = True

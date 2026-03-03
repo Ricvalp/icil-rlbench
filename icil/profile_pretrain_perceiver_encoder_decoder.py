@@ -68,6 +68,15 @@ def _unwrap_batch(batch_list: List[Dict[str, Any]]) -> Dict[str, Any]:
     return batch_list[0]
 
 
+def _drop_mask_ids_if_disabled(batch: Dict[str, Any], use_mask_id: bool) -> Dict[str, Any]:
+    if use_mask_id:
+        return batch
+    out = dict(batch)
+    out.pop("cond_mask_id", None)
+    out.pop("query_mask_id", None)
+    return out
+
+
 def _discover_cached_tasks(cache_root: Path) -> List[str]:
     tasks: List[str] = []
     if not cache_root.is_dir():
@@ -134,10 +143,12 @@ def _build_model_cfg(cfg: ConfigDict) -> ModelConfig:
         frame_tokenizer_layers=int(cfg.frame_tokenizer_layers),
         M_demo_latents=int(cfg.M_demo_latents),
         demo_perceiver_layers=int(cfg.demo_perceiver_layers),
+        ignore_demos=_as_bool(getattr(cfg, "ignore_demos", False)),
         denoiser_layers=int(cfg.denoiser_layers),
         denoiser_mlp_mult=int(cfg.denoiser_mlp_mult),
         dropout=float(cfg.dropout),
         mask_hash_buckets=int(cfg.mask_hash_buckets),
+        use_mask_id=_as_bool(getattr(cfg, "use_mask_id", True)),
         role_embed_max_K=int(cfg.role_embed_max_K),
         role_embed_max_L=int(cfg.role_embed_max_L),
         role_embed_max_Tobs=int(cfg.role_embed_max_Tobs),
@@ -295,6 +306,7 @@ def profile_train(train_cfg: ConfigDict, profile_cfg: ConfigDict) -> Path:
         except Exception:
             scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
         grad_clip_norm = float(train_cfg.train.grad_clip_norm)
+        use_mask_id = _as_bool(getattr(train_cfg.model, "use_mask_id", True))
 
         model.train()
         optimizer.zero_grad(set_to_none=True)
@@ -329,10 +341,11 @@ def profile_train(train_cfg: ConfigDict, profile_cfg: ConfigDict) -> Path:
 
                     with record_function("batch.to_device"):
                         batch = _to_device(batch, device)
+                        model_batch = _drop_mask_ids_if_disabled(batch, use_mask_id)
 
                     with record_function("train.forward"):
                         with torch.autocast(device_type=device.type, enabled=use_amp):
-                            out = model.forward_loss(batch)
+                            out = model.forward_loss(model_batch)
                             loss = out["loss"] / grad_accum
 
                     with record_function("train.backward"):

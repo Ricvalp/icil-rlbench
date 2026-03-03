@@ -130,6 +130,22 @@ def _dataset_config_from_eval_and_checkpoint(cfg: ConfigDict, ckpt: Dict[str, An
     )
 
 
+def _conditioning_use_mask_id_from_eval_and_checkpoint(cfg: ConfigDict, ckpt: Dict[str, Any]) -> bool:
+    model_cfg = {}
+    if isinstance(ckpt.get("config", None), dict):
+        model_cfg = ckpt["config"].get("model", {}) or {}
+    if "use_mask_id" in model_cfg:
+        return _as_bool(model_cfg["use_mask_id"])
+    return _as_bool(getattr(cfg.conditioning, "use_mask_id", True))
+
+
+def _query_stride_mode_from_eval(cfg: ConfigDict) -> str:
+    mode = str(getattr(cfg.dataset, "query_stride_mode", "dataset")).lower()
+    if mode not in ("dataset", "consecutive"):
+        raise ValueError("cfg.dataset.query_stride_mode must be one of: dataset, consecutive.")
+    return mode
+
+
 def _normalize_quaternion_xyzw(q: np.ndarray) -> np.ndarray:
     norm = float(np.linalg.norm(q))
     if norm < 1e-8:
@@ -394,13 +410,15 @@ def _build_query_window(
     history: Sequence[Dict[str, torch.Tensor]],
     *,
     dataset_cfg: ICILConfig,
+    query_stride_mode: str,
 ) -> Dict[str, torch.Tensor]:
     if not history:
         raise RuntimeError("Query history is empty.")
     last = len(history) - 1
+    qstep = int(dataset_cfg.stride) if query_stride_mode == "dataset" else 1
     idx: List[int] = []
     for i in range(dataset_cfg.T_obs):
-        rel = (dataset_cfg.T_obs - 1 - i) * dataset_cfg.stride
+        rel = (dataset_cfg.T_obs - 1 - i) * qstep
         idx.append(max(0, last - rel))
     frames = [history[i] for i in idx]
 
@@ -478,7 +496,9 @@ def _run_eval_episode(
     model: ICILPerceiverDiffusionPolicy,
     device: torch.device,
     dataset_cfg: ICILConfig,
-    support_cond: Dict[str, torch.Tensor],
+    support_cond: Optional[Dict[str, torch.Tensor]],
+    ignore_demos: bool,
+    query_stride_mode: str,
     processor: _LiveConditioningProcessor,
     cfg: ConfigDict,
     run_dir: Path,
@@ -504,19 +524,34 @@ def _run_eval_episode(
     max_env_steps = int(cfg.task.max_env_steps)
 
     while env_steps < max_env_steps and not success and not terminated:
-        query = _build_query_window(history, dataset_cfg=dataset_cfg)
-
-        cond_xyz = _to_device(support_cond["cond_xyz"], device)
-        cond_state = _to_device(support_cond["cond_state"], device)
-        cond_valid = _to_device(support_cond.get("cond_valid", None), device)
-        cond_mask_id = _to_device(support_cond.get("cond_mask_id", None), device)
-        cond_rgb = _to_device(support_cond.get("cond_rgb", None), device)
-
+        query = _build_query_window(
+            history,
+            dataset_cfg=dataset_cfg,
+            query_stride_mode=query_stride_mode,
+        )
         query_xyz = _to_device(query["query_xyz"], device)
         query_state = _to_device(query["query_state"], device)
         query_valid = _to_device(query.get("query_valid", None), device)
         query_mask_id = _to_device(query.get("query_mask_id", None), device)
         query_rgb = _to_device(query.get("query_rgb", None), device)
+
+        if ignore_demos:
+            B = int(query_xyz.shape[0])
+            N = int(query_xyz.shape[2])
+            S = int(query_state.shape[-1])
+            cond_xyz = query_xyz.new_zeros((B, 1, 1, N, 3))
+            cond_state = query_state.new_zeros((B, 1, 1, S))
+            cond_valid = None
+            cond_mask_id = None
+            cond_rgb = None
+        else:
+            if support_cond is None:
+                raise RuntimeError("support_cond is required when ignore_demos=False.")
+            cond_xyz = _to_device(support_cond["cond_xyz"], device)
+            cond_state = _to_device(support_cond["cond_state"], device)
+            cond_valid = _to_device(support_cond.get("cond_valid", None), device)
+            cond_mask_id = _to_device(support_cond.get("cond_mask_id", None), device)
+            cond_rgb = _to_device(support_cond.get("cond_rgb", None), device)
 
         with torch.no_grad():
             plan = model.sample_actions(
@@ -592,6 +627,9 @@ def evaluate(cfg: ConfigDict) -> None:
     ckpt, state_dict = _load_checkpoint(checkpoint_path, device)
     model_cfg = _model_config_from_checkpoint_or_default(ckpt)
     dataset_cfg = _dataset_config_from_eval_and_checkpoint(cfg, ckpt)
+    use_mask_id = _conditioning_use_mask_id_from_eval_and_checkpoint(cfg, ckpt)
+    ignore_demos = _as_bool(getattr(model_cfg, "ignore_demos", False))
+    query_stride_mode = _query_stride_mode_from_eval(cfg)
     state_dim, action_dim = _infer_state_action_dims_from_state_dict(state_dict)
 
     model = ICILPerceiverDiffusionPolicy(
@@ -618,6 +656,9 @@ def evaluate(cfg: ConfigDict) -> None:
 
     logging.info("Loading task='%s' variation=%d", task_name, variation)
     logging.info("Checkpoint=%s", checkpoint_path)
+    logging.info("Model cfg: ignore_demos=%s", ignore_demos)
+    logging.info("Conditioning cfg: use_mask_id=%s", use_mask_id)
+    logging.info("Eval query_stride_mode=%s", query_stride_mode)
     logging.info(
         "Dataset cfg: K=%d L=%d T_obs=%d H=%d stride=%d",
         dataset_cfg.K,
@@ -638,24 +679,27 @@ def evaluate(cfg: ConfigDict) -> None:
             task_env=task_env,
             num_points=int(cfg.conditioning.num_points),
             use_rgb=_as_bool(cfg.conditioning.use_rgb),
-            use_mask_id=_as_bool(cfg.conditioning.use_mask_id),
+            use_mask_id=use_mask_id,
             seed=seed + 11,
         )
 
         rng = np.random.default_rng(seed + 17)
         for ep in range(int(cfg.task.num_eval_episodes)):
-            regen = _as_bool(cfg.conditioning.regenerate_demos_each_episode)
-            if support_cond is None or regen:
-                if variation >= 0:
-                    task_env.set_variation(variation)
-                demos = task_env.get_demos(amount=int(dataset_cfg.K), live_demos=True)
-                support_cond = _build_support_conditioning(
-                    demos,
-                    dataset_cfg=dataset_cfg,
-                    processor=processor,
-                    rng=rng,
-                )
-                logging.info("Built support conditioning from %d demos.", dataset_cfg.K)
+            if not ignore_demos:
+                regen = _as_bool(cfg.conditioning.regenerate_demos_each_episode)
+                if support_cond is None or regen:
+                    if variation >= 0:
+                        task_env.set_variation(variation)
+                    demos = task_env.get_demos(amount=int(dataset_cfg.K), live_demos=True)
+                    support_cond = _build_support_conditioning(
+                        demos,
+                        dataset_cfg=dataset_cfg,
+                        processor=processor,
+                        rng=rng,
+                    )
+                    logging.info("Built support conditioning from %d demos.", dataset_cfg.K)
+            else:
+                support_cond = None
 
             res = _run_eval_episode(
                 episode_index=ep,
@@ -665,6 +709,8 @@ def evaluate(cfg: ConfigDict) -> None:
                 device=device,
                 dataset_cfg=dataset_cfg,
                 support_cond=support_cond,
+                ignore_demos=ignore_demos,
+                query_stride_mode=query_stride_mode,
                 processor=processor,
                 cfg=cfg,
                 run_dir=run_dir,

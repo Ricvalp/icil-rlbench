@@ -91,6 +91,50 @@ class DiffusionSchedule(nn.Module):
         return torch.sqrt(ab) * x0 + torch.sqrt(1.0 - ab) * noise
 
 
+class CosineDiffusionSchedule(nn.Module):
+    """
+    Cosine schedule defined via alpha_bar(t) = cos^2(((t/T)+s)/(1+s) * pi/2),
+    then betas are derived from consecutive alpha_bar values.
+
+    This matches the widely used cosine schedule (Nichol & Dhariwal style).
+    """
+    def __init__(self, T: int = 1000, s: float = 0.008, max_beta: float = 0.999):
+        super().__init__()
+        self.T = int(T)
+
+        # t in [0, T]
+        steps = torch.arange(self.T + 1, dtype=torch.float32)
+
+        f = (steps / self.T + s) / (1.0 + s)
+        alpha_bar = torch.cos(0.5 * math.pi * f) ** 2  # [T+1]
+        alpha_bar = alpha_bar / alpha_bar[0].clamp_min(1e-12)  # normalize so alpha_bar[0] = 1
+
+        # Convert alpha_bar to betas for t=0..T-1
+        alpha_bar_t = alpha_bar[:-1]        # [T]
+        alpha_bar_next = alpha_bar[1:]      # [T]
+        betas = 1.0 - (alpha_bar_next / alpha_bar_t.clamp_min(1e-12))
+        betas = betas.clamp(min=1e-8, max=max_beta)
+
+        alphas = 1.0 - betas
+        alpha_bar_prod = torch.cumprod(alphas, dim=0)  # [T]
+
+        self.register_buffer("betas", betas)
+        self.register_buffer("alphas", alphas)
+        self.register_buffer("alpha_bar", alpha_bar_prod)
+
+    def sample_timesteps(self, batch_size: int, device: torch.device) -> torch.Tensor:
+        return torch.randint(low=0, high=self.T, size=(batch_size,), device=device, dtype=torch.long)
+
+    def q_sample(self, x0: torch.Tensor, t: torch.Tensor, noise: torch.Tensor) -> torch.Tensor:
+        """
+        x0: [B, H, A]
+        t:  [B]
+        noise: [B, H, A]
+        """
+        ab = self.alpha_bar[t].view(-1, 1, 1)
+        return torch.sqrt(ab) * x0 + torch.sqrt(1.0 - ab) * noise
+
+
 # =========================
 # Attention blocks
 # =========================
@@ -296,6 +340,7 @@ class ModelConfig:
     # demo memory
     M_demo_latents: int = 256
     demo_perceiver_layers: int = 3
+    ignore_demos: bool = False
 
     # diffusion transformer
     denoiser_layers: int = 10
@@ -304,6 +349,7 @@ class ModelConfig:
 
     # embeddings
     mask_hash_buckets: int = 2048  # to avoid huge embedding tables for raw RLBench mask ids
+    use_mask_id: bool = True
     role_embed_max_K: int = 32
     role_embed_max_L: int = 64
     role_embed_max_Tobs: int = 16
@@ -369,7 +415,8 @@ class ICILPerceiverDiffusionPolicy(nn.Module):
             for _ in range(cfg.denoiser_layers)
         ])
 
-        self.schedule = DiffusionSchedule(T=cfg.diffusion_T)
+        # self.schedule = DiffusionSchedule(T=cfg.diffusion_T)
+        self.schedule = CosineDiffusionSchedule(T=cfg.diffusion_T)
 
     # --------------------
     # Encoding helpers
@@ -392,7 +439,7 @@ class ICILPerceiverDiffusionPolicy(nn.Module):
         if rgb is not None:
             rgb_f = rgb.to(dtype=xyz.dtype)
             h = h + self.rgb_alpha.to(dtype=h.dtype) * self.rgb_proj(rgb_f)
-        if mask_id is not None:
+        if bool(getattr(self.cfg, "use_mask_id", True)) and mask_id is not None:
             mid = self._hash_mask_ids(mask_id)
             h = h + self.mask_embed(mid)
         return h
@@ -529,14 +576,17 @@ class ICILPerceiverDiffusionPolicy(nn.Module):
         B, H, A = x_t.shape
         d = self.cfg.d_model
 
-        # context
-        Z_demo = self._build_demo_memory(
-            cond_xyz, cond_state, cond_rgb=cond_rgb, cond_mask_id=cond_mask_id, cond_valid=cond_valid
-        )  # [B,M,d]
         Z_query = self._build_query_tokens(
             query_xyz, query_state, query_rgb=query_rgb, query_mask_id=query_mask_id, query_valid=query_valid
         )  # [B,Sq,d]
-        ctx = torch.cat([Z_demo, Z_query], dim=1)  # [B, M+Sq, d]
+        # Optional ablation: ignore support demos and condition only on query tokens.
+        if bool(getattr(self.cfg, "ignore_demos", False)):
+            ctx = Z_query
+        else:
+            Z_demo = self._build_demo_memory(
+                cond_xyz, cond_state, cond_rgb=cond_rgb, cond_mask_id=cond_mask_id, cond_valid=cond_valid
+            )  # [B,M,d]
+            ctx = torch.cat([Z_demo, Z_query], dim=1)  # [B, M+Sq, d]
 
         # diffusion timestep embedding
         t_emb = sinusoidal_time_embedding(t, d)  # [B,d]
@@ -635,6 +685,7 @@ class ICILPerceiverDiffusionPolicy(nn.Module):
         total_T = int(self.schedule.T)
         steps = total_T if inference_steps is None else int(inference_steps)
         steps = max(1, min(steps, total_T))
+        
         time_seq = torch.linspace(total_T - 1, 0, steps, device=device).long()
 
         x_t = torch.randn(B, H, A, device=device)

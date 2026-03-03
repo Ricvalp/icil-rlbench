@@ -44,10 +44,12 @@ def get_config():
     cfg.model.frame_tokenizer_layers = 2
     cfg.model.M_demo_latents = 256
     cfg.model.demo_perceiver_layers = 3
+    cfg.model.ignore_demos = True
     cfg.model.denoiser_layers = 10
     cfg.model.denoiser_mlp_mult = 4
     cfg.model.dropout = 0.0
     cfg.model.mask_hash_buckets = 2048
+    cfg.model.use_mask_id = False
     cfg.model.role_embed_max_K = 32
     cfg.model.role_embed_max_L = 64
     cfg.model.role_embed_max_Tobs = 16
@@ -56,7 +58,7 @@ def get_config():
 
     cfg.train = ConfigDict()
     cfg.train.num_steps = 10_000
-    cfg.train.batch_size = 16
+    cfg.train.batch_size = 2
     cfg.train.grad_accum_steps = 1
     cfg.train.lr = 1e-4
     cfg.train.beta1 = 0.9
@@ -88,10 +90,10 @@ def get_config():
     cfg.wandb.n_loss_steps = 20
     cfg.wandb.n_sample_steps = 200
     cfg.wandb.sample_batch_items = 4
-    cfg.wandb.sample_inference_steps = 50
+    cfg.wandb.sample_inference_steps = 100
     cfg.wandb.sample_trace_frames = 8
     cfg.wandb.sample_eta = 0.0
-    cfg.wandb.sample_clip_x0 = 1.0
+    cfg.wandb.sample_clip_x0 = 10.0
     cfg.wandb.include_query_pointcloud_in_x0_pred_vs_gt_3d = False
     cfg.wandb.query_pointcloud_max_points = 4096
 
