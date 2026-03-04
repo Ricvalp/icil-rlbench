@@ -146,7 +146,18 @@ def _build_model_cfg(cfg: ConfigDict) -> ModelConfig:
         role_embed_max_L=int(cfg.role_embed_max_L),
         role_embed_max_Tobs=int(cfg.role_embed_max_Tobs),
         rgb_alpha_init=float(getattr(cfg, "rgb_alpha_init", 1.0)),
-        diffusion_T=int(cfg.diffusion_T),
+        num_train_timesteps=int(cfg.num_train_timesteps),
+        beta_start=float(getattr(cfg, "beta_start", 1e-4)),
+        beta_end=float(getattr(cfg, "beta_end", 2e-2)),
+        beta_schedule=str(getattr(cfg, "beta_schedule", "squaredcos_cap_v2")),
+        prediction_type=str(getattr(cfg, "prediction_type", "v_prediction")),
+        set_alpha_to_one=_as_bool(getattr(cfg, "set_alpha_to_one", True)),
+        steps_offset=int(getattr(cfg, "steps_offset", 0)),
+        num_inference_steps=(
+            int(getattr(cfg, "num_inference_steps"))
+            if getattr(cfg, "num_inference_steps", None) is not None
+            else None
+        ),
     )
 
 
@@ -506,7 +517,6 @@ def train(cfg: ConfigDict) -> None:
             int(getattr(cfg.wandb, "sample_inference_steps", 0)) if wandb_run is not None else 0
         )
         wandb_sample_eta = float(getattr(cfg.wandb, "sample_eta", 0.0)) if wandb_run is not None else 0.0
-        wandb_sample_clip_x0 = float(getattr(cfg.wandb, "sample_clip_x0", 0.0)) if wandb_run is not None else 0.0
         wandb_sample_trace_frames = int(getattr(cfg.wandb, "sample_trace_frames", 8)) if wandb_run is not None else 0
         wandb_include_query_pc = (
             _as_bool(getattr(cfg.wandb, "include_query_pointcloud_in_x0_pred_vs_gt_3d", False))
@@ -637,7 +647,6 @@ def train(cfg: ConfigDict) -> None:
                             wandb_sample_inference_steps if wandb_sample_inference_steps > 0 else None
                         ),
                         eta=wandb_sample_eta,
-                        clip_x0=(wandb_sample_clip_x0 if wandb_sample_clip_x0 > 0 else None),
                         return_trace=True,
                         trace_steps=(wandb_sample_trace_frames if wandb_sample_trace_frames > 0 else None),
                     )

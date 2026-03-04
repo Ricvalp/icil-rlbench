@@ -14,7 +14,7 @@ def get_config():
     cfg.task.name = "put_item_in_drawer"
     cfg.task.variation = 0
     cfg.task.num_eval_episodes = 10
-    cfg.task.max_env_steps = 120
+    cfg.task.max_env_steps = 220
 
     cfg.dataset = ConfigDict()
     # If True, these values are read from checkpoint["config"]["dataset"].
@@ -34,7 +34,7 @@ def get_config():
     cfg.conditioning.use_rgb = True
     # Fallback for old checkpoints that do not store model.use_mask_id.
     # New checkpoints use checkpoint["config"]["model"]["use_mask_id"].
-    cfg.conditioning.use_mask_id = True
+    cfg.conditioning.use_mask_id = False
     cfg.conditioning.num_points = 4096
 
     cfg.sim = ConfigDict()
@@ -53,7 +53,6 @@ def get_config():
     cfg.inference = ConfigDict()
     cfg.inference.inference_steps = 100
     cfg.inference.eta = 0.0
-    cfg.inference.clip_x0 = 10.0
 
     cfg.video = ConfigDict()
     cfg.video.enable = True

@@ -1,12 +1,14 @@
 from __future__ import annotations
 
+import inspect
 import math
 from dataclasses import dataclass
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from diffusers.schedulers.scheduling_ddim import DDIMScheduler
 
 
 # =========================
@@ -57,82 +59,6 @@ class TimeMLP(nn.Module):
 
     def forward(self, t_emb: torch.Tensor) -> torch.Tensor:
         return self.net(t_emb)
-
-
-# =========================
-# Diffusion schedule
-# =========================
-
-class DiffusionSchedule(nn.Module):
-    """
-    Simple linear beta schedule.
-    Stores buffers for fast indexing of alpha_bar[t].
-    """
-    def __init__(self, T: int = 1000, beta_start: float = 1e-4, beta_end: float = 2e-2):
-        super().__init__()
-        self.T = int(T)
-        betas = torch.linspace(beta_start, beta_end, self.T, dtype=torch.float32)
-        alphas = 1.0 - betas
-        alpha_bar = torch.cumprod(alphas, dim=0)
-        self.register_buffer("betas", betas)
-        self.register_buffer("alphas", alphas)
-        self.register_buffer("alpha_bar", alpha_bar)
-
-    def sample_timesteps(self, batch_size: int, device: torch.device) -> torch.Tensor:
-        return torch.randint(low=0, high=self.T, size=(batch_size,), device=device, dtype=torch.long)
-
-    def q_sample(self, x0: torch.Tensor, t: torch.Tensor, noise: torch.Tensor) -> torch.Tensor:
-        """
-        x0: [B, H, A]
-        t: [B]
-        noise: [B, H, A]
-        """
-        ab = self.alpha_bar[t].view(-1, 1, 1)  # [B,1,1]
-        return torch.sqrt(ab) * x0 + torch.sqrt(1.0 - ab) * noise
-
-
-class CosineDiffusionSchedule(nn.Module):
-    """
-    Cosine schedule defined via alpha_bar(t) = cos^2(((t/T)+s)/(1+s) * pi/2),
-    then betas are derived from consecutive alpha_bar values.
-
-    This matches the widely used cosine schedule (Nichol & Dhariwal style).
-    """
-    def __init__(self, T: int = 1000, s: float = 0.008, max_beta: float = 0.999):
-        super().__init__()
-        self.T = int(T)
-
-        # t in [0, T]
-        steps = torch.arange(self.T + 1, dtype=torch.float32)
-
-        f = (steps / self.T + s) / (1.0 + s)
-        alpha_bar = torch.cos(0.5 * math.pi * f) ** 2  # [T+1]
-        alpha_bar = alpha_bar / alpha_bar[0].clamp_min(1e-12)  # normalize so alpha_bar[0] = 1
-
-        # Convert alpha_bar to betas for t=0..T-1
-        alpha_bar_t = alpha_bar[:-1]        # [T]
-        alpha_bar_next = alpha_bar[1:]      # [T]
-        betas = 1.0 - (alpha_bar_next / alpha_bar_t.clamp_min(1e-12))
-        betas = betas.clamp(min=1e-8, max=max_beta)
-
-        alphas = 1.0 - betas
-        alpha_bar_prod = torch.cumprod(alphas, dim=0)  # [T]
-
-        self.register_buffer("betas", betas)
-        self.register_buffer("alphas", alphas)
-        self.register_buffer("alpha_bar", alpha_bar_prod)
-
-    def sample_timesteps(self, batch_size: int, device: torch.device) -> torch.Tensor:
-        return torch.randint(low=0, high=self.T, size=(batch_size,), device=device, dtype=torch.long)
-
-    def q_sample(self, x0: torch.Tensor, t: torch.Tensor, noise: torch.Tensor) -> torch.Tensor:
-        """
-        x0: [B, H, A]
-        t:  [B]
-        noise: [B, H, A]
-        """
-        ab = self.alpha_bar[t].view(-1, 1, 1)
-        return torch.sqrt(ab) * x0 + torch.sqrt(1.0 - ab) * noise
 
 
 # =========================
@@ -357,8 +283,15 @@ class ModelConfig:
     # RGB fusion
     rgb_alpha_init: float = 1.0
 
-    # diffusion
-    diffusion_T: int = 1000
+    # diffusion (DDIM via diffusers)
+    num_train_timesteps: int = 1000
+    beta_start: float = 1e-4
+    beta_end: float = 2e-2
+    beta_schedule: str = "squaredcos_cap_v2"
+    prediction_type: str = "v_prediction"  # "epsilon" | "sample" | "v_prediction"
+    set_alpha_to_one: bool = True
+    steps_offset: int = 0
+    num_inference_steps: Optional[int] = None
 
 
 class ICILPerceiverDiffusionPolicy(nn.Module):
@@ -415,8 +348,21 @@ class ICILPerceiverDiffusionPolicy(nn.Module):
             for _ in range(cfg.denoiser_layers)
         ])
 
-        # self.schedule = DiffusionSchedule(T=cfg.diffusion_T)
-        self.schedule = CosineDiffusionSchedule(T=cfg.diffusion_T)
+        self.noise_scheduler = DDIMScheduler(
+            num_train_timesteps=int(cfg.num_train_timesteps),
+            beta_start=float(cfg.beta_start),
+            beta_end=float(cfg.beta_end),
+            beta_schedule=str(cfg.beta_schedule),
+            clip_sample=False,
+            set_alpha_to_one=bool(cfg.set_alpha_to_one),
+            steps_offset=int(cfg.steps_offset),
+            prediction_type=str(cfg.prediction_type),
+        )
+        self.num_inference_steps = (
+            int(cfg.num_inference_steps)
+            if cfg.num_inference_steps is not None
+            else int(self.noise_scheduler.config.num_train_timesteps)
+        )
 
     # --------------------
     # Encoding helpers
@@ -555,7 +501,7 @@ class ICILPerceiverDiffusionPolicy(nn.Module):
     # Denoiser forward
     # --------------------
 
-    def predict_noise(
+    def predict_model_output(
         self,
         x_t: torch.Tensor,                # [B,H,A]
         t: torch.Tensor,                  # [B]
@@ -571,7 +517,7 @@ class ICILPerceiverDiffusionPolicy(nn.Module):
         query_valid: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
-        Returns predicted noise epsilon_hat: [B,H,A]
+        Returns model output for the configured diffusion prediction type: [B,H,A]
         """
         B, H, A = x_t.shape
         d = self.cfg.d_model
@@ -598,8 +544,8 @@ class ICILPerceiverDiffusionPolicy(nn.Module):
         h = h + sinusoidal_position_embedding(H, d, device=x_t.device).to(dtype=h.dtype).unsqueeze(0)
         for blk in self.denoiser:
             h = blk(h, t_cond=t_cond, ctx=ctx, ctx_mask=None)
-        eps_hat = self.action_out(h)  # [B,H,A]
-        return eps_hat
+        model_out = self.action_out(h)  # [B,H,A]
+        return model_out
 
     # --------------------
     # Training loss
@@ -617,11 +563,16 @@ class ICILPerceiverDiffusionPolicy(nn.Module):
         x0 = batch["target_action"]  # [B,H,A]
         B = x0.shape[0]
 
-        t = self.schedule.sample_timesteps(B, device=device)  # [B]
+        t = torch.randint(
+            low=0,
+            high=int(self.noise_scheduler.config.num_train_timesteps),
+            size=(B,),
+            device=device,
+        ).long()  # [B]
         noise = torch.randn_like(x0)
-        x_t = self.schedule.q_sample(x0, t, noise)
+        x_t = self.noise_scheduler.add_noise(x0, noise, t)
 
-        eps_hat = self.predict_noise(
+        model_out = self.predict_model_output(
             x_t=x_t,
             t=t,
             cond_xyz=batch["cond_xyz"],
@@ -636,7 +587,24 @@ class ICILPerceiverDiffusionPolicy(nn.Module):
             query_valid=batch.get("query_valid", None),
         )
 
-        loss = F.mse_loss(eps_hat, noise)
+        pred_type = str(self.noise_scheduler.config.prediction_type)
+        if pred_type == "epsilon":
+            target = noise
+        elif pred_type == "sample":
+            target = x0
+        elif pred_type == "v_prediction":
+            if hasattr(self.noise_scheduler, "get_velocity"):
+                target = self.noise_scheduler.get_velocity(x0, noise, t)
+            else:
+                alpha_t = self.noise_scheduler.alphas_cumprod[t].sqrt().to(x0.device)
+                sigma_t = (1.0 - self.noise_scheduler.alphas_cumprod[t]).sqrt().to(x0.device)
+                alpha_t = alpha_t.unsqueeze(-1).unsqueeze(-1)
+                sigma_t = sigma_t.unsqueeze(-1).unsqueeze(-1)
+                target = alpha_t * noise - sigma_t * x0
+        else:
+            raise ValueError(f"Unsupported prediction type {pred_type}")
+
+        loss = F.mse_loss(model_out, target)
 
         return {
             "loss": loss,
@@ -661,7 +629,6 @@ class ICILPerceiverDiffusionPolicy(nn.Module):
         query_valid: Optional[torch.Tensor] = None,
         inference_steps: Optional[int] = None,
         eta: float = 0.0,
-        clip_x0: Optional[float] = None,
         return_trace: bool = False,
         trace_steps: Optional[int] = None,
     ) -> Any:
@@ -682,15 +649,19 @@ class ICILPerceiverDiffusionPolicy(nn.Module):
         H = int(action_horizon)
         A = self.action_dim
 
-        total_T = int(self.schedule.T)
-        steps = total_T if inference_steps is None else int(inference_steps)
+        scheduler = self.noise_scheduler
+        total_T = int(scheduler.config.num_train_timesteps)
+        steps = self.num_inference_steps if inference_steps is None else int(inference_steps)
         steps = max(1, min(steps, total_T))
-        
-        time_seq = torch.linspace(total_T - 1, 0, steps, device=device).long()
+
+        try:
+            scheduler.set_timesteps(steps, device=device)
+        except TypeError:
+            scheduler.set_timesteps(steps)
 
         x_t = torch.randn(B, H, A, device=device)
-        trace_x0 = []
-        trace_t = []
+        trace_x0: List[torch.Tensor] = []
+        trace_t: List[int] = []
         capture_idx = None
         if return_trace:
             if trace_steps is None or int(trace_steps) <= 0 or int(trace_steps) >= steps:
@@ -705,11 +676,12 @@ class ICILPerceiverDiffusionPolicy(nn.Module):
                         for i in range(n)
                     }
 
-        for i, t_now in enumerate(time_seq):
-            t_int = int(t_now.item())
+        step_sig = inspect.signature(scheduler.step).parameters
+        for i, t_now in enumerate(scheduler.timesteps):
+            t_int = int(t_now.item() if torch.is_tensor(t_now) else t_now)
             t_batch = torch.full((B,), t_int, device=device, dtype=torch.long)
 
-            eps = self.predict_noise(
+            model_out = self.predict_model_output(
                 x_t=x_t,
                 t=t_batch,
                 cond_xyz=cond_xyz,
@@ -724,30 +696,22 @@ class ICILPerceiverDiffusionPolicy(nn.Module):
                 query_valid=query_valid,
             )
 
-            ab_t = self.schedule.alpha_bar[t_int].to(device=device, dtype=x_t.dtype)
-            sqrt_ab_t = torch.sqrt(ab_t)
-            sqrt_one_minus_ab_t = torch.sqrt(torch.clamp(1.0 - ab_t, min=1e-12))
-            x0_hat = (x_t - sqrt_one_minus_ab_t * eps) / torch.clamp(sqrt_ab_t, min=1e-12)
-            if clip_x0 is not None:
-                x0_hat = x0_hat.clamp(-clip_x0, clip_x0)
+            step_kwargs: Dict[str, Any] = {}
+            if "eta" in step_sig:
+                step_kwargs["eta"] = float(eta)
+
+            step_out = scheduler.step(model_out, t_now, x_t, **step_kwargs)
+            x0_hat = getattr(step_out, "pred_original_sample", None)
+            if isinstance(step_out, tuple):
+                x_t = step_out[0]
+            else:
+                x_t = step_out.prev_sample
+
             if return_trace and capture_idx is not None and i in capture_idx:
+                if x0_hat is None:
+                    x0_hat = x_t
                 trace_x0.append(x0_hat.detach())
                 trace_t.append(t_int)
-
-            is_last = (i == steps - 1)
-            if is_last:
-                x_t = x0_hat
-                break
-
-            t_prev = int(time_seq[i + 1].item())
-            ab_prev = self.schedule.alpha_bar[t_prev].to(device=device, dtype=x_t.dtype)
-
-            sigma = eta * torch.sqrt((1.0 - ab_prev) / torch.clamp(1.0 - ab_t, min=1e-12))
-            sigma = sigma * torch.sqrt(torch.clamp(1.0 - ab_t / torch.clamp(ab_prev, min=1e-12), min=0.0))
-
-            c = torch.sqrt(torch.clamp(1.0 - ab_prev - sigma.pow(2), min=0.0))
-            z = torch.randn_like(x_t) if eta > 0.0 else torch.zeros_like(x_t)
-            x_t = torch.sqrt(ab_prev) * x0_hat + c * eps + sigma * z
 
         if return_trace:
             if len(trace_x0) == 0:

@@ -54,7 +54,14 @@ def get_config():
     cfg.model.role_embed_max_L = 64
     cfg.model.role_embed_max_Tobs = 16
     cfg.model.rgb_alpha_init = 1.0
-    cfg.model.diffusion_T = 1000
+    cfg.model.num_train_timesteps = 1000
+    cfg.model.beta_start = 1e-4
+    cfg.model.beta_end = 2e-2
+    cfg.model.beta_schedule = "squaredcos_cap_v2"
+    cfg.model.prediction_type = "v_prediction"  # "epsilon" | "sample" | "v_prediction"
+    cfg.model.set_alpha_to_one = True
+    cfg.model.steps_offset = 0
+    cfg.model.num_inference_steps = None
 
     cfg.train = ConfigDict()
     cfg.train.num_steps = 10_000
@@ -93,7 +100,6 @@ def get_config():
     cfg.wandb.sample_inference_steps = 100
     cfg.wandb.sample_trace_frames = 8
     cfg.wandb.sample_eta = 0.0
-    cfg.wandb.sample_clip_x0 = 10.0
     cfg.wandb.include_query_pointcloud_in_x0_pred_vs_gt_3d = False
     cfg.wandb.query_pointcloud_max_points = 4096
 

@@ -12,6 +12,7 @@ import torch
 from absl import app, logging
 from ml_collections import ConfigDict
 from ml_collections.config_flags import config_flags
+from tqdm.auto import tqdm
 
 from icil.datasets.in_context_imitation_learning.cache_variation_h5 import (
     MASK_NAME_SUBSTRINGS_TO_IGNORE,
@@ -549,67 +550,76 @@ def _run_eval_episode(
 
     execute_actions = max(1, int(cfg.control.execute_actions_per_plan))
     max_env_steps = int(cfg.task.max_env_steps)
+    pbar = tqdm(
+        total=max_env_steps,
+        desc=f"Episode {episode_index}",
+        leave=False,
+        unit="step",
+    )
+    try:
+        while env_steps < max_env_steps and not success and not terminated:
+            query = _build_query_window(history, dataset_cfg=dataset_cfg)
 
-    while env_steps < max_env_steps and not success and not terminated:
-        query = _build_query_window(history, dataset_cfg=dataset_cfg)
+            cond_xyz = _to_device(support_cond["cond_xyz"], device)
+            cond_state = _to_device(support_cond["cond_state"], device)
+            cond_valid = _to_device(support_cond.get("cond_valid", None), device)
+            cond_mask_id = _to_device(support_cond.get("cond_mask_id", None), device)
+            cond_rgb = _to_device(support_cond.get("cond_rgb", None), device)
 
-        cond_xyz = _to_device(support_cond["cond_xyz"], device)
-        cond_state = _to_device(support_cond["cond_state"], device)
-        cond_valid = _to_device(support_cond.get("cond_valid", None), device)
-        cond_mask_id = _to_device(support_cond.get("cond_mask_id", None), device)
-        cond_rgb = _to_device(support_cond.get("cond_rgb", None), device)
+            query_xyz = _to_device(query["query_xyz"], device)
+            query_state = _to_device(query["query_state"], device)
+            query_valid = _to_device(query.get("query_valid", None), device)
+            query_mask_id = _to_device(query.get("query_mask_id", None), device)
+            query_rgb = _to_device(query.get("query_rgb", None), device)
 
-        query_xyz = _to_device(query["query_xyz"], device)
-        query_state = _to_device(query["query_state"], device)
-        query_valid = _to_device(query.get("query_valid", None), device)
-        query_mask_id = _to_device(query.get("query_mask_id", None), device)
-        query_rgb = _to_device(query.get("query_rgb", None), device)
+            with torch.no_grad():
+                plan = model.sample_actions(
+                    cond_xyz=cond_xyz,
+                    cond_state=cond_state,
+                    query_xyz=query_xyz,
+                    query_state=query_state,
+                    action_horizon=int(dataset_cfg.H),
+                    cond_rgb=cond_rgb,
+                    query_rgb=query_rgb,
+                    cond_mask_id=cond_mask_id,
+                    query_mask_id=query_mask_id,
+                    cond_valid=cond_valid,
+                    query_valid=query_valid,
+                    inference_steps=int(cfg.inference.inference_steps),
+                    eta=float(cfg.inference.eta),
+                    clip_x0=float(cfg.inference.clip_x0),
+                )
+            plan_np = plan[0].detach().cpu().numpy()
+            n_exec = int(min(execute_actions, plan_np.shape[0], max_env_steps - env_steps))
 
-        with torch.no_grad():
-            plan = model.sample_actions(
-                cond_xyz=cond_xyz,
-                cond_state=cond_state,
-                query_xyz=query_xyz,
-                query_state=query_state,
-                action_horizon=int(dataset_cfg.H),
-                cond_rgb=cond_rgb,
-                query_rgb=query_rgb,
-                cond_mask_id=cond_mask_id,
-                query_mask_id=query_mask_id,
-                cond_valid=cond_valid,
-                query_valid=query_valid,
-                inference_steps=int(cfg.inference.inference_steps),
-                eta=float(cfg.inference.eta),
-                clip_x0=float(cfg.inference.clip_x0),
-            )
-        plan_np = plan[0].detach().cpu().numpy()
-        n_exec = int(min(execute_actions, plan_np.shape[0], max_env_steps - env_steps))
+            for i in range(n_exec):
+                action = _sanitize_action(
+                    plan_np[i],
+                    normalize_quaternion=_as_bool(cfg.control.normalize_quaternion),
+                    discretize_gripper=_as_bool(cfg.control.discretize_gripper),
+                )
+                try:
+                    obs, reward, terminated = task_env.step(action.astype(np.float32))
+                except InvalidActionError as exc:
+                    error = f"InvalidActionError: {exc}"
+                    terminated = True
+                    break
+                except Exception as exc:  # pragma: no cover - defensive path in runtime envs
+                    error = f"{type(exc).__name__}: {exc}"
+                    terminated = True
+                    break
 
-        for i in range(n_exec):
-            action = _sanitize_action(
-                plan_np[i],
-                normalize_quaternion=_as_bool(cfg.control.normalize_quaternion),
-                discretize_gripper=_as_bool(cfg.control.discretize_gripper),
-            )
-            try:
-                obs, reward, terminated = task_env.step(action.astype(np.float32))
-            except InvalidActionError as exc:
-                error = f"InvalidActionError: {exc}"
-                terminated = True
-                break
-            except Exception as exc:  # pragma: no cover - defensive path in runtime envs
-                error = f"{type(exc).__name__}: {exc}"
-                terminated = True
-                break
+                env_steps += 1
+                pbar.update(1)
+                success = bool(float(reward) > 0.5)
+                history.append(processor.observation_to_frame(obs))
+                if _as_bool(cfg.video.enable):
+                    frames.append(_extract_rgb_frame(obs, str(cfg.video.camera)))
 
-            env_steps += 1
-            success = bool(float(reward) > 0.5)
-            history.append(processor.observation_to_frame(obs))
-            if _as_bool(cfg.video.enable):
-                frames.append(_extract_rgb_frame(obs, str(cfg.video.camera)))
-
-            if success or terminated or env_steps >= max_env_steps:
-                break
+                if success or terminated or env_steps >= max_env_steps:
+                    break
+    finally:
+        pbar.close()
 
     video_path = None
     if _as_bool(cfg.video.enable) and len(frames) > 0:
