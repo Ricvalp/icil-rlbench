@@ -24,6 +24,7 @@ MASK_NAME_SUBSTRINGS_TO_IGNORE = [
     "roof",
     "workspace",
     "table",
+    "panda_link"
 ]
 
 @dataclass(frozen=True)
