@@ -3,6 +3,7 @@
 urdfs/
 rlbench/
 3D-Diffusion-Policy/
+inspect_*
 
 # Python cache and bytecode
 __pycache__/

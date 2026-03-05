@@ -4,19 +4,15 @@ import json
 import os
 import random
 import time
-from contextlib import nullcontext
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
-import torch.distributed as dist
-import torch.nn as nn
 import torch.nn.functional as F
 from absl import app, logging
 from ml_collections import ConfigDict
 from ml_collections.config_flags import config_flags
-from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
 
 from icil.datasets.in_context_imitation_learning.icil_datasets import (
@@ -27,7 +23,7 @@ from icil.datasets.in_context_imitation_learning.variation_store import (
     VariationStore,
     build_variation_keys,
 )
-from icil.models.perceiver_encoder_decoder import (
+from icil.legacy_models.perceiver_encoder_decoder import (
     ICILPerceiverDiffusionPolicy,
     ModelConfig,
 )
@@ -268,18 +264,10 @@ def _plot_pred_vs_gt_3d(
             # Use last observed query frame as environment context.
             if qxyz.ndim == 4:  # [B, T_obs, N, 3]
                 pts = qxyz[i, -1]
-                mask = (
-                    qvalid[i, -1]
-                    if (qvalid is not None and qvalid.ndim == 3)
-                    else np.ones((pts.shape[0],), dtype=bool)
-                )
+                mask = qvalid[i, -1] if (qvalid is not None and qvalid.ndim == 3) else np.ones((pts.shape[0],), dtype=bool)
             elif qxyz.ndim == 3:  # [B, N, 3]
                 pts = qxyz[i]
-                mask = (
-                    qvalid[i]
-                    if (qvalid is not None and qvalid.ndim == 2)
-                    else np.ones((pts.shape[0],), dtype=bool)
-                )
+                mask = qvalid[i] if (qvalid is not None and qvalid.ndim == 2) else np.ones((pts.shape[0],), dtype=bool)
             else:
                 pts = None
                 mask = None
@@ -370,89 +358,32 @@ def _plot_denoising_trace_3d(
     return fig
 
 
-def _init_distributed() -> Tuple[bool, int, int, int]:
-    world_size = int(os.environ.get("WORLD_SIZE", "1"))
-    rank = int(os.environ.get("RANK", "0"))
-    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
-    distributed = world_size > 1
-    if distributed and not dist.is_initialized():
-        backend = "nccl" if torch.cuda.is_available() else "gloo"
-        dist.init_process_group(backend=backend, init_method="env://")
-    return distributed, rank, world_size, local_rank
-
-
-def _cleanup_distributed() -> None:
-    if dist.is_initialized():
-        dist.destroy_process_group()
-
-
-def _broadcast_string(value: str, src: int = 0) -> str:
-    if not dist.is_initialized():
-        return value
-    obj_list = [value]
-    dist.broadcast_object_list(obj_list, src=src)
-    return str(obj_list[0])
-
-
-def _distributed_mean(value: float, device: torch.device) -> float:
-    tensor = torch.tensor([float(value)], device=device, dtype=torch.float64)
-    if dist.is_initialized():
-        dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
-        tensor /= float(dist.get_world_size())
-    return float(tensor.item())
-
-
-class _PolicyLossWrapper(nn.Module):
-    def __init__(self, policy: ICILPerceiverDiffusionPolicy):
-        super().__init__()
-        self.policy = policy
-
-    def forward(self, batch: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
-        return self.policy.forward_loss(batch)
-
-
 def train(cfg: ConfigDict) -> None:
-    distributed, rank, world_size, local_rank = _init_distributed()
-    is_main = rank == 0
-    store: Optional[VariationStore] = None
+    seed = int(cfg.seed)
+    _set_seed(seed)
+
+    if torch.cuda.is_available() and str(cfg.device).startswith("cuda"):
+        device = torch.device(str(cfg.device))
+    else:
+        device = torch.device("cpu")
+
+    cache_root = Path(str(cfg.data.cache_root))
+    tasks: List[str] = list(cfg.data.tasks) if cfg.data.tasks is not None else []
+    store, tasks_used = _build_store(
+        cache_root=cache_root,
+        tasks=tasks,
+        keep_open_per_worker=_as_bool(cfg.data.keep_open_per_worker),
+    )
     wandb_run = None
 
     try:
-        base_seed = int(cfg.seed)
-        # Keep model init deterministic across ranks; data sampling seed is rank-shifted below.
-        _set_seed(base_seed)
-
-        if torch.cuda.is_available() and str(cfg.device).startswith("cuda"):
-            if distributed:
-                torch.cuda.set_device(local_rank)
-                device = torch.device(f"cuda:{local_rank}")
-            else:
-                device = torch.device(str(cfg.device))
-        else:
-            device = torch.device("cpu")
-
-        if not is_main:
-            logging.set_verbosity(logging.ERROR)
-
-        cache_root = Path(str(cfg.data.cache_root))
-        tasks: List[str] = list(cfg.data.tasks) if cfg.data.tasks is not None else []
-        store, tasks_used = _build_store(
-            cache_root=cache_root,
-            tasks=tasks,
-            keep_open_per_worker=_as_bool(cfg.data.keep_open_per_worker),
-        )
-
         output_parent = Path(
             str(getattr(cfg, "output_parent_dir", getattr(cfg, "workdir", "output_data_playground_v3/.experiments")))
         )
         output_parent.mkdir(parents=True, exist_ok=True)
-
-        if is_main:
-            wandb_run = _maybe_init_wandb(cfg, output_parent)
-        run_id = _resolve_run_id(wandb_run) if is_main else ""
-        if distributed:
-            run_id = _broadcast_string(run_id, src=0)
-        if is_main and wandb_run is not None:
+        wandb_run = _maybe_init_wandb(cfg, output_parent)
+        run_id = _resolve_run_id(wandb_run)
+        if wandb_run is not None:
             # Always use run id as run name for deterministic checkpoint/output mapping.
             wandb_run.name = run_id
 
@@ -471,47 +402,37 @@ def train(cfg: ConfigDict) -> None:
         checkpoint_dir = ckpt_parent / run_id
         checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
-        if distributed:
-            dist.barrier()
+        config_payload = cfg.to_dict()
+        config_payload["runtime"] = {
+            "run_id": run_id,
+            "output_dir": str(workdir),
+            "checkpoint_dir": str(checkpoint_dir),
+        }
+        config_path = workdir / "config.json"
+        with config_path.open("w", encoding="utf-8") as f:
+            json.dump(config_payload, f, indent=2)
 
-        if is_main:
-            config_payload = cfg.to_dict()
-            config_payload["runtime"] = {
-                "run_id": run_id,
-                "output_dir": str(workdir),
-                "checkpoint_dir": str(checkpoint_dir),
-                "distributed": bool(distributed),
-                "world_size": int(world_size),
-            }
-            config_path = workdir / "config.json"
-            with config_path.open("w", encoding="utf-8") as f:
-                json.dump(config_payload, f, indent=2)
-
-            logging.info("Run id=%s", run_id)
-            logging.info("Output dir=%s", workdir)
-            logging.info("Checkpoint dir=%s", checkpoint_dir)
-            logging.info("DDP=%s | world_size=%d", distributed, world_size)
-            if wandb_run is not None:
-                wandb_run.config.update(
-                    {
-                        "runtime": {
-                            "run_id": run_id,
-                            "output_dir": str(workdir),
-                            "checkpoint_dir": str(checkpoint_dir),
-                            "distributed": bool(distributed),
-                            "world_size": int(world_size),
-                        }
-                    },
-                    allow_val_change=True,
-                )
-                # Log exact resolved config file for reproducibility.
-                wandb_run.save(str(config_path), policy="now")
+        logging.info("Run id=%s", run_id)
+        logging.info("Output dir=%s", workdir)
+        logging.info("Checkpoint dir=%s", checkpoint_dir)
+        if wandb_run is not None:
+            wandb_run.config.update(
+                {
+                    "runtime": {
+                        "run_id": run_id,
+                        "output_dir": str(workdir),
+                        "checkpoint_dir": str(checkpoint_dir),
+                    }
+                },
+                allow_val_change=True,
+            )
+            # Log exact resolved config file for reproducibility.
+            wandb_run.save(str(config_path), policy="now")
 
         state_dim, action_dim = _infer_dims(store)
-        if is_main:
-            logging.info("Using cache_root=%s", cache_root)
-            logging.info("Tasks=%s | variations=%d", tasks_used, len(store))
-            logging.info("Inferred dims: state_dim=%d, action_dim=%d", state_dim, action_dim)
+        logging.info("Using cache_root=%s", cache_root)
+        logging.info("Tasks=%s | variations=%d", tasks_used, len(store))
+        logging.info("Inferred dims: state_dim=%d, action_dim=%d", state_dim, action_dim)
 
         dataset_cfg = ICILConfig(
             K=int(cfg.dataset.K),
@@ -532,7 +453,7 @@ def train(cfg: ConfigDict) -> None:
             cfg=dataset_cfg,
             batch_size_B=int(cfg.train.batch_size),
             num_batches=total_micro_batches,
-            seed=base_seed + rank * 1000003,
+            seed=seed,
             num_tries_per_item=int(cfg.dataset.num_tries_per_item),
         )
 
@@ -548,48 +469,34 @@ def train(cfg: ConfigDict) -> None:
             persistent_workers=persistent_workers,
         )
 
-        policy = ICILPerceiverDiffusionPolicy(
+        model = ICILPerceiverDiffusionPolicy(
             cfg=_build_model_cfg(cfg.model),
             state_dim=state_dim,
             action_dim=action_dim,
         ).to(device)
-        wrapped = _PolicyLossWrapper(policy).to(device)
-        if distributed:
-            ddp_model = DDP(
-                wrapped,
-                device_ids=[local_rank] if device.type == "cuda" else None,
-                output_device=local_rank if device.type == "cuda" else None,
-                find_unused_parameters=False,
+        n_total, n_trainable = _count_parameters(model)
+        print(
+            f"Model params: total={n_total:,} ({n_total / 1e6:.3f}M) | "
+            f"trainable={n_trainable:,} ({n_trainable / 1e6:.3f}M)"
+        )
+        logging.info(
+            "Model params: total=%s (%.3fM) | trainable=%s (%.3fM)",
+            f"{n_total:,}",
+            n_total / 1e6,
+            f"{n_trainable:,}",
+            n_trainable / 1e6,
+        )
+        if wandb_run is not None:
+            wandb_run.log(
+                {
+                    "model/num_params_total": n_total,
+                    "model/num_params_trainable": n_trainable,
+                },
+                step=0,
             )
-        else:
-            ddp_model = wrapped
-
-        policy_for_io = ddp_model.module.policy if distributed else ddp_model.policy
-
-        n_total, n_trainable = _count_parameters(policy_for_io)
-        if is_main:
-            print(
-                f"Model params: total={n_total:,} ({n_total / 1e6:.3f}M) | "
-                f"trainable={n_trainable:,} ({n_trainable / 1e6:.3f}M)"
-            )
-            logging.info(
-                "Model params: total=%s (%.3fM) | trainable=%s (%.3fM)",
-                f"{n_total:,}",
-                n_total / 1e6,
-                f"{n_trainable:,}",
-                n_trainable / 1e6,
-            )
-            if wandb_run is not None:
-                wandb_run.log(
-                    {
-                        "model/num_params_total": n_total,
-                        "model/num_params_trainable": n_trainable,
-                    },
-                    step=0,
-                )
 
         optimizer = torch.optim.AdamW(
-            ddp_model.parameters(),
+            model.parameters(),
             lr=float(cfg.train.lr),
             betas=(float(cfg.train.beta1), float(cfg.train.beta2)),
             weight_decay=float(cfg.train.weight_decay),
@@ -627,14 +534,13 @@ def train(cfg: ConfigDict) -> None:
         resume_path = str(cfg.train.resume_path) if cfg.train.resume_path is not None else ""
         if resume_path:
             ckpt = torch.load(resume_path, map_location=device)
-            policy_for_io.load_state_dict(ckpt["model"])
+            model.load_state_dict(ckpt["model"])
             optimizer.load_state_dict(ckpt["optimizer"])
             scaler.load_state_dict(ckpt["scaler"])
             step = int(ckpt["step"])
-            if is_main:
-                logging.info("Resumed from %s at step=%d", resume_path, step)
+            logging.info("Resumed from %s at step=%d", resume_path, step)
 
-        ddp_model.train()
+        model.train()
         optimizer.zero_grad(set_to_none=True)
 
         log_loss = 0.0
@@ -654,18 +560,11 @@ def train(cfg: ConfigDict) -> None:
 
             batch = _to_device(batch, device)
             model_batch = _drop_mask_ids_if_disabled(batch, use_mask_id)
-            sync_this_micro = ((micro_count + 1) % grad_accum == 0)
-            sync_context = (
-                nullcontext()
-                if (not distributed or sync_this_micro)
-                else ddp_model.no_sync()
-            )
-            with sync_context:
-                with torch.autocast(device_type=device.type, enabled=use_amp):
-                    out = ddp_model(model_batch)
-                    loss = out["loss"] / grad_accum
-                scaler.scale(loss).backward()
+            with torch.autocast(device_type=device.type, enabled=use_amp):
+                out = model.forward_loss(model_batch)
+                loss = out["loss"] / grad_accum
 
+            scaler.scale(loss).backward()
             micro_count += 1
             micro_loss_sum += float(out["loss"].detach().cpu())
             micro_mse_sum += float(out["mse"].detach().cpu())
@@ -673,167 +572,158 @@ def train(cfg: ConfigDict) -> None:
             if micro_count % grad_accum != 0:
                 continue
 
-            # Average local micro-batch losses to one optimizer-step scalar.
-            step_loss_local = micro_loss_sum / float(grad_accum)
-            step_mse_local = micro_mse_sum / float(grad_accum)
+            # Average micro-batch losses to one optimizer-step scalar.
+            step_loss = micro_loss_sum / float(grad_accum)
+            step_mse = micro_mse_sum / float(grad_accum)
             micro_loss_sum = 0.0
             micro_mse_sum = 0.0
 
-            # Aggregate across ranks for logging.
-            step_loss = _distributed_mean(step_loss_local, device)
-            step_mse = _distributed_mean(step_mse_local, device)
-
             if grad_clip_norm > 0:
                 scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(ddp_model.parameters(), grad_clip_norm)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip_norm)
 
             scaler.step(optimizer)
             scaler.update()
             optimizer.zero_grad(set_to_none=True)
             step += 1
+            log_loss += step_loss
+            log_mse += step_mse
+            log_count += 1
+            wb_loss_sum += step_loss
+            wb_mse_sum += step_mse
+            wb_count += 1
 
-            if is_main:
-                log_loss += step_loss
-                log_mse += step_mse
-                log_count += 1
-                wb_loss_sum += step_loss
-                wb_mse_sum += step_mse
-                wb_count += 1
+            if log_every > 0 and (step % log_every == 0 or step == 1):
+                elapsed = max(1e-6, time.time() - window_start)
+                steps_per_sec = log_count / elapsed
+                avg_loss = log_loss / max(1, log_count)
+                avg_mse = log_mse / max(1, log_count)
+                lr = optimizer.param_groups[0]["lr"]
+                logging.info(
+                    "step %d/%d | loss %.6f | mse %.6f | lr %.3e | %.2f step/s",
+                    step,
+                    train_steps,
+                    avg_loss,
+                    avg_mse,
+                    lr,
+                    steps_per_sec,
+                )
+                log_loss = 0.0
+                log_mse = 0.0
+                log_count = 0
+                window_start = time.time()
 
-                if log_every > 0 and (step % log_every == 0 or step == 1):
-                    elapsed = max(1e-6, time.time() - window_start)
-                    steps_per_sec = log_count / elapsed
-                    avg_loss = log_loss / max(1, log_count)
-                    avg_mse = log_mse / max(1, log_count)
-                    lr = optimizer.param_groups[0]["lr"]
-                    logging.info(
-                        "step %d/%d | loss %.6f | mse %.6f | lr %.3e | %.2f step/s",
-                        step,
-                        train_steps,
-                        avg_loss,
-                        avg_mse,
-                        lr,
-                        steps_per_sec,
-                    )
-                    log_loss = 0.0
-                    log_mse = 0.0
-                    log_count = 0
-                    window_start = time.time()
-
-                if wandb_run is not None and wandb_loss_every > 0 and (step % wandb_loss_every == 0 or step == 1):
-                    wandb_run.log(
-                        {
-                            "train/loss": wb_loss_sum / max(1, wb_count),
-                            "train/mse": wb_mse_sum / max(1, wb_count),
-                            "train/lr": float(optimizer.param_groups[0]["lr"]),
-                            "train/step": step,
-                        },
-                        step=step,
-                    )
-                    wb_loss_sum = 0.0
-                    wb_mse_sum = 0.0
-                    wb_count = 0
-
-                if wandb_run is not None and wandb_sample_every > 0 and (step % wandb_sample_every == 0):
-                    was_training = ddp_model.training
-                    ddp_model.eval()
-                    with torch.no_grad():
-                        sample_out = policy_for_io.sample_actions(
-                            cond_xyz=batch["cond_xyz"],
-                            cond_state=batch["cond_state"],
-                            query_xyz=batch["query_xyz"],
-                            query_state=batch["query_state"],
-                            action_horizon=int(batch["target_action"].shape[1]),
-                            cond_rgb=batch.get("cond_rgb", None),
-                            query_rgb=batch.get("query_rgb", None),
-                            cond_mask_id=(batch.get("cond_mask_id", None) if use_mask_id else None),
-                            query_mask_id=(batch.get("query_mask_id", None) if use_mask_id else None),
-                            cond_valid=batch.get("cond_valid", None),
-                            query_valid=batch.get("query_valid", None),
-                            inference_steps=(
-                                wandb_sample_inference_steps if wandb_sample_inference_steps > 0 else None
-                            ),
-                            eta=wandb_sample_eta,
-                            return_trace=True,
-                            trace_steps=(wandb_sample_trace_frames if wandb_sample_trace_frames > 0 else None),
-                        )
-                        if isinstance(sample_out, tuple):
-                            pred_x0, denoise_trace = sample_out
-                        else:
-                            pred_x0, denoise_trace = sample_out, None
-                    if was_training:
-                        ddp_model.train()
-
-                    sample_mse = float(F.mse_loss(pred_x0, batch["target_action"]).detach().cpu())
-                    fig = _plot_pred_vs_gt_3d(
-                        pred_x0=pred_x0,
-                        gt_x0=batch["target_action"],
-                        max_items=wandb_sample_batch,
-                        include_query_pointcloud=wandb_include_query_pc,
-                        query_xyz=batch.get("query_xyz", None),
-                        query_valid=batch.get("query_valid", None),
-                        max_query_points=wandb_query_pc_max_points,
-                    )
-                    fig_trace = None
-                    if denoise_trace is not None:
-                        fig_trace = _plot_denoising_trace_3d(
-                            denoise_trace["x0_hat"],
-                            denoise_trace["timesteps"],
-                            max_items=max(1, min(2, wandb_sample_batch)),
-                        )
-                    log_dict: Dict[str, Any] = {
-                        "samples/x0_mse": sample_mse,
+            if wandb_run is not None and wandb_loss_every > 0 and (step % wandb_loss_every == 0 or step == 1):
+                wandb_run.log(
+                    {
+                        "train/loss": wb_loss_sum / max(1, wb_count),
+                        "train/mse": wb_mse_sum / max(1, wb_count),
+                        "train/lr": float(optimizer.param_groups[0]["lr"]),
                         "train/step": step,
-                    }
-                    if fig is not None or fig_trace is not None:
-                        import wandb
+                    },
+                    step=step,
+                )
+                wb_loss_sum = 0.0
+                wb_mse_sum = 0.0
+                wb_count = 0
+
+            if wandb_run is not None and wandb_sample_every > 0 and (step % wandb_sample_every == 0):
+                was_training = model.training
+                model.eval()
+                with torch.no_grad():
+                    sample_out = model.sample_actions(
+                        cond_xyz=batch["cond_xyz"],
+                        cond_state=batch["cond_state"],
+                        query_xyz=batch["query_xyz"],
+                        query_state=batch["query_state"],
+                        action_horizon=int(batch["target_action"].shape[1]),
+                        cond_rgb=batch.get("cond_rgb", None),
+                        query_rgb=batch.get("query_rgb", None),
+                        cond_mask_id=(batch.get("cond_mask_id", None) if use_mask_id else None),
+                        query_mask_id=(batch.get("query_mask_id", None) if use_mask_id else None),
+                        cond_valid=batch.get("cond_valid", None),
+                        query_valid=batch.get("query_valid", None),
+                        inference_steps=(
+                            wandb_sample_inference_steps if wandb_sample_inference_steps > 0 else None
+                        ),
+                        eta=wandb_sample_eta,
+                        return_trace=True,
+                        trace_steps=(wandb_sample_trace_frames if wandb_sample_trace_frames > 0 else None),
+                    )
+                    if isinstance(sample_out, tuple):
+                        pred_x0, denoise_trace = sample_out
+                    else:
+                        pred_x0, denoise_trace = sample_out, None
+                if was_training:
+                    model.train()
+
+                sample_mse = float(F.mse_loss(pred_x0, batch["target_action"]).detach().cpu())
+                fig = _plot_pred_vs_gt_3d(
+                    pred_x0=pred_x0,
+                    gt_x0=batch["target_action"],
+                    max_items=wandb_sample_batch,
+                    include_query_pointcloud=wandb_include_query_pc,
+                    query_xyz=batch.get("query_xyz", None),
+                    query_valid=batch.get("query_valid", None),
+                    max_query_points=wandb_query_pc_max_points,
+                )
+                fig_trace = None
+                if denoise_trace is not None:
+                    fig_trace = _plot_denoising_trace_3d(
+                        denoise_trace["x0_hat"],
+                        denoise_trace["timesteps"],
+                        max_items=max(1, min(2, wandb_sample_batch)),
+                    )
+                log_dict: Dict[str, Any] = {
+                    "samples/x0_mse": sample_mse,
+                    "train/step": step,
+                }
+                if fig is not None or fig_trace is not None:
+                    import wandb
+
+                    if fig is not None:
+                        log_dict["samples/x0_pred_vs_gt_3d"] = wandb.Image(fig)
+                    if fig_trace is not None:
+                        log_dict["samples/x0_denoising_trace_3d"] = wandb.Image(fig_trace)
+                wandb_run.log(log_dict, step=step)
+                if fig is not None or fig_trace is not None:
+                    try:
+                        import matplotlib.pyplot as plt
 
                         if fig is not None:
-                            log_dict["samples/x0_pred_vs_gt_3d"] = wandb.Image(fig)
+                            plt.close(fig)
                         if fig_trace is not None:
-                            log_dict["samples/x0_denoising_trace_3d"] = wandb.Image(fig_trace)
-                    wandb_run.log(log_dict, step=step)
-                    if fig is not None or fig_trace is not None:
-                        try:
-                            import matplotlib.pyplot as plt
+                            plt.close(fig_trace)
+                    except Exception:
+                        pass
 
-                            if fig is not None:
-                                plt.close(fig)
-                            if fig_trace is not None:
-                                plt.close(fig_trace)
-                        except Exception:
-                            pass
+            if ckpt_every > 0 and step % ckpt_every == 0:
+                ckpt_path = checkpoint_dir / f"step_{step:07d}.pt"
+                _save_checkpoint(
+                    ckpt_path,
+                    step=step,
+                    model=model,
+                    optimizer=optimizer,
+                    scaler=scaler,
+                    cfg=cfg,
+                )
+                logging.info("Saved checkpoint: %s", ckpt_path)
 
-                if ckpt_every > 0 and step % ckpt_every == 0:
-                    ckpt_path = checkpoint_dir / f"step_{step:07d}.pt"
-                    _save_checkpoint(
-                        ckpt_path,
-                        step=step,
-                        model=policy_for_io,
-                        optimizer=optimizer,
-                        scaler=scaler,
-                        cfg=cfg,
-                    )
-                    logging.info("Saved checkpoint: %s", ckpt_path)
-
-        if is_main:
-            final_ckpt = checkpoint_dir / "last.pt"
-            _save_checkpoint(
-                final_ckpt,
-                step=step,
-                model=policy_for_io,
-                optimizer=optimizer,
-                scaler=scaler,
-                cfg=cfg,
-            )
-            logging.info("Training complete. Final checkpoint: %s", final_ckpt)
+        final_ckpt = checkpoint_dir / "last.pt"
+        _save_checkpoint(
+            final_ckpt,
+            step=step,
+            model=model,
+            optimizer=optimizer,
+            scaler=scaler,
+            cfg=cfg,
+        )
+        logging.info("Training complete. Final checkpoint: %s", final_ckpt)
 
     finally:
         if wandb_run is not None:
             wandb_run.finish()
-        if store is not None:
-            store.close()
-        _cleanup_distributed()
+        store.close()
 
 
 def main(argv=None):

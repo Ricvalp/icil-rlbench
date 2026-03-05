@@ -25,14 +25,15 @@ def get_config():
     cfg.dataset.H = 16
     cfg.dataset.stride = 2
     # Controls how query windows are built from eval history:
-    # - "dataset": use dataset stride spacing
+    # - "dataset": use dataset stride spacing (default)
     # - "consecutive": use adjacent history frames (no extra striding)
     cfg.dataset.query_stride_mode = "consecutive"
 
     cfg.conditioning = ConfigDict()
     cfg.conditioning.regenerate_demos_each_episode = False
     cfg.conditioning.use_rgb = True
-    # Fallback for checkpoints that do not store mask-id usage in model config.
+    # Fallback for old checkpoints that do not store model.use_mask_id.
+    # New checkpoints use checkpoint["config"]["model"]["use_mask_id"].
     cfg.conditioning.use_mask_id = False
     cfg.conditioning.num_points = 4096
 

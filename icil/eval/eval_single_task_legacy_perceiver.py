@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import random
 import time
-from dataclasses import fields, is_dataclass
+from dataclasses import fields
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
@@ -25,11 +25,9 @@ from icil.datasets.in_context_imitation_learning.icil_datasets import (
     ICILConfig,
     ICILSamplerCore,
 )
-from icil.models import (
-    Policy,
-    PolicyBuilderConfig,
-    PolicyConfig,
-    build_policy,
+from icil.legacy_models.perceiver_encoder_decoder import (
+    ICILPerceiverDiffusionPolicy,
+    ModelConfig,
 )
 
 _CONFIG = config_flags.DEFINE_config_file(
@@ -88,106 +86,28 @@ def _load_checkpoint(path: Path, device: torch.device) -> Tuple[Dict[str, Any], 
 
 def _infer_state_action_dims_from_state_dict(state_dict: Dict[str, torch.Tensor]) -> Tuple[int, int]:
     try:
+        state_dim = int(state_dict["state_proj.0.weight"].shape[1])
         action_dim = int(state_dict["action_out.weight"].shape[0])
     except KeyError as exc:
         raise KeyError(
-            "Could not infer action_dim from checkpoint. Expected key 'action_out.weight'."
+            "Could not infer state/action dims from checkpoint. "
+            "Expected keys 'state_proj.0.weight' and 'action_out.weight'."
         ) from exc
-
-    state_dim_key_candidates = (
-        "context_encoder.state_proj.0.weight",
-        "context_encoder.demo_query_encoder.state_proj.0.weight",
-    )
-    state_dim = None
-    for key in state_dim_key_candidates:
-        if key in state_dict:
-            state_dim = int(state_dict[key].shape[1])
-            break
-    if state_dim is None:
-        # For non-perceiver context encoders, this key may not exist.
-        # Keep a practical default for RLBench gripper pose+open.
-        state_dim = 8
-        logging.warning(
-            "Could not infer state_dim from state_dict; using fallback state_dim=%d.",
-            state_dim,
-        )
     return state_dim, action_dim
-
-
-def _dataclass_from_dict(default_obj: Any, src: Dict[str, Any]) -> Any:
-    if not is_dataclass(default_obj):
-        return default_obj
-    kwargs: Dict[str, Any] = {}
-    for f in fields(default_obj):
-        default_v = getattr(default_obj, f.name)
-        if is_dataclass(default_v):
-            sub_src = src.get(f.name, {}) if isinstance(src, dict) else {}
-            if not isinstance(sub_src, dict):
-                sub_src = {}
-            kwargs[f.name] = _dataclass_from_dict(default_v, sub_src)
-        else:
-            if isinstance(src, dict) and f.name in src:
-                v = src[f.name]
-                if isinstance(default_v, tuple) and isinstance(v, (list, tuple)):
-                    v = tuple(v)
-                kwargs[f.name] = v
-            else:
-                kwargs[f.name] = default_v
-    return type(default_obj)(**kwargs)
-
-
-def _legacy_flat_model_cfg_to_nested(model_from_ckpt: Dict[str, Any]) -> Dict[str, Any]:
-    policy_field_names = {f.name for f in fields(PolicyConfig())}
-    # Legacy flat configs were perceiver-only.
-    out: Dict[str, Any] = {
-        "encoder_name": "perceiver_demo_query",
-        "policy": {},
-        "perceiver_demo_query": {},
-        "traj_perceiver": {},
-    }
-    for k, v in model_from_ckpt.items():
-        if k in ("policy", "perceiver_demo_query", "traj_perceiver", "encoder_name"):
-            out[k] = v
-            continue
-        if k in policy_field_names:
-            out["policy"][k] = v
-        else:
-            out["perceiver_demo_query"][k] = v
-    return out
 
 
 def _model_config_from_checkpoint_or_default(
     ckpt: Dict[str, Any],
-) -> PolicyBuilderConfig:
-    model_from_ckpt: Dict[str, Any] = {}
+) -> ModelConfig:
+    model_from_ckpt = {}
     if isinstance(ckpt.get("config", None), dict):
         model_from_ckpt = ckpt["config"].get("model", {}) or {}
 
-    defaults = PolicyBuilderConfig()
-    if not isinstance(model_from_ckpt, dict) or not model_from_ckpt:
-        return defaults
-    if "policy" not in model_from_ckpt:
-        model_from_ckpt = _legacy_flat_model_cfg_to_nested(model_from_ckpt)
-    return _dataclass_from_dict(defaults, model_from_ckpt)
-
-
-def _conditioning_use_mask_id_from_eval_and_checkpoint(
-    cfg: ConfigDict,
-    model_cfg: PolicyBuilderConfig,
-) -> bool:
-    if str(model_cfg.encoder_name) == "perceiver_demo_query":
-        return bool(model_cfg.perceiver_demo_query.use_mask_id)
-    if str(model_cfg.encoder_name) == "traj_perceiver":
-        return bool(model_cfg.traj_perceiver.use_mask_id)
-    return _as_bool(getattr(cfg.conditioning, "use_mask_id", True))
-
-
-def _ignore_demos_from_model_cfg(model_cfg: PolicyBuilderConfig) -> bool:
-    if str(model_cfg.encoder_name) == "perceiver_demo_query":
-        return bool(model_cfg.perceiver_demo_query.ignore_demos)
-    if str(model_cfg.encoder_name) == "traj_perceiver":
-        return bool(model_cfg.traj_perceiver.ignore_demos)
-    return False
+    defaults = ModelConfig()
+    kwargs: Dict[str, Any] = {}
+    for f in fields(ModelConfig):
+        kwargs[f.name] = model_from_ckpt.get(f.name, getattr(defaults, f.name))
+    return ModelConfig(**kwargs)
 
 
 def _dataset_config_from_eval_and_checkpoint(cfg: ConfigDict, ckpt: Dict[str, Any]) -> ICILConfig:
@@ -209,6 +129,15 @@ def _dataset_config_from_eval_and_checkpoint(cfg: ConfigDict, ckpt: Dict[str, An
         H=_ival("H", 1),
         stride=_ival("stride", 1),
     )
+
+
+def _conditioning_use_mask_id_from_eval_and_checkpoint(cfg: ConfigDict, ckpt: Dict[str, Any]) -> bool:
+    model_cfg = {}
+    if isinstance(ckpt.get("config", None), dict):
+        model_cfg = ckpt["config"].get("model", {}) or {}
+    if "use_mask_id" in model_cfg:
+        return _as_bool(model_cfg["use_mask_id"])
+    return _as_bool(getattr(cfg.conditioning, "use_mask_id", True))
 
 
 def _query_stride_mode_from_eval(cfg: ConfigDict) -> str:
@@ -471,12 +400,6 @@ def _build_support_conditioning(
         "cond_state": torch.stack(cond_state, 0).unsqueeze(0),  # [1,K,L,S]
         "cond_valid": torch.stack(cond_valid, 0).unsqueeze(0),  # [1,K,L,N]
     }
-    # Trajectory branch compatibility: use keyframe state sequence as support trajectory fallback.
-    out["cond_traj"] = out["cond_state"]  # [1,K,L,S]
-    out["cond_traj_mask"] = torch.ones(
-        out["cond_state"].shape[:3],
-        dtype=torch.bool,
-    )  # [1,K,L]
     if all_have_mask and len(cond_mask) == dataset_cfg.K:
         out["cond_mask_id"] = torch.stack(cond_mask, 0).unsqueeze(0)  # [1,K,L,N]
     if all_have_rgb and len(cond_rgb) == dataset_cfg.K:
@@ -571,7 +494,7 @@ def _run_eval_episode(
     episode_index: int,
     task_env: Any,
     variation: int,
-    model: Policy,
+    model: ICILPerceiverDiffusionPolicy,
     device: torch.device,
     dataset_cfg: ICILConfig,
     support_cond: Optional[Dict[str, torch.Tensor]],
@@ -628,8 +551,6 @@ def _run_eval_episode(
                 cond_valid = None
                 cond_mask_id = None
                 cond_rgb = None
-                cond_traj = None
-                cond_traj_mask = None
             else:
                 if support_cond is None:
                     raise RuntimeError("support_cond is required when ignore_demos=False.")
@@ -638,15 +559,11 @@ def _run_eval_episode(
                 cond_valid = _to_device(support_cond.get("cond_valid", None), device)
                 cond_mask_id = _to_device(support_cond.get("cond_mask_id", None), device)
                 cond_rgb = _to_device(support_cond.get("cond_rgb", None), device)
-                cond_traj = _to_device(support_cond.get("cond_traj", None), device)
-                cond_traj_mask = _to_device(support_cond.get("cond_traj_mask", None), device)
 
             with torch.no_grad():
                 plan = model.sample_actions(
                     cond_xyz=cond_xyz,
                     cond_state=cond_state,
-                    cond_traj=cond_traj,
-                    cond_traj_mask=cond_traj_mask,
                     query_xyz=query_xyz,
                     query_state=query_state,
                     action_horizon=int(dataset_cfg.H),
@@ -719,13 +636,13 @@ def evaluate(cfg: ConfigDict) -> None:
     ckpt, state_dict = _load_checkpoint(checkpoint_path, device)
     model_cfg = _model_config_from_checkpoint_or_default(ckpt)
     dataset_cfg = _dataset_config_from_eval_and_checkpoint(cfg, ckpt)
-    use_mask_id = _conditioning_use_mask_id_from_eval_and_checkpoint(cfg, model_cfg)
-    ignore_demos = _ignore_demos_from_model_cfg(model_cfg)
+    use_mask_id = _conditioning_use_mask_id_from_eval_and_checkpoint(cfg, ckpt)
+    ignore_demos = _as_bool(getattr(model_cfg, "ignore_demos", False))
     query_stride_mode = _query_stride_mode_from_eval(cfg)
     state_dim, action_dim = _infer_state_action_dims_from_state_dict(state_dict)
 
-    model = build_policy(
-        model_cfg,
+    model = ICILPerceiverDiffusionPolicy(
+        cfg=model_cfg,
         state_dim=state_dim,
         action_dim=action_dim,
     ).to(device)
@@ -748,7 +665,7 @@ def evaluate(cfg: ConfigDict) -> None:
 
     logging.info("Loading task='%s' variation=%d", task_name, variation)
     logging.info("Checkpoint=%s", checkpoint_path)
-    logging.info("Model cfg: encoder_name=%s | ignore_demos=%s", model_cfg.encoder_name, ignore_demos)
+    logging.info("Model cfg: ignore_demos=%s", ignore_demos)
     logging.info("Conditioning cfg: use_mask_id=%s", use_mask_id)
     logging.info("Eval query_stride_mode=%s", query_stride_mode)
     logging.info(
