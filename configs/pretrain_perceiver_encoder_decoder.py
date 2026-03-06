@@ -128,8 +128,8 @@ def get_config():
     cfg.wandb.mode = os.environ.get("WANDB_MODE", "online")  # online | offline | disabled
     cfg.wandb.tags = ()
     cfg.wandb.n_loss_steps = 20
-    cfg.wandb.n_sample_steps = 200
-    cfg.wandb.sample_batch_items = 4
+    cfg.wandb.n_sample_steps = 500
+    cfg.wandb.sample_batch_items = 16
     cfg.wandb.sample_inference_steps = 100
     cfg.wandb.sample_trace_frames = 8
     cfg.wandb.sample_eta = 0.0
