@@ -849,9 +849,7 @@ if __name__ == "__main__":
             seed=args.seed + 1,
             flatten_inner=args.flatten_inner,
         )
-        
 
-        
         meta_seen = 0
         for b in meta_ds:
             _assert_meta_batch(

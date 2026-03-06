@@ -55,8 +55,16 @@ python -m icil.pretrain_perceiver_encoder_decoder \
 ```
 
 ## Profile (Perfetto JSON)
+Single-process profiling traces one normal training run and exports a Perfetto/Chrome trace plus memory timeline artifacts.
 ```bash
-python -m icil.profile_pretrain_perceiver_encoder_decoder \
+python -m icil.profiling.profile_pretrain_perceiver_encoder_decoder \
+  --train_config=configs/pretrain_perceiver_encoder_decoder.py \
+  --profile_config=configs/profile_pretrain_perceiver_encoder_decoder.py
+```
+
+DDP profiling does the same under `torchrun`, producing one trace file per rank.
+```bash
+torchrun --standalone --nproc_per_node=2 -m icil.profiling.profile_pretrain_perceiver_encoder_decoder_ddp \
   --train_config=configs/pretrain_perceiver_encoder_decoder.py \
   --profile_config=configs/profile_pretrain_perceiver_encoder_decoder.py
 ```
