@@ -137,6 +137,14 @@ class ICILSamplerCore:
         act_idx = act_start + np.arange(0, cfg.H * cfg.stride, cfg.stride, dtype=np.int64)
         return obs_idx, act_idx
 
+    def _stride_traj(self, traj: torch.Tensor) -> torch.Tensor:
+        if traj.dim() != 2:
+            raise ValueError(f"Expected trajectory tensor [T,D], got shape={tuple(traj.shape)}")
+        stride = int(self.cfg.stride)
+        if stride <= 1:
+            return traj
+        return traj[::stride]
+
     def _pack_traj_list(
         self,
         traj_list: Sequence[torch.Tensor],
@@ -262,7 +270,7 @@ class ICILSamplerCore:
             else:
                 cond_has_rgb_for_all = False
             if "traj" in c:
-                cond_traj.append(c["traj"])
+                cond_traj.append(self._stride_traj(c["traj"]))
             else:
                 cond_has_traj = False
 
@@ -422,7 +430,7 @@ class ICILSamplerCore:
                 else:
                     cond_has_rgb_this_j = False
                 if "traj" in s:
-                    cond_traj.append(s["traj"])
+                    cond_traj.append(self._stride_traj(s["traj"]))
                 else:
                     cond_has_traj_this_j = False
             cond_xyz_J.append(torch.stack(cond_xyz, 0))       # [K,L,N,3]
