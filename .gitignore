@@ -7,6 +7,7 @@ inspect_*
 legacy/
 eval_checkpoints/
 
+TODO.md
 
 # Python cache and bytecode
 __pycache__/
