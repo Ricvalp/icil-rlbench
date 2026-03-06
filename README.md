@@ -144,3 +144,16 @@ python -u -m rlbench.dataset_generator_pc \
 ```
 
 If your CoppeliaSim installation is not at `$HOME/CoppeliaSim`, replace that path in the command.
+
+
+
+
+
+
+
+
+python -m icil.cache_dense_icil_dataset \
+--root-raw /mnt/external_storage/robotics/rlbench/icil_rlbench \
+--root-cache /mnt/external_storage/robotics/rlbench/icil_rlbench/.rlbench_cache_dense_v2 \
+--num-points 4096 \
+--num-workers 16

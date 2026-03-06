@@ -27,6 +27,12 @@ MASK_NAME_SUBSTRINGS_TO_IGNORE = [
     "panda_link"
 ]
 
+# Fixed workspace crop used during caching to remove far-away outliers that can
+# survive handle-based masking.
+X_BOUNDS = (-1.0, 1.0)
+Y_BOUNDS = (-1.0, 1.0)
+Z_BOUNDS = (0.0, 2.5)
+
 @dataclass(frozen=True)
 class CacheSpec:
     N: int = 4096
@@ -85,6 +91,19 @@ def _filter_by_ignore_ids(masks: np.ndarray, ignore_ids: Tuple[int, ...]) -> np.
     for mid in ignore_ids:
         keep &= (masks != mid)
     return keep
+
+def _filter_by_xyz_bounds(
+    points: np.ndarray,
+    *,
+    x_bounds: Tuple[float, float] = X_BOUNDS,
+    y_bounds: Tuple[float, float] = Y_BOUNDS,
+    z_bounds: Tuple[float, float] = Z_BOUNDS,
+) -> np.ndarray:
+    return (
+        (points[:, 0] >= float(x_bounds[0])) & (points[:, 0] <= float(x_bounds[1])) &
+        (points[:, 1] >= float(y_bounds[0])) & (points[:, 1] <= float(y_bounds[1])) &
+        (points[:, 2] >= float(z_bounds[0])) & (points[:, 2] <= float(z_bounds[1]))
+    )
 
 def _subsample_fixedN(rng: np.random.Generator, M: int, N: int) -> np.ndarray:
     if M >= N:
@@ -237,7 +256,12 @@ def cache_episode_into_variation_file(
             cols = z["colors"].astype(np.uint8)
             msk = z["masks"].astype(np.int32)
 
+            # Filter semantic masks first, then apply the workspace crop before
+            # subsampling so removed points never occupy cached slots.
             keep = _filter_by_ignore_ids(msk, ignore_ids)
+            pts, cols, msk = pts[keep], cols[keep], msk[keep]
+
+            keep = _filter_by_xyz_bounds(pts)
             pts, cols, msk = pts[keep], cols[keep], msk[keep]
             M = pts.shape[0]
 
