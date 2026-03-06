@@ -137,6 +137,61 @@ class ICILSamplerCore:
         act_idx = act_start + np.arange(0, cfg.H * cfg.stride, cfg.stride, dtype=np.int64)
         return obs_idx, act_idx
 
+    def _pack_traj_list(
+        self,
+        traj_list: Sequence[torch.Tensor],
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        if len(traj_list) == 0:
+            raise ValueError("traj_list must be non-empty.")
+        max_T = max(int(traj.shape[0]) for traj in traj_list)
+        traj_dim = int(traj_list[0].shape[-1])
+
+        padded_traj: List[torch.Tensor] = []
+        padded_mask: List[torch.Tensor] = []
+        for traj in traj_list:
+            if traj.dim() != 2:
+                raise ValueError(f"Expected trajectory tensor [T,D], got shape={tuple(traj.shape)}")
+            T = int(traj.shape[0])
+            if int(traj.shape[-1]) != traj_dim:
+                raise ValueError("All trajectories in traj_list must share the same feature dimension.")
+            traj_pad = traj.new_zeros((max_T, traj_dim))
+            traj_pad[:T] = traj
+            mask = torch.zeros((max_T,), dtype=torch.bool, device=traj.device)
+            mask[:T] = True
+            padded_traj.append(traj_pad)
+            padded_mask.append(mask)
+
+        return torch.stack(padded_traj, 0), torch.stack(padded_mask, 0)
+
+    def _pad_traj_items(
+        self,
+        traj_items: Sequence[torch.Tensor],
+        mask_items: Sequence[torch.Tensor],
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        if len(traj_items) == 0 or len(mask_items) == 0:
+            raise ValueError("traj_items and mask_items must be non-empty.")
+        if len(traj_items) != len(mask_items):
+            raise ValueError("traj_items and mask_items must have the same length.")
+
+        max_T = max(int(traj.shape[-2]) for traj in traj_items)
+        padded_traj_items: List[torch.Tensor] = []
+        padded_mask_items: List[torch.Tensor] = []
+        for traj, mask in zip(traj_items, mask_items):
+            if mask.shape != traj.shape[:-1]:
+                raise ValueError(
+                    f"Trajectory/mask shape mismatch: traj={tuple(traj.shape)}, mask={tuple(mask.shape)}"
+                )
+            T = int(traj.shape[-2])
+            if T < max_T:
+                traj_pad = traj.new_zeros(*traj.shape[:-2], max_T - T, traj.shape[-1])
+                mask_pad = torch.zeros(*mask.shape[:-1], max_T - T, dtype=torch.bool, device=mask.device)
+                traj = torch.cat([traj, traj_pad], dim=-2)
+                mask = torch.cat([mask, mask_pad], dim=-1)
+            padded_traj_items.append(traj)
+            padded_mask_items.append(mask)
+
+        return torch.stack(padded_traj_items, 0), torch.stack(padded_mask_items, 0)
+
     # ----------------------------
     # Atomic ICIL sample (pretrain)
     # ----------------------------
@@ -179,12 +234,13 @@ class ICILSamplerCore:
 
         obs_idx, act_idx = self._build_obs_act_indices(t0)
 
-        q_obs = self.store.load_episode_slices(vidx, query_id, obs_idx, load_rgb=True, load_mask_id=True)
-        q_act = self.store.load_episode_slices(vidx, query_id, act_idx, load_rgb=False, load_mask_id=False)
+        q_obs = self.store.load_episode_slices(vidx, query_id, obs_idx, load_rgb=True, load_mask_id=True, load_full_traj=False)
+        q_act = self.store.load_episode_slices(vidx, query_id, act_idx, load_rgb=False, load_mask_id=False, load_full_traj=False)
 
-        cond_xyz, cond_state, cond_valid, cond_mask, cond_rgb = [], [], [], [], []
+        cond_xyz, cond_state, cond_valid, cond_mask, cond_rgb, cond_traj = [], [], [], [], [], []
         cond_has_mask_for_all = True
         cond_has_rgb_for_all = True
+        cond_has_traj = True
         for eid in cond_ids:
             eid = int(eid)
             Ti = self.store.episode_length(vidx, eid)
@@ -193,7 +249,7 @@ class ICILSamplerCore:
             kf = self._sample_keyframes(Ti, cfg.L, rng)
             if kf.shape[0] != cfg.L:
                 return None
-            c = self.store.load_episode_slices(vidx, eid, kf, load_rgb=True, load_mask_id=True)
+            c = self.store.load_episode_slices(vidx, eid, kf, load_rgb=True, load_mask_id=True, load_full_traj=True)
             cond_xyz.append(c["xyz"])       # [L,N,3]
             cond_state.append(c["state"])   # [L,S]
             cond_valid.append(c["valid"])   # [L,N]
@@ -205,6 +261,10 @@ class ICILSamplerCore:
                 cond_rgb.append(c["rgb"])
             else:
                 cond_has_rgb_for_all = False
+            if "traj" in c:
+                cond_traj.append(c["traj"])
+            else:
+                cond_has_traj = False
 
         sample: Dict[str, Any] = {
             "cond_xyz": torch.stack(cond_xyz, 0),          # [K,L,N,3]
@@ -224,6 +284,9 @@ class ICILSamplerCore:
             sample["cond_rgb"] = torch.stack(cond_rgb, 0)       # [K,L,N,3]
         if "rgb" in q_obs:
             sample["query_rgb"] = q_obs["rgb"]                  # [T_obs,N,3]
+        if cond_has_traj and len(cond_traj) == cfg.K:
+            sample["cond_traj"], sample["cond_traj_mask"] = self._pack_traj_list(cond_traj)  # [K,T,D], [K,T]
+
         return sample
 
     # ----------------------------
@@ -302,8 +365,12 @@ class ICILSamplerCore:
                 return None
             t0_list.append(t0)
             obs_idx, act_idx = self._build_obs_act_indices(t0)
-            q_obs = self.store.load_episode_slices(vidx, qid, obs_idx, load_rgb=True, load_mask_id=True)
-            q_act = self.store.load_episode_slices(vidx, qid, act_idx, load_rgb=False, load_mask_id=False)
+            q_obs = self.store.load_episode_slices(
+                vidx, qid, obs_idx, load_rgb=True, load_mask_id=True, load_full_traj=False
+            )
+            q_act = self.store.load_episode_slices(
+                vidx, qid, act_idx, load_rgb=False, load_mask_id=False, load_full_traj=False
+            )
 
             query_xyz_list.append(q_obs["xyz"])
             query_state_list.append(q_obs["state"])
@@ -320,16 +387,19 @@ class ICILSamplerCore:
 
         # Support for each j: all except j
         cond_xyz_J, cond_state_J, cond_valid_J, cond_mask_J, cond_rgb_J = [], [], [], [], []
+        cond_traj_J, cond_traj_mask_J = [], []
         cond_has_mask_for_all_j = True
         cond_has_rgb_for_all_j = True
+        cond_has_traj_for_all_j = True
         for j in range(J):
             support_ids = [int(ep_ids[k]) for k in range(J) if k != j]  # length K
             if len(support_ids) != cfg.K:
                 return None
 
-            cond_xyz, cond_state, cond_valid, cond_mask, cond_rgb = [], [], [], [], []
+            cond_xyz, cond_state, cond_valid, cond_mask, cond_rgb, cond_traj = [], [], [], [], [], []
             cond_has_mask_this_j = True
             cond_has_rgb_this_j = True
+            cond_has_traj_this_j = True
             for sid in support_ids:
                 Ts = self.store.episode_length(vidx, sid)
                 if Ts <= 0:
@@ -337,7 +407,9 @@ class ICILSamplerCore:
                 kf = self._sample_keyframes(Ts, cfg.L, rng)
                 if kf.shape[0] != cfg.L:
                     return None
-                s = self.store.load_episode_slices(vidx, sid, kf, load_rgb=True, load_mask_id=True)
+                s = self.store.load_episode_slices(
+                    vidx, sid, kf, load_rgb=True, load_mask_id=True, load_full_traj=True
+                )
                 cond_xyz.append(s["xyz"])       # [L,N,3]
                 cond_state.append(s["state"])   # [L,S]
                 cond_valid.append(s["valid"])   # [L,N]
@@ -349,6 +421,10 @@ class ICILSamplerCore:
                     cond_rgb.append(s["rgb"])
                 else:
                     cond_has_rgb_this_j = False
+                if "traj" in s:
+                    cond_traj.append(s["traj"])
+                else:
+                    cond_has_traj_this_j = False
             cond_xyz_J.append(torch.stack(cond_xyz, 0))       # [K,L,N,3]
             cond_state_J.append(torch.stack(cond_state, 0))   # [K,L,S]
             cond_valid_J.append(torch.stack(cond_valid, 0))   # [K,L,N]
@@ -360,6 +436,12 @@ class ICILSamplerCore:
                 cond_rgb_J.append(torch.stack(cond_rgb, 0))    # [K,L,N,3]
             else:
                 cond_has_rgb_for_all_j = False
+            if cond_has_traj_this_j and len(cond_traj) == cfg.K:
+                traj_padded, traj_mask = self._pack_traj_list(cond_traj)
+                cond_traj_J.append(traj_padded)            # [K,T,D]
+                cond_traj_mask_J.append(traj_mask)         # [K,T]
+            else:
+                cond_has_traj_for_all_j = False
 
         out: Dict[str, Any] = {
             "cond_xyz": torch.stack(cond_xyz_J, 0),            # [J,K,L,N,3]
@@ -379,6 +461,8 @@ class ICILSamplerCore:
             out["cond_rgb"] = torch.stack(cond_rgb_J, 0)       # [J,K,L,N,3]
         if query_has_rgb_for_all and len(query_rgb_list) == J:
             out["query_rgb"] = torch.stack(query_rgb_list, 0)  # [J,T_obs,N,3]
+        if cond_has_traj_for_all_j and len(cond_traj_J) == J:
+            out["cond_traj"], out["cond_traj_mask"] = self._pad_traj_items(cond_traj_J, cond_traj_mask_J)
         return out
 
 
@@ -460,6 +544,11 @@ class ICILPretrainBatchIterable(ICILSamplerCore, IterableDataset):
                 batch["cond_rgb"] = torch.stack([s["cond_rgb"] for s in samples], 0)
             if all("query_rgb" in s for s in samples):
                 batch["query_rgb"] = torch.stack([s["query_rgb"] for s in samples], 0)
+            if all("cond_traj" in s and "cond_traj_mask" in s for s in samples):
+                batch["cond_traj"], batch["cond_traj_mask"] = self._pad_traj_items(
+                    [s["cond_traj"] for s in samples],
+                    [s["cond_traj_mask"] for s in samples],
+                )
 
             yield batch
 
@@ -564,6 +653,11 @@ class ICILMetaBatchIterable(ICILSamplerCore, IterableDataset):
                 batch["cond_rgb"] = torch.stack([it["cond_rgb"] for it in items], 0)  # [B,J,K,L,N,3]
             if all("query_rgb" in it for it in items):
                 batch["query_rgb"] = torch.stack([it["query_rgb"] for it in items], 0)  # [B,J,T_obs,N,3]
+            if all("cond_traj" in it and "cond_traj_mask" in it for it in items):
+                batch["cond_traj"], batch["cond_traj_mask"] = self._pad_traj_items(
+                    [it["cond_traj"] for it in items],
+                    [it["cond_traj_mask"] for it in items],
+                )  # [B,J,K,T,D], [B,J,K,T]
 
             if self.flatten_inner:
                 # Flatten (B,J) -> B'
@@ -583,6 +677,10 @@ class ICILMetaBatchIterable(ICILSamplerCore, IterableDataset):
                     batch["cond_rgb"] = batch["cond_rgb"].reshape(B * J, *batch["cond_rgb"].shape[2:])
                 if "query_rgb" in batch:
                     batch["query_rgb"] = batch["query_rgb"].reshape(B * J, *batch["query_rgb"].shape[2:])
+                if "cond_traj" in batch:
+                    batch["cond_traj"] = batch["cond_traj"].reshape(B * J, *batch["cond_traj"].shape[2:])
+                if "cond_traj_mask" in batch:
+                    batch["cond_traj_mask"] = batch["cond_traj_mask"].reshape(B * J, *batch["cond_traj_mask"].shape[2:])
                 flat_meta: List[Dict[str, Any]] = []
                 for task_meta in batch["meta"]:
                     vidx = int(task_meta["vidx"])
@@ -634,6 +732,10 @@ def _assert_pretrain_batch(
         assert tuple(batch["cond_rgb"].shape) == (B, cfg.K, cfg.L, N, 3), batch["cond_rgb"].shape
     if "query_rgb" in batch:
         assert tuple(batch["query_rgb"].shape) == (B, cfg.T_obs, N, 3), batch["query_rgb"].shape
+    if "cond_traj" in batch:
+        assert batch["cond_traj"].shape[:2] == (B, cfg.K), batch["cond_traj"].shape
+        assert batch["cond_traj"].shape[-1] == A, batch["cond_traj"].shape
+        assert batch["cond_traj_mask"].shape == batch["cond_traj"].shape[:-1], batch["cond_traj_mask"].shape
 
 
 def _assert_meta_batch(
@@ -667,6 +769,10 @@ def _assert_meta_batch(
             assert tuple(batch["cond_rgb"].shape) == (bp, cfg.K, cfg.L, N, 3), batch["cond_rgb"].shape
         if "query_rgb" in batch:
             assert tuple(batch["query_rgb"].shape) == (bp, cfg.T_obs, N, 3), batch["query_rgb"].shape
+        if "cond_traj" in batch:
+            assert batch["cond_traj"].shape[:2] == (bp, cfg.K), batch["cond_traj"].shape
+            assert batch["cond_traj"].shape[-1] == A, batch["cond_traj"].shape
+            assert batch["cond_traj_mask"].shape == batch["cond_traj"].shape[:-1], batch["cond_traj_mask"].shape
     else:
         assert tuple(batch["cond_xyz"].shape) == (B, J, cfg.K, cfg.L, N, 3), batch["cond_xyz"].shape
         assert tuple(batch["cond_state"].shape) == (B, J, cfg.K, cfg.L, S), batch["cond_state"].shape
@@ -685,6 +791,10 @@ def _assert_meta_batch(
             assert tuple(batch["cond_rgb"].shape) == (B, J, cfg.K, cfg.L, N, 3), batch["cond_rgb"].shape
         if "query_rgb" in batch:
             assert tuple(batch["query_rgb"].shape) == (B, J, cfg.T_obs, N, 3), batch["query_rgb"].shape
+        if "cond_traj" in batch:
+            assert batch["cond_traj"].shape[:3] == (B, J, cfg.K), batch["cond_traj"].shape
+            assert batch["cond_traj"].shape[-1] == A, batch["cond_traj"].shape
+            assert batch["cond_traj_mask"].shape == batch["cond_traj"].shape[:-1], batch["cond_traj_mask"].shape
 
 
 def _discover_cached_tasks(cache_root: Path) -> List[str]:

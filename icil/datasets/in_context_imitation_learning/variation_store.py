@@ -82,6 +82,7 @@ class VariationStore(Dataset):
         *,
         load_rgb: bool = True,
         load_mask_id: bool = True,
+        load_full_traj: bool = False,
     ) -> Dict[str, torch.Tensor]:
         """
         Returns tensors with leading dim len(t_idx).
@@ -100,6 +101,8 @@ class VariationStore(Dataset):
                 out["rgb"] = torch.from_numpy(g["rgb"][t_idx]).float() / 255.0
             if load_mask_id and "mask_id" in g:
                 out["mask_id"] = torch.from_numpy(g["mask_id"][t_idx]).long()
+            if load_full_traj:
+                out["traj"] = torch.from_numpy(g["action"][:]).float()
             return out
 
         with h5py.File(self.keys[vidx].path, "r") as h:
@@ -115,4 +118,6 @@ class VariationStore(Dataset):
                 out["rgb"] = torch.from_numpy(g["rgb"][t_idx]).float() / 255.0
             if load_mask_id and "mask_id" in g:
                 out["mask_id"] = torch.from_numpy(g["mask_id"][t_idx]).long()
+            if load_full_traj:
+                out["traj"] = torch.from_numpy(g["action"][:]).float()
             return out

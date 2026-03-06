@@ -127,6 +127,9 @@ class TrajectoryPerceiverEncoder(ContextEncoder):
 
         if bool(self.cfg.use_cond_state_as_traj_fallback) and cond_state is not None:
             # cond_state is [B, K, L, S], use L as trajectory-length proxy.
+            
+            print("Warning: using cond_state as trajectory!")
+            
             traj = cond_state
             if int(traj.shape[-1]) != int(self.cfg.traj_dim):
                 raise ValueError(

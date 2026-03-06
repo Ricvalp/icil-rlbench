@@ -38,7 +38,7 @@ def get_config():
     cfg.dataset.num_tries_per_item = 100
 
     cfg.model = ConfigDict()
-    cfg.model.encoder_name = "perceiver_demo_query"  # "perceiver_demo_query" | "traj_perceiver"
+    cfg.model.encoder_name = "traj_perceiver"  # "perceiver_demo_query" | "traj_perceiver"
 
     # Core policy/denoiser config.
     cfg.model.policy = ConfigDict()
@@ -84,8 +84,8 @@ def get_config():
     cfg.model.traj_perceiver.demo_perceiver_layers = 3
     cfg.model.traj_perceiver.mask_hash_buckets = 2048
     cfg.model.traj_perceiver.use_mask_id = False
-    cfg.model.traj_perceiver.role_embed_max_K = 32
-    cfg.model.traj_perceiver.role_embed_max_L = 64
+    cfg.model.traj_perceiver.role_embed_max_K = 4
+    cfg.model.traj_perceiver.role_embed_max_L = 16
     cfg.model.traj_perceiver.role_embed_max_Tobs = 16
     cfg.model.traj_perceiver.rgb_alpha_init = 1.0
     cfg.model.traj_perceiver.ignore_demos = False
