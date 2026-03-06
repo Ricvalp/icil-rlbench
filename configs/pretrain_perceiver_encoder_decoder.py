@@ -60,16 +60,16 @@ def get_config():
     cfg.model.perceiver_demo_query = ConfigDict()
     cfg.model.perceiver_demo_query.d_model = 512
     cfg.model.perceiver_demo_query.n_heads = 8
-    cfg.model.perceiver_demo_query.m_frame_tokens = 64
+    cfg.model.perceiver_demo_query.m_frame_tokens = 128
     cfg.model.perceiver_demo_query.frame_tokenizer_layers = 2
     cfg.model.perceiver_demo_query.M_demo_latents = 256
     cfg.model.perceiver_demo_query.demo_perceiver_layers = 3
-    cfg.model.perceiver_demo_query.ignore_demos = True
-    cfg.model.perceiver_demo_query.mask_hash_buckets = 2048
+    cfg.model.perceiver_demo_query.ignore_demos = False
+    cfg.model.perceiver_demo_query.mask_hash_buckets = 1
     cfg.model.perceiver_demo_query.use_mask_id = False
-    cfg.model.perceiver_demo_query.role_embed_max_K = 32
-    cfg.model.perceiver_demo_query.role_embed_max_L = 64
-    cfg.model.perceiver_demo_query.role_embed_max_Tobs = 16
+    cfg.model.perceiver_demo_query.role_embed_max_K = 4
+    cfg.model.perceiver_demo_query.role_embed_max_L = 16
+    cfg.model.perceiver_demo_query.role_embed_max_Tobs = 2
     cfg.model.perceiver_demo_query.rgb_alpha_init = 1.0
     cfg.model.perceiver_demo_query.dropout = 0.0
 
@@ -78,15 +78,15 @@ def get_config():
     cfg.model.traj_perceiver.d_model = 512
     cfg.model.traj_perceiver.n_heads = 8
     cfg.model.traj_perceiver.dropout = 0.0
-    cfg.model.traj_perceiver.m_frame_tokens = 64
+    cfg.model.traj_perceiver.m_frame_tokens = 128
     cfg.model.traj_perceiver.frame_tokenizer_layers = 2
     cfg.model.traj_perceiver.M_demo_latents = 256
     cfg.model.traj_perceiver.demo_perceiver_layers = 3
-    cfg.model.traj_perceiver.mask_hash_buckets = 2048
+    cfg.model.traj_perceiver.mask_hash_buckets = 1
     cfg.model.traj_perceiver.use_mask_id = False
     cfg.model.traj_perceiver.role_embed_max_K = 4
     cfg.model.traj_perceiver.role_embed_max_L = 16
-    cfg.model.traj_perceiver.role_embed_max_Tobs = 16
+    cfg.model.traj_perceiver.role_embed_max_Tobs = 2
     cfg.model.traj_perceiver.rgb_alpha_init = 1.0
     cfg.model.traj_perceiver.ignore_demos = False
     cfg.model.traj_perceiver.m_traj_tokens = 16
@@ -94,10 +94,10 @@ def get_config():
     cfg.model.traj_perceiver.traj_dim = 8
     cfg.model.traj_perceiver.use_demo_id_embed = True
     cfg.model.traj_perceiver.include_traj_tokens = True
-    cfg.model.traj_perceiver.use_cond_state_as_traj_fallback = True
+    cfg.model.traj_perceiver.use_cond_state_as_traj_fallback = False
 
     cfg.train = ConfigDict()
-    cfg.train.num_steps = 10_000
+    cfg.train.num_steps = 100000
     cfg.train.batch_size = 2
     cfg.train.grad_accum_steps = 1
     cfg.train.lr = 1e-4
