@@ -24,6 +24,7 @@ def get_config():
         os.path.join("output_data_playground_v3", ".rlbench_cache_dense"),
     )
     cfg.data.tasks = ()  # () => use all tasks in cache_root
+    cfg.data.exclude_tasks = ("put_item_in_drawer", "lamp_on")
     cfg.data.keep_open_per_worker = True
     cfg.data.num_workers = 8
     cfg.data.pin_memory = True

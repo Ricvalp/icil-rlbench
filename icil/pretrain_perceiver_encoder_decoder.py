@@ -83,13 +83,28 @@ def _discover_cached_tasks(cache_root: Path) -> List[str]:
     return tasks
 
 
-def _build_store(cache_root: Path, tasks: Sequence[str], keep_open_per_worker: bool) -> Tuple[VariationStore, List[str]]:
+def _resolve_selected_tasks(cache_root: Path, tasks: Sequence[str], exclude_tasks: Sequence[str]) -> List[str]:
+    selected_tasks = list(tasks) if tasks else _discover_cached_tasks(cache_root)
+    exclude_set = set(exclude_tasks)
+    if exclude_set:
+        selected_tasks = [task for task in selected_tasks if task not in exclude_set]
+    return selected_tasks
+
+
+def _build_store(
+    cache_root: Path,
+    tasks: Sequence[str],
+    exclude_tasks: Sequence[str],
+    keep_open_per_worker: bool,
+) -> Tuple[VariationStore, List[str]]:
     if not cache_root.is_dir():
         raise FileNotFoundError(f"Cache root not found: {cache_root}")
 
-    selected_tasks = list(tasks) if tasks else _discover_cached_tasks(cache_root)
+    selected_tasks = _resolve_selected_tasks(cache_root, tasks, exclude_tasks)
     if not selected_tasks:
-        raise RuntimeError(f"No tasks found in cache root: {cache_root}")
+        raise RuntimeError(
+            f"No tasks remain after applying cfg.data.exclude_tasks under cache root: {cache_root}"
+        )
 
     keys = []
     missing_tasks = []
@@ -411,9 +426,11 @@ def train(cfg: ConfigDict) -> None:
 
     cache_root = Path(str(cfg.data.cache_root))
     tasks: List[str] = list(cfg.data.tasks) if cfg.data.tasks is not None else []
+    exclude_tasks: List[str] = list(getattr(cfg.data, "exclude_tasks", ()))
     store, tasks_used = _build_store(
         cache_root=cache_root,
         tasks=tasks,
+        exclude_tasks=exclude_tasks,
         keep_open_per_worker=_as_bool(cfg.data.keep_open_per_worker),
     )
     wandb_run = None
@@ -474,6 +491,7 @@ def train(cfg: ConfigDict) -> None:
         state_dim, action_dim = _infer_dims(store)
         logging.info("Using cache_root=%s", cache_root)
         logging.info("Tasks=%s | variations=%d", tasks_used, len(store))
+        logging.info("Excluded tasks=%s", exclude_tasks)
         logging.info("Inferred dims: state_dim=%d, action_dim=%d", state_dim, action_dim)
 
         dataset_cfg = ICILConfig(
