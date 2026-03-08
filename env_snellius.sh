@@ -7,7 +7,7 @@
 # =============================================================================
 
 # Root of cached RLBench dense H5 variations.
-export ICIL_CACHE_ROOT="/projects/prjs1905/robotics/rlbench/icil_rlbench/.rlbench_cache_dense"
+export ICIL_CACHE_ROOT="/projects/prjs1905/robotics/rlbench/icil_rlbench/.rlbench_cache_dense_v3/"
 
 # =============================================================================
 # OUTPUT DIRECTORIES
