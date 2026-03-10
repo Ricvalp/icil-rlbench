@@ -123,18 +123,31 @@ class ICILSamplerCore:
         #   obs_idx = t0 + [0, stride, ..., (T_obs-1)*stride]
         # act_idx starts strictly AFTER the last observed step:
         #   act_idx = obs_idx[-1] + stride * [1, 2, ..., H]
-        # required raw timesteps = 1 + ((T_obs + H - 1) * stride)
-        required = 1 + ((self.cfg.T_obs + self.cfg.H - 1) * self.cfg.stride)
+        # We require the query observation window to be fully real, but allow the
+        # target-action window to run past the episode end and repeat the last
+        # available action timestep via index clamping.
+        # required raw timesteps for the observation window only:
+        #   1 + ((T_obs - 1) * stride)
+        required = 1 + ((self.cfg.T_obs - 1) * self.cfg.stride)
         max_t0 = T - required
         if max_t0 < 0:
             return None
         return int(rng.integers(0, max_t0 + 1))
 
-    def _build_obs_act_indices(self, t0: int) -> Tuple[np.ndarray, np.ndarray]:
+    def _build_obs_act_indices(
+        self,
+        t0: int,
+        *,
+        episode_length: Optional[int] = None,
+    ) -> Tuple[np.ndarray, np.ndarray]:
         cfg = self.cfg
         obs_idx = t0 + np.arange(0, cfg.T_obs * cfg.stride, cfg.stride, dtype=np.int64)
         act_start = int(obs_idx[-1] + cfg.stride)
         act_idx = act_start + np.arange(0, cfg.H * cfg.stride, cfg.stride, dtype=np.int64)
+        if episode_length is not None:
+            if episode_length < 1:
+                raise ValueError(f"episode_length must be >= 1, got {episode_length}.")
+            act_idx = np.minimum(act_idx, episode_length - 1)
         return obs_idx, act_idx
 
     def _stride_traj(self, traj: torch.Tensor) -> torch.Tensor:
@@ -317,7 +330,7 @@ class ICILSamplerCore:
         if t0 is None:
             return None
 
-        obs_idx, act_idx = self._build_obs_act_indices(t0)
+        obs_idx, act_idx = self._build_obs_act_indices(t0, episode_length=Tq)
 
         q_obs = self.store.load_episode_slices(vidx, query_id, obs_idx, load_rgb=True, load_mask_id=True, load_full_traj=False)
         q_act = self.store.load_episode_slices(vidx, query_id, act_idx, load_rgb=False, load_mask_id=False, load_full_traj=False)
@@ -423,7 +436,7 @@ class ICILSamplerCore:
             if t0 is None:
                 return None
             t0_list.append(t0)
-            obs_idx, act_idx = self._build_obs_act_indices(t0)
+            obs_idx, act_idx = self._build_obs_act_indices(t0, episode_length=Tq)
             q_obs = self.store.load_episode_slices(
                 vidx, qid, obs_idx, load_rgb=True, load_mask_id=True, load_full_traj=False
             )
