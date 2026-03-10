@@ -83,6 +83,14 @@ def _discover_cached_tasks(cache_root: Path) -> List[str]:
     return tasks
 
 
+def _normalize_task_list(values: Any) -> List[str]:
+    if values is None:
+        return []
+    if isinstance(values, str):
+        values = [values]
+    return [str(v) for v in values if str(v).strip()]
+
+
 def _resolve_selected_tasks(cache_root: Path, tasks: Sequence[str], exclude_tasks: Sequence[str]) -> List[str]:
     selected_tasks = list(tasks) if tasks else _discover_cached_tasks(cache_root)
     exclude_set = set(exclude_tasks)
@@ -425,8 +433,8 @@ def train(cfg: ConfigDict) -> None:
         device = torch.device("cpu")
 
     cache_root = Path(str(cfg.data.cache_root))
-    tasks: List[str] = list(cfg.data.tasks) if cfg.data.tasks is not None else []
-    exclude_tasks: List[str] = list(getattr(cfg.data, "exclude_tasks", ()))
+    tasks = _normalize_task_list(getattr(cfg.data, "tasks", ()))
+    exclude_tasks = _normalize_task_list(getattr(cfg.data, "exclude_tasks", ()))
     store, tasks_used = _build_store(
         cache_root=cache_root,
         tasks=tasks,

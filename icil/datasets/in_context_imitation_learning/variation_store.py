@@ -74,6 +74,19 @@ class VariationStore(Dataset):
         with h5py.File(self.keys[vidx].path, "r") as h:
             return int(h["episodes"][str(int(episode_id))].attrs["T"])
 
+    def _read_dataset_rows(self, ds: h5py.Dataset, t_idx: np.ndarray) -> np.ndarray:
+        idx = np.asarray(t_idx, dtype=np.int64).reshape(-1)
+        if idx.size == 0:
+            return ds[idx]
+        # h5py fancy indexing requires strictly increasing indices. This path
+        # also supports duplicate indices, which occur when target-action
+        # padding repeats the last available timestep.
+        if np.all(idx[1:] > idx[:-1]):
+            return ds[idx]
+        unique_idx, inverse = np.unique(idx, return_inverse=True)
+        gathered = ds[unique_idx]
+        return gathered[inverse]
+
     def load_episode_slices(
         self,
         vidx: int,
@@ -91,16 +104,16 @@ class VariationStore(Dataset):
             h = self._get_handle(vidx)
             g = h["episodes"][str(int(episode_id))]
 
-            xyz = torch.from_numpy(g["xyz"][t_idx]).float()
-            valid = torch.from_numpy(g["valid"][t_idx]).bool()
-            state = torch.from_numpy(g["state"][t_idx]).float()
-            action = torch.from_numpy(g["action"][t_idx]).float()
+            xyz = torch.from_numpy(self._read_dataset_rows(g["xyz"], t_idx)).float()
+            valid = torch.from_numpy(self._read_dataset_rows(g["valid"], t_idx)).bool()
+            state = torch.from_numpy(self._read_dataset_rows(g["state"], t_idx)).float()
+            action = torch.from_numpy(self._read_dataset_rows(g["action"], t_idx)).float()
 
             out = {"xyz": xyz, "valid": valid, "state": state, "action": action}
             if load_rgb and "rgb" in g:
-                out["rgb"] = torch.from_numpy(g["rgb"][t_idx]).float() / 255.0
+                out["rgb"] = torch.from_numpy(self._read_dataset_rows(g["rgb"], t_idx)).float() / 255.0
             if load_mask_id and "mask_id" in g:
-                out["mask_id"] = torch.from_numpy(g["mask_id"][t_idx]).long()
+                out["mask_id"] = torch.from_numpy(self._read_dataset_rows(g["mask_id"], t_idx)).long()
             if load_full_traj:
                 out["traj"] = torch.from_numpy(g["action"][:]).float()
             return out
@@ -108,16 +121,16 @@ class VariationStore(Dataset):
         with h5py.File(self.keys[vidx].path, "r") as h:
             g = h["episodes"][str(int(episode_id))]
 
-            xyz = torch.from_numpy(g["xyz"][t_idx]).float()
-            valid = torch.from_numpy(g["valid"][t_idx]).bool()
-            state = torch.from_numpy(g["state"][t_idx]).float()
-            action = torch.from_numpy(g["action"][t_idx]).float()
+            xyz = torch.from_numpy(self._read_dataset_rows(g["xyz"], t_idx)).float()
+            valid = torch.from_numpy(self._read_dataset_rows(g["valid"], t_idx)).bool()
+            state = torch.from_numpy(self._read_dataset_rows(g["state"], t_idx)).float()
+            action = torch.from_numpy(self._read_dataset_rows(g["action"], t_idx)).float()
 
             out = {"xyz": xyz, "valid": valid, "state": state, "action": action}
             if load_rgb and "rgb" in g:
-                out["rgb"] = torch.from_numpy(g["rgb"][t_idx]).float() / 255.0
+                out["rgb"] = torch.from_numpy(self._read_dataset_rows(g["rgb"], t_idx)).float() / 255.0
             if load_mask_id and "mask_id" in g:
-                out["mask_id"] = torch.from_numpy(g["mask_id"][t_idx]).long()
+                out["mask_id"] = torch.from_numpy(self._read_dataset_rows(g["mask_id"], t_idx)).long()
             if load_full_traj:
                 out["traj"] = torch.from_numpy(g["action"][:]).float()
             return out
