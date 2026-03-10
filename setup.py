@@ -7,6 +7,8 @@ core_requirements = [
     "absl-py",
     "ml-collections",
     "h5py",
+    "diffusers",
+    "wandb",
 ]
 
 
