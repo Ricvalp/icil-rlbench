@@ -200,6 +200,83 @@ class ICILSamplerCore:
 
         return torch.stack(padded_traj_items, 0), torch.stack(padded_mask_items, 0)
 
+    def build_support_conditioning(
+        self,
+        rng: np.random.Generator,
+        *,
+        vidx: int,
+        support_ids: Sequence[int],
+        load_rgb: bool = True,
+        load_mask_id: bool = True,
+        load_full_traj: bool = True,
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Build only the support-conditioning portion used during training:
+          cond_xyz: [K,L,N,3]
+          cond_state: [K,L,S]
+          cond_valid: [K,L,N]
+          optional cond_mask_id: [K,L,N]
+          optional cond_rgb: [K,L,N,3]
+          optional cond_traj: [K,T,D]
+          optional cond_traj_mask: [K,T]
+        """
+        if self.store is None:
+            raise ValueError("build_support_conditioning requires a valid VariationStore.")
+
+        cfg = self.cfg
+        if len(support_ids) < cfg.K:
+            raise ValueError(f"Need at least K={cfg.K} support episode ids, got {len(support_ids)}.")
+
+        cond_xyz, cond_state, cond_valid, cond_mask, cond_rgb, cond_traj = [], [], [], [], [], []
+        cond_has_mask_for_all = bool(load_mask_id)
+        cond_has_rgb_for_all = bool(load_rgb)
+        cond_has_traj = bool(load_full_traj)
+
+        for eid in support_ids[: cfg.K]:
+            eid = int(eid)
+            Ti = self.store.episode_length(vidx, eid)
+            if Ti <= 0:
+                return None
+            kf = self._sample_keyframes(Ti, cfg.L, rng)
+            if kf.shape[0] != cfg.L:
+                return None
+            c = self.store.load_episode_slices(
+                vidx,
+                eid,
+                kf,
+                load_rgb=load_rgb,
+                load_mask_id=load_mask_id,
+                load_full_traj=load_full_traj,
+            )
+            cond_xyz.append(c["xyz"])       # [L,N,3]
+            cond_state.append(c["state"])   # [L,S]
+            cond_valid.append(c["valid"])   # [L,N]
+            if load_mask_id and "mask_id" in c:
+                cond_mask.append(c["mask_id"])
+            elif load_mask_id:
+                cond_has_mask_for_all = False
+            if load_rgb and "rgb" in c:
+                cond_rgb.append(c["rgb"])
+            elif load_rgb:
+                cond_has_rgb_for_all = False
+            if load_full_traj and "traj" in c:
+                cond_traj.append(self._stride_traj(c["traj"]))
+            elif load_full_traj:
+                cond_has_traj = False
+
+        out: Dict[str, Any] = {
+            "cond_xyz": torch.stack(cond_xyz, 0),      # [K,L,N,3]
+            "cond_state": torch.stack(cond_state, 0),  # [K,L,S]
+            "cond_valid": torch.stack(cond_valid, 0),  # [K,L,N]
+        }
+        if cond_has_mask_for_all and len(cond_mask) == cfg.K:
+            out["cond_mask_id"] = torch.stack(cond_mask, 0)  # [K,L,N]
+        if cond_has_rgb_for_all and len(cond_rgb) == cfg.K:
+            out["cond_rgb"] = torch.stack(cond_rgb, 0)       # [K,L,N,3]
+        if cond_has_traj and len(cond_traj) == cfg.K:
+            out["cond_traj"], out["cond_traj_mask"] = self._pack_traj_list(cond_traj)  # [K,T,D], [K,T]
+        return out
+
     # ----------------------------
     # Atomic ICIL sample (pretrain)
     # ----------------------------
@@ -245,55 +322,29 @@ class ICILSamplerCore:
         q_obs = self.store.load_episode_slices(vidx, query_id, obs_idx, load_rgb=True, load_mask_id=True, load_full_traj=False)
         q_act = self.store.load_episode_slices(vidx, query_id, act_idx, load_rgb=False, load_mask_id=False, load_full_traj=False)
 
-        cond_xyz, cond_state, cond_valid, cond_mask, cond_rgb, cond_traj = [], [], [], [], [], []
-        cond_has_mask_for_all = True
-        cond_has_rgb_for_all = True
-        cond_has_traj = True
-        for eid in cond_ids:
-            eid = int(eid)
-            Ti = self.store.episode_length(vidx, eid)
-            if Ti <= 0:
-                return None
-            kf = self._sample_keyframes(Ti, cfg.L, rng)
-            if kf.shape[0] != cfg.L:
-                return None
-            c = self.store.load_episode_slices(vidx, eid, kf, load_rgb=True, load_mask_id=True, load_full_traj=True)
-            cond_xyz.append(c["xyz"])       # [L,N,3]
-            cond_state.append(c["state"])   # [L,S]
-            cond_valid.append(c["valid"])   # [L,N]
-            if "mask_id" in c:
-                cond_mask.append(c["mask_id"])
-            else:
-                cond_has_mask_for_all = False
-            if "rgb" in c:
-                cond_rgb.append(c["rgb"])
-            else:
-                cond_has_rgb_for_all = False
-            if "traj" in c:
-                cond_traj.append(self._stride_traj(c["traj"]))
-            else:
-                cond_has_traj = False
+        support = self.build_support_conditioning(
+            rng,
+            vidx=vidx,
+            support_ids=cond_ids,
+            load_rgb=True,
+            load_mask_id=True,
+            load_full_traj=True,
+        )
+        if support is None:
+            return None
 
         sample: Dict[str, Any] = {
-            "cond_xyz": torch.stack(cond_xyz, 0),          # [K,L,N,3]
-            "cond_state": torch.stack(cond_state, 0),      # [K,L,S]
-            "cond_valid": torch.stack(cond_valid, 0),      # [K,L,N]
             "query_xyz": q_obs["xyz"],                     # [T_obs,N,3]
             "query_state": q_obs["state"],                 # [T_obs,S]
             "query_valid": q_obs["valid"],                 # [T_obs,N]
             "target_action": q_act["action"],              # [H,A]
             "meta": {"vidx": vidx, "query_episode": query_id, "t0": t0},
         }
-        if cond_has_mask_for_all and len(cond_mask) == cfg.K:
-            sample["cond_mask_id"] = torch.stack(cond_mask, 0)  # [K,L,N]
+        sample.update(support)
         if "mask_id" in q_obs:
             sample["query_mask_id"] = q_obs["mask_id"]          # [T_obs,N]
-        if cond_has_rgb_for_all and len(cond_rgb) == cfg.K:
-            sample["cond_rgb"] = torch.stack(cond_rgb, 0)       # [K,L,N,3]
         if "rgb" in q_obs:
             sample["query_rgb"] = q_obs["rgb"]                  # [T_obs,N,3]
-        if cond_has_traj and len(cond_traj) == cfg.K:
-            sample["cond_traj"], sample["cond_traj_mask"] = self._pack_traj_list(cond_traj)  # [K,T,D], [K,T]
 
         return sample
 
@@ -866,4 +917,3 @@ def _infer_store_dims(store) -> Tuple[int, int, int]:
         A = int(one["action"].shape[1])
         return N, S, A
     raise RuntimeError("Unable to infer dimensions from store (no non-empty episodes found).")
-

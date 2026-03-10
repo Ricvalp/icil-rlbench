@@ -9,6 +9,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
+import torch.nn as nn
 from absl import app, logging
 from ml_collections import ConfigDict
 from ml_collections.config_flags import config_flags
@@ -30,9 +31,12 @@ from icil.datasets.in_context_imitation_learning.variation_store import (
     build_variation_keys,
 )
 from icil.models import (
+    ContextEncoderOutput,
+    PerceiverDemoQueryEncoder,
     Policy,
     PolicyBuilderConfig,
     PolicyConfig,
+    TrajectoryPerceiverEncoder,
     build_policy,
 )
 
@@ -612,6 +616,196 @@ def _to_device(t: Optional[torch.Tensor], device: torch.device) -> Optional[torc
     return t.to(device, non_blocking=True)
 
 
+def _move_tensor_dict_to_device(d: Dict[str, Any], device: torch.device) -> Dict[str, Any]:
+    out: Dict[str, Any] = {}
+    for k, v in d.items():
+        out[k] = v.to(device, non_blocking=True) if torch.is_tensor(v) else v
+    return out
+
+
+class _CachedSupportContextEncoder(nn.Module):
+    """
+    Fast-eval wrapper that caches support-dependent context tokens and recomputes
+    only query-dependent tokens at each diffusion step.
+
+    This relies on the current modular encoder internals and is intentionally kept
+    local to the fast eval script.
+    """
+
+    def __init__(self, base_encoder: nn.Module):
+        super().__init__()
+        self.base_encoder = base_encoder
+        self.d_model = getattr(base_encoder, "d_model", None)
+        self._cached_demo_tokens: Optional[torch.Tensor] = None
+        self._cached_traj_tokens: Optional[torch.Tensor] = None
+        self._cache_enabled = False
+
+    @property
+    def cache_enabled(self) -> bool:
+        return bool(self._cache_enabled)
+
+    def clear_cache(self) -> None:
+        self._cached_demo_tokens = None
+        self._cached_traj_tokens = None
+        self._cache_enabled = False
+
+    @torch.no_grad()
+    def update_cache(self, support_cond: Dict[str, Any], device: torch.device) -> None:
+        support = _move_tensor_dict_to_device(support_cond, device)
+        enc = self.base_encoder
+
+        if isinstance(enc, PerceiverDemoQueryEncoder):
+            if bool(getattr(enc.cfg, "ignore_demos", False)):
+                self._cached_demo_tokens = None
+            else:
+                self._cached_demo_tokens = enc._build_demo_memory(
+                    support["cond_xyz"],
+                    support["cond_state"],
+                    cond_rgb=support.get("cond_rgb", None),
+                    cond_mask_id=support.get("cond_mask_id", None),
+                    cond_valid=support.get("cond_valid", None),
+                )
+            self._cached_traj_tokens = None
+            self._cache_enabled = True
+            return
+
+        if isinstance(enc, TrajectoryPerceiverEncoder):
+            demo_enc = enc.demo_query_encoder
+            if bool(getattr(demo_enc.cfg, "ignore_demos", False)):
+                self._cached_demo_tokens = None
+            else:
+                self._cached_demo_tokens = demo_enc._build_demo_memory(
+                    support["cond_xyz"],
+                    support["cond_state"],
+                    cond_rgb=support.get("cond_rgb", None),
+                    cond_mask_id=support.get("cond_mask_id", None),
+                    cond_valid=support.get("cond_valid", None),
+                )
+
+            self._cached_traj_tokens = None
+            if bool(getattr(enc.cfg, "include_traj_tokens", True)):
+                traj_src, traj_mask = enc._resolve_traj_source(
+                    cond_traj=support.get("cond_traj", None),
+                    cond_traj_mask=support.get("cond_traj_mask", None),
+                    cond_state=support.get("cond_state", None),
+                )
+                if traj_src is not None and traj_mask is not None:
+                    self._cached_traj_tokens = enc._build_traj_tokens(
+                        cond_traj=traj_src,
+                        cond_traj_mask=traj_mask,
+                    )
+            self._cache_enabled = True
+            return
+
+        logging.warning(
+            "Support encoding cache is not implemented for context encoder type %s. "
+            "Falling back to normal eval path.",
+            type(enc).__name__,
+        )
+        self.clear_cache()
+
+    def _check_batch_size(self, query_xyz: torch.Tensor) -> None:
+        b = int(query_xyz.shape[0])
+        for tok in (self._cached_demo_tokens, self._cached_traj_tokens):
+            if tok is not None and int(tok.shape[0]) != b:
+                raise ValueError(
+                    f"Cached support batch size {int(tok.shape[0])} does not match query batch size {b}."
+                )
+
+    def forward(
+        self,
+        *,
+        query_xyz: torch.Tensor,
+        query_state: torch.Tensor,
+        cond_xyz: Optional[torch.Tensor] = None,
+        cond_state: Optional[torch.Tensor] = None,
+        cond_traj: Optional[torch.Tensor] = None,
+        cond_traj_mask: Optional[torch.Tensor] = None,
+        query_rgb: Optional[torch.Tensor] = None,
+        query_mask_id: Optional[torch.Tensor] = None,
+        query_valid: Optional[torch.Tensor] = None,
+        cond_rgb: Optional[torch.Tensor] = None,
+        cond_mask_id: Optional[torch.Tensor] = None,
+        cond_valid: Optional[torch.Tensor] = None,
+    ) -> ContextEncoderOutput:
+        if not self.cache_enabled:
+            return self.base_encoder(
+                query_xyz=query_xyz,
+                query_state=query_state,
+                cond_xyz=cond_xyz,
+                cond_state=cond_state,
+                cond_traj=cond_traj,
+                cond_traj_mask=cond_traj_mask,
+                query_rgb=query_rgb,
+                query_mask_id=query_mask_id,
+                query_valid=query_valid,
+                cond_rgb=cond_rgb,
+                cond_mask_id=cond_mask_id,
+                cond_valid=cond_valid,
+            )
+
+        self._check_batch_size(query_xyz)
+        enc = self.base_encoder
+
+        if isinstance(enc, PerceiverDemoQueryEncoder):
+            z_query = enc._build_query_tokens(
+                query_xyz,
+                query_state,
+                query_rgb=query_rgb,
+                query_mask_id=query_mask_id,
+                query_valid=query_valid,
+            )
+            if bool(getattr(enc.cfg, "ignore_demos", False)):
+                ctx = z_query
+            else:
+                if self._cached_demo_tokens is None:
+                    raise RuntimeError("Support cache is enabled but cached demo tokens are missing.")
+                ctx = torch.cat([self._cached_demo_tokens, z_query], dim=1)
+            return ContextEncoderOutput(tokens=ctx, token_mask=None)
+
+        if isinstance(enc, TrajectoryPerceiverEncoder):
+            demo_enc = enc.demo_query_encoder
+            z_query = demo_enc._build_query_tokens(
+                query_xyz,
+                query_state,
+                query_rgb=query_rgb,
+                query_mask_id=query_mask_id,
+                query_valid=query_valid,
+            )
+            if bool(getattr(demo_enc.cfg, "ignore_demos", False)):
+                ctx = z_query
+            else:
+                if self._cached_demo_tokens is None:
+                    raise RuntimeError("Support cache is enabled but cached demo tokens are missing.")
+                ctx = torch.cat([self._cached_demo_tokens, z_query], dim=1)
+            if self._cached_traj_tokens is not None:
+                ctx = torch.cat([ctx, self._cached_traj_tokens], dim=1)
+            return ContextEncoderOutput(tokens=ctx, token_mask=None)
+
+        return self.base_encoder(
+            query_xyz=query_xyz,
+            query_state=query_state,
+            cond_xyz=cond_xyz,
+            cond_state=cond_state,
+            cond_traj=cond_traj,
+            cond_traj_mask=cond_traj_mask,
+            query_rgb=query_rgb,
+            query_mask_id=query_mask_id,
+            query_valid=query_valid,
+            cond_rgb=cond_rgb,
+            cond_mask_id=cond_mask_id,
+            cond_valid=cond_valid,
+        )
+
+
+def _ensure_cached_support_context_encoder(model: Policy) -> _CachedSupportContextEncoder:
+    if isinstance(model.context_encoder, _CachedSupportContextEncoder):
+        return model.context_encoder
+    wrapped = _CachedSupportContextEncoder(model.context_encoder)
+    model.context_encoder = wrapped
+    return wrapped
+
+
 def _build_rlbench_env(cfg: ConfigDict, task_name: str):
     from pyrep.const import RenderMode
     from rlbench import ObservationConfig
@@ -677,6 +871,11 @@ def _run_eval_episode(
 ) -> Dict[str, Any]:
     from rlbench.backend.exceptions import InvalidActionError
 
+    cached_support_enabled = (
+        isinstance(model.context_encoder, _CachedSupportContextEncoder)
+        and model.context_encoder.cache_enabled
+    )
+
     if variation >= 0:
         task_env.set_variation(int(variation))
     descriptions, obs = task_env.reset()
@@ -727,13 +926,22 @@ def _run_eval_episode(
             else:
                 if support_cond is None:
                     raise RuntimeError("support_cond is required when ignore_demos=False.")
-                cond_xyz = _to_device(support_cond["cond_xyz"], device)
-                cond_state = _to_device(support_cond["cond_state"], device)
-                cond_valid = _to_device(support_cond.get("cond_valid", None), device)
-                cond_mask_id = _to_device(support_cond.get("cond_mask_id", None), device)
-                cond_rgb = _to_device(support_cond.get("cond_rgb", None), device)
-                cond_traj = _to_device(support_cond.get("cond_traj", None), device)
-                cond_traj_mask = _to_device(support_cond.get("cond_traj_mask", None), device)
+                if cached_support_enabled:
+                    cond_xyz = None
+                    cond_state = None
+                    cond_valid = None
+                    cond_mask_id = None
+                    cond_rgb = None
+                    cond_traj = None
+                    cond_traj_mask = None
+                else:
+                    cond_xyz = _to_device(support_cond["cond_xyz"], device)
+                    cond_state = _to_device(support_cond["cond_state"], device)
+                    cond_valid = _to_device(support_cond.get("cond_valid", None), device)
+                    cond_mask_id = _to_device(support_cond.get("cond_mask_id", None), device)
+                    cond_rgb = _to_device(support_cond.get("cond_rgb", None), device)
+                    cond_traj = _to_device(support_cond.get("cond_traj", None), device)
+                    cond_traj_mask = _to_device(support_cond.get("cond_traj_mask", None), device)
 
             with torch.no_grad():
                 plan = model.sample_actions(
@@ -826,6 +1034,7 @@ def evaluate(cfg: ConfigDict) -> None:
     ).to(device)
     model.load_state_dict(state_dict, strict=True)
     model.eval()
+    cached_support_wrapper = _ensure_cached_support_context_encoder(model)
 
     if action_dim != 8:
         raise ValueError(
@@ -846,6 +1055,7 @@ def evaluate(cfg: ConfigDict) -> None:
     logging.info("Model cfg: encoder_name=%s | ignore_demos=%s", model_cfg.encoder_name, ignore_demos)
     logging.info("Conditioning cfg: use_mask_id=%s", use_mask_id)
     logging.info("Conditioning support_source=%s", support_source)
+    logging.info("Fast eval support encoding cache=%s", not ignore_demos)
     logging.info("Eval query_stride_mode=%s", query_stride_mode)
     logging.info(
         "Dataset cfg: K=%d L=%d T_obs=%d H=%d stride=%d",
@@ -914,8 +1124,23 @@ def evaluate(cfg: ConfigDict) -> None:
                             rng=rng,
                         )
                         logging.info("Built live support conditioning from %d demos.", dataset_cfg.K)
+                    cached_support_wrapper.update_cache(support_cond, device=device)
+                    logging.info(
+                        "Cached support encoding | demo_tokens=%s | traj_tokens=%s",
+                        (
+                            tuple(cached_support_wrapper._cached_demo_tokens.shape)
+                            if cached_support_wrapper._cached_demo_tokens is not None
+                            else None
+                        ),
+                        (
+                            tuple(cached_support_wrapper._cached_traj_tokens.shape)
+                            if cached_support_wrapper._cached_traj_tokens is not None
+                            else None
+                        ),
+                    )
             else:
                 support_cond = None
+                cached_support_wrapper.clear_cache()
 
             res = _run_eval_episode(
                 episode_index=ep,

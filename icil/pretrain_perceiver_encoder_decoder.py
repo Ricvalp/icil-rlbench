@@ -703,6 +703,8 @@ def train(cfg: ConfigDict) -> None:
                     sample_out = model.sample_actions(
                         cond_xyz=batch["cond_xyz"],
                         cond_state=batch["cond_state"],
+                        cond_traj=batch.get("cond_traj", None),
+                        cond_traj_mask=batch.get("cond_traj_mask", None),
                         query_xyz=batch["query_xyz"],
                         query_state=batch["query_state"],
                         action_horizon=int(batch["target_action"].shape[1]),

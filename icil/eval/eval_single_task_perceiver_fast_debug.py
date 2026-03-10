@@ -9,6 +9,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
+import torch.nn as nn
 from absl import app, logging
 from ml_collections import ConfigDict
 from ml_collections.config_flags import config_flags
@@ -30,9 +31,12 @@ from icil.datasets.in_context_imitation_learning.variation_store import (
     build_variation_keys,
 )
 from icil.models import (
+    ContextEncoderOutput,
+    PerceiverDemoQueryEncoder,
     Policy,
     PolicyBuilderConfig,
     PolicyConfig,
+    TrajectoryPerceiverEncoder,
     build_policy,
 )
 
@@ -266,6 +270,29 @@ def _sanitize_action(
         else:
             a[7] = float(np.clip(a[7], 0.0, 1.0))
     return a
+
+
+def _quat_angular_difference_rad(q0_xyzw: np.ndarray, q1_xyzw: np.ndarray) -> float:
+    q0 = _normalize_quaternion_xyzw(np.asarray(q0_xyzw, dtype=np.float32))
+    q1 = _normalize_quaternion_xyzw(np.asarray(q1_xyzw, dtype=np.float32))
+    dot = float(np.clip(np.abs(np.dot(q0, q1)), 0.0, 1.0))
+    return float(2.0 * np.arccos(dot))
+
+
+def _quat_xyzw_to_rotmat(q_xyzw: np.ndarray) -> np.ndarray:
+    q = _normalize_quaternion_xyzw(np.asarray(q_xyzw, dtype=np.float32))
+    x, y, z, w = [float(v) for v in q]
+    xx, yy, zz = x * x, y * y, z * z
+    xy, xz, yz = x * y, x * z, y * z
+    xw, yw, zw = x * w, y * w, z * w
+    return np.asarray(
+        [
+            [1.0 - 2.0 * (yy + zz), 2.0 * (xy - zw), 2.0 * (xz + yw)],
+            [2.0 * (xy + zw), 1.0 - 2.0 * (xx + zz), 2.0 * (yz - xw)],
+            [2.0 * (xz - yw), 2.0 * (yz + xw), 1.0 - 2.0 * (xx + yy)],
+        ],
+        dtype=np.float32,
+    )
 
 
 def _extract_rgb_frame(obs: Any, camera: str) -> np.ndarray:
@@ -612,6 +639,196 @@ def _to_device(t: Optional[torch.Tensor], device: torch.device) -> Optional[torc
     return t.to(device, non_blocking=True)
 
 
+def _move_tensor_dict_to_device(d: Dict[str, Any], device: torch.device) -> Dict[str, Any]:
+    out: Dict[str, Any] = {}
+    for k, v in d.items():
+        out[k] = v.to(device, non_blocking=True) if torch.is_tensor(v) else v
+    return out
+
+
+class _CachedSupportContextEncoder(nn.Module):
+    """
+    Fast-eval wrapper that caches support-dependent context tokens and recomputes
+    only query-dependent tokens at each diffusion step.
+
+    This relies on the current modular encoder internals and is intentionally kept
+    local to the fast eval script.
+    """
+
+    def __init__(self, base_encoder: nn.Module):
+        super().__init__()
+        self.base_encoder = base_encoder
+        self.d_model = getattr(base_encoder, "d_model", None)
+        self._cached_demo_tokens: Optional[torch.Tensor] = None
+        self._cached_traj_tokens: Optional[torch.Tensor] = None
+        self._cache_enabled = False
+
+    @property
+    def cache_enabled(self) -> bool:
+        return bool(self._cache_enabled)
+
+    def clear_cache(self) -> None:
+        self._cached_demo_tokens = None
+        self._cached_traj_tokens = None
+        self._cache_enabled = False
+
+    @torch.no_grad()
+    def update_cache(self, support_cond: Dict[str, Any], device: torch.device) -> None:
+        support = _move_tensor_dict_to_device(support_cond, device)
+        enc = self.base_encoder
+
+        if isinstance(enc, PerceiverDemoQueryEncoder):
+            if bool(getattr(enc.cfg, "ignore_demos", False)):
+                self._cached_demo_tokens = None
+            else:
+                self._cached_demo_tokens = enc._build_demo_memory(
+                    support["cond_xyz"],
+                    support["cond_state"],
+                    cond_rgb=support.get("cond_rgb", None),
+                    cond_mask_id=support.get("cond_mask_id", None),
+                    cond_valid=support.get("cond_valid", None),
+                )
+            self._cached_traj_tokens = None
+            self._cache_enabled = True
+            return
+
+        if isinstance(enc, TrajectoryPerceiverEncoder):
+            demo_enc = enc.demo_query_encoder
+            if bool(getattr(demo_enc.cfg, "ignore_demos", False)):
+                self._cached_demo_tokens = None
+            else:
+                self._cached_demo_tokens = demo_enc._build_demo_memory(
+                    support["cond_xyz"],
+                    support["cond_state"],
+                    cond_rgb=support.get("cond_rgb", None),
+                    cond_mask_id=support.get("cond_mask_id", None),
+                    cond_valid=support.get("cond_valid", None),
+                )
+
+            self._cached_traj_tokens = None
+            if bool(getattr(enc.cfg, "include_traj_tokens", True)):
+                traj_src, traj_mask = enc._resolve_traj_source(
+                    cond_traj=support.get("cond_traj", None),
+                    cond_traj_mask=support.get("cond_traj_mask", None),
+                    cond_state=support.get("cond_state", None),
+                )
+                if traj_src is not None and traj_mask is not None:
+                    self._cached_traj_tokens = enc._build_traj_tokens(
+                        cond_traj=traj_src,
+                        cond_traj_mask=traj_mask,
+                    )
+            self._cache_enabled = True
+            return
+
+        logging.warning(
+            "Support encoding cache is not implemented for context encoder type %s. "
+            "Falling back to normal eval path.",
+            type(enc).__name__,
+        )
+        self.clear_cache()
+
+    def _check_batch_size(self, query_xyz: torch.Tensor) -> None:
+        b = int(query_xyz.shape[0])
+        for tok in (self._cached_demo_tokens, self._cached_traj_tokens):
+            if tok is not None and int(tok.shape[0]) != b:
+                raise ValueError(
+                    f"Cached support batch size {int(tok.shape[0])} does not match query batch size {b}."
+                )
+
+    def forward(
+        self,
+        *,
+        query_xyz: torch.Tensor,
+        query_state: torch.Tensor,
+        cond_xyz: Optional[torch.Tensor] = None,
+        cond_state: Optional[torch.Tensor] = None,
+        cond_traj: Optional[torch.Tensor] = None,
+        cond_traj_mask: Optional[torch.Tensor] = None,
+        query_rgb: Optional[torch.Tensor] = None,
+        query_mask_id: Optional[torch.Tensor] = None,
+        query_valid: Optional[torch.Tensor] = None,
+        cond_rgb: Optional[torch.Tensor] = None,
+        cond_mask_id: Optional[torch.Tensor] = None,
+        cond_valid: Optional[torch.Tensor] = None,
+    ) -> ContextEncoderOutput:
+        if not self.cache_enabled:
+            return self.base_encoder(
+                query_xyz=query_xyz,
+                query_state=query_state,
+                cond_xyz=cond_xyz,
+                cond_state=cond_state,
+                cond_traj=cond_traj,
+                cond_traj_mask=cond_traj_mask,
+                query_rgb=query_rgb,
+                query_mask_id=query_mask_id,
+                query_valid=query_valid,
+                cond_rgb=cond_rgb,
+                cond_mask_id=cond_mask_id,
+                cond_valid=cond_valid,
+            )
+
+        self._check_batch_size(query_xyz)
+        enc = self.base_encoder
+
+        if isinstance(enc, PerceiverDemoQueryEncoder):
+            z_query = enc._build_query_tokens(
+                query_xyz,
+                query_state,
+                query_rgb=query_rgb,
+                query_mask_id=query_mask_id,
+                query_valid=query_valid,
+            )
+            if bool(getattr(enc.cfg, "ignore_demos", False)):
+                ctx = z_query
+            else:
+                if self._cached_demo_tokens is None:
+                    raise RuntimeError("Support cache is enabled but cached demo tokens are missing.")
+                ctx = torch.cat([self._cached_demo_tokens, z_query], dim=1)
+            return ContextEncoderOutput(tokens=ctx, token_mask=None)
+
+        if isinstance(enc, TrajectoryPerceiverEncoder):
+            demo_enc = enc.demo_query_encoder
+            z_query = demo_enc._build_query_tokens(
+                query_xyz,
+                query_state,
+                query_rgb=query_rgb,
+                query_mask_id=query_mask_id,
+                query_valid=query_valid,
+            )
+            if bool(getattr(demo_enc.cfg, "ignore_demos", False)):
+                ctx = z_query
+            else:
+                if self._cached_demo_tokens is None:
+                    raise RuntimeError("Support cache is enabled but cached demo tokens are missing.")
+                ctx = torch.cat([self._cached_demo_tokens, z_query], dim=1)
+            if self._cached_traj_tokens is not None:
+                ctx = torch.cat([ctx, self._cached_traj_tokens], dim=1)
+            return ContextEncoderOutput(tokens=ctx, token_mask=None)
+
+        return self.base_encoder(
+            query_xyz=query_xyz,
+            query_state=query_state,
+            cond_xyz=cond_xyz,
+            cond_state=cond_state,
+            cond_traj=cond_traj,
+            cond_traj_mask=cond_traj_mask,
+            query_rgb=query_rgb,
+            query_mask_id=query_mask_id,
+            query_valid=query_valid,
+            cond_rgb=cond_rgb,
+            cond_mask_id=cond_mask_id,
+            cond_valid=cond_valid,
+        )
+
+
+def _ensure_cached_support_context_encoder(model: Policy) -> _CachedSupportContextEncoder:
+    if isinstance(model.context_encoder, _CachedSupportContextEncoder):
+        return model.context_encoder
+    wrapped = _CachedSupportContextEncoder(model.context_encoder)
+    model.context_encoder = wrapped
+    return wrapped
+
+
 def _build_rlbench_env(cfg: ConfigDict, task_name: str):
     from pyrep.const import RenderMode
     from rlbench import ObservationConfig
@@ -677,6 +894,11 @@ def _run_eval_episode(
 ) -> Dict[str, Any]:
     from rlbench.backend.exceptions import InvalidActionError
 
+    cached_support_enabled = (
+        isinstance(model.context_encoder, _CachedSupportContextEncoder)
+        and model.context_encoder.cache_enabled
+    )
+
     if variation >= 0:
         task_env.set_variation(int(variation))
     descriptions, obs = task_env.reset()
@@ -691,6 +913,12 @@ def _run_eval_episode(
     terminated = False
     error: Optional[str] = None
     env_steps = 0
+    generated_action_chunks: List[List[List[float]]] = []
+    generated_action_chunk_meta: List[Dict[str, Any]] = []
+    executed_quaternion_deltas: List[Dict[str, Any]] = []
+    prev_executed_quat: Optional[np.ndarray] = None
+    max_plan_attempts = 8
+    consecutive_same_state_invalid_attempts = 0
 
     execute_actions = max(1, int(cfg.control.execute_actions_per_plan))
     max_env_steps = int(cfg.task.max_env_steps)
@@ -727,13 +955,22 @@ def _run_eval_episode(
             else:
                 if support_cond is None:
                     raise RuntimeError("support_cond is required when ignore_demos=False.")
-                cond_xyz = _to_device(support_cond["cond_xyz"], device)
-                cond_state = _to_device(support_cond["cond_state"], device)
-                cond_valid = _to_device(support_cond.get("cond_valid", None), device)
-                cond_mask_id = _to_device(support_cond.get("cond_mask_id", None), device)
-                cond_rgb = _to_device(support_cond.get("cond_rgb", None), device)
-                cond_traj = _to_device(support_cond.get("cond_traj", None), device)
-                cond_traj_mask = _to_device(support_cond.get("cond_traj_mask", None), device)
+                if cached_support_enabled:
+                    cond_xyz = None
+                    cond_state = None
+                    cond_valid = None
+                    cond_mask_id = None
+                    cond_rgb = None
+                    cond_traj = None
+                    cond_traj_mask = None
+                else:
+                    cond_xyz = _to_device(support_cond["cond_xyz"], device)
+                    cond_state = _to_device(support_cond["cond_state"], device)
+                    cond_valid = _to_device(support_cond.get("cond_valid", None), device)
+                    cond_mask_id = _to_device(support_cond.get("cond_mask_id", None), device)
+                    cond_rgb = _to_device(support_cond.get("cond_rgb", None), device)
+                    cond_traj = _to_device(support_cond.get("cond_traj", None), device)
+                    cond_traj_mask = _to_device(support_cond.get("cond_traj_mask", None), device)
 
             with torch.no_grad():
                 plan = model.sample_actions(
@@ -755,41 +992,190 @@ def _run_eval_episode(
                 )
             plan_np = plan[0].detach().cpu().numpy()
             n_exec = int(min(execute_actions, plan_np.shape[0], max_env_steps - env_steps))
+            plan_index = len(generated_action_chunks)
+            generated_action_chunks.append(plan_np.astype(np.float32).tolist())
+            plan_meta = {
+                "plan_index": int(plan_index),
+                "start_env_step": int(env_steps),
+                "chunk_length": int(plan_np.shape[0]),
+                "requested_execute_actions": int(n_exec),
+                "executed_actions": 0,
+                "same_state_attempt": int(consecutive_same_state_invalid_attempts + 1),
+                "status": "sampled",
+                "error": None,
+                "failed_action_index": None,
+                "failed_action_quat_delta_rad": None,
+                "failed_action_quat_delta_deg": None,
+            }
+            generated_action_chunk_meta.append(plan_meta)
+            logging.info(
+                (
+                    "Episode %d | plan %d | start_env_step=%d | requested_execute=%d | "
+                    "chunk_length=%d | same_state_attempt=%d/%d"
+                ),
+                episode_index,
+                plan_index,
+                env_steps,
+                n_exec,
+                int(plan_np.shape[0]),
+                int(plan_meta["same_state_attempt"]),
+                int(max_plan_attempts),
+            )
 
+            should_resample = False
             for i in range(n_exec):
                 action = _sanitize_action(
                     plan_np[i],
                     normalize_quaternion=_as_bool(cfg.control.normalize_quaternion),
                     discretize_gripper=_as_bool(cfg.control.discretize_gripper),
                 )
+                action_quat = None
+                action_quat_delta_rad = None
+                action_quat_delta_deg = None
+                if action.shape[0] >= 7:
+                    action_quat = _normalize_quaternion_xyzw(action[3:7])
+                    if prev_executed_quat is not None:
+                        action_quat_delta_rad = _quat_angular_difference_rad(prev_executed_quat, action_quat)
+                        action_quat_delta_deg = float(np.degrees(action_quat_delta_rad))
                 try:
                     obs, reward, terminated = task_env.step(action.astype(np.float32))
                 except InvalidActionError as exc:
-                    error = f"InvalidActionError: {exc}"
-                    terminated = True
+                    plan_meta["failed_action_index"] = int(i)
+                    plan_meta["error"] = f"InvalidActionError: {exc}"
+                    plan_meta["failed_action_quat_delta_rad"] = action_quat_delta_rad
+                    plan_meta["failed_action_quat_delta_deg"] = action_quat_delta_deg
+                    if plan_meta["executed_actions"] == 0:
+                        consecutive_same_state_invalid_attempts += 1
+                        if consecutive_same_state_invalid_attempts < max_plan_attempts:
+                            plan_meta["status"] = "invalid_action_resampled"
+                            logging.info(
+                                (
+                                    "Episode %d | plan %d invalid at action %d; "
+                                    "resampling from same state (%d/%d)."
+                                ),
+                                episode_index,
+                                plan_index,
+                                int(i),
+                                int(consecutive_same_state_invalid_attempts),
+                                int(max_plan_attempts),
+                            )
+                            error = None
+                            terminated = False
+                            should_resample = True
+                        else:
+                            plan_meta["status"] = "invalid_action_terminal"
+                            error = str(plan_meta["error"])
+                            terminated = True
+                    else:
+                        consecutive_same_state_invalid_attempts = 0
+                        plan_meta["status"] = "invalid_action_after_progress"
+                        logging.info(
+                            (
+                                "Episode %d | plan %d invalid at action %d after %d executed "
+                                "actions; resampling from updated state."
+                            ),
+                            episode_index,
+                            plan_index,
+                            int(i),
+                            int(plan_meta["executed_actions"]),
+                        )
+                        error = None
+                        terminated = False
+                        should_resample = True
                     break
                 except Exception as exc:  # pragma: no cover - defensive path in runtime envs
+                    plan_meta["failed_action_index"] = int(i)
+                    plan_meta["error"] = f"{type(exc).__name__}: {exc}"
+                    plan_meta["status"] = "exception_terminal"
                     error = f"{type(exc).__name__}: {exc}"
                     terminated = True
                     break
 
                 env_steps += 1
+                plan_meta["executed_actions"] += 1
+                plan_meta["status"] = "executing"
                 pbar.update(1)
                 success = bool(float(reward) > 0.5)
+                executed_quaternion_deltas.append(
+                    {
+                        "executed_env_step": int(env_steps),
+                        "plan_index": int(plan_index),
+                        "action_index_in_plan": int(i),
+                        "delta_rad": action_quat_delta_rad,
+                        "delta_deg": action_quat_delta_deg,
+                    }
+                )
+                if action_quat is not None:
+                    prev_executed_quat = action_quat
                 history.append(processor.observation_to_frame(obs))
                 if _as_bool(cfg.video.enable):
                     frames.append(_extract_rgb_frame(obs, str(cfg.video.camera)))
 
                 if success or terminated or env_steps >= max_env_steps:
                     break
+
+            if plan_meta["status"] == "executing":
+                plan_meta["status"] = "completed"
+            if plan_meta["executed_actions"] > 0:
+                consecutive_same_state_invalid_attempts = 0
+            if should_resample and not success and not terminated and env_steps < max_env_steps:
+                continue
     finally:
         pbar.close()
 
     video_path = None
+    action_plot_path = None
+    actions_json_path = None
+    scene_point_cloud = None
+    if history:
+        last_frame = history[-1]
+        if "xyz" in last_frame:
+            xyz = np.asarray(last_frame["xyz"].detach().cpu().numpy(), dtype=np.float32)
+            valid = last_frame.get("valid", None)
+            if valid is not None:
+                valid_np = np.asarray(valid.detach().cpu().numpy(), dtype=bool)
+                if valid_np.shape[0] == xyz.shape[0]:
+                    xyz = xyz[valid_np]
+            scene_point_cloud = xyz
+    action_dir = run_dir / "videos"
     if _as_bool(cfg.video.enable) and len(frames) > 0:
-        video_file = run_dir / "videos" / f"episode_{episode_index:04d}.{str(cfg.video.format).lower()}"
+        video_file = action_dir / f"episode_{episode_index:04d}.{str(cfg.video.format).lower()}"
         actual = _write_video(frames, video_file, fps=int(cfg.video.fps))
         video_path = str(actual)
+
+    if len(generated_action_chunks) > 0:
+        action_dir.mkdir(parents=True, exist_ok=True)
+        actions_json_file = action_dir / f"episode_{episode_index:04d}_action_chunks.json"
+        with actions_json_file.open("w", encoding="utf-8") as f:
+            json.dump(
+                {
+                    "episode_index": int(episode_index),
+                    "chunks": generated_action_chunks,
+                    "meta": generated_action_chunk_meta,
+                    "executed_quaternion_deltas": executed_quaternion_deltas,
+                },
+                f,
+                indent=2,
+            )
+        actions_json_path = str(actions_json_file)
+
+        action_html_file = action_dir / f"episode_{episode_index:04d}_action_chunks.html"
+        actual_html = _write_action_chunks_html(
+            generated_action_chunks,
+            generated_action_chunk_meta,
+            action_html_file,
+            scene_point_cloud=scene_point_cloud,
+        )
+        action_plot_path = str(actual_html) if actual_html is not None else None
+
+    logging.info(
+        "Episode %d | executed quaternion delta series (deg)=%s",
+        episode_index,
+        [
+            None if item["delta_deg"] is None else round(float(item["delta_deg"]), 3)
+            for item in executed_quaternion_deltas
+        ],
+    )
 
     return {
         "episode_index": int(episode_index),
@@ -798,6 +1184,11 @@ def _run_eval_episode(
         "env_steps": int(env_steps),
         "error": error,
         "video_path": video_path,
+        "actions_json_path": actions_json_path,
+        "action_plot_path": action_plot_path,
+        "generated_action_chunks": generated_action_chunks,
+        "generated_action_chunk_meta": generated_action_chunk_meta,
+        "executed_quaternion_deltas": executed_quaternion_deltas,
     }
 
 
@@ -826,6 +1217,7 @@ def evaluate(cfg: ConfigDict) -> None:
     ).to(device)
     model.load_state_dict(state_dict, strict=True)
     model.eval()
+    cached_support_wrapper = _ensure_cached_support_context_encoder(model)
 
     if action_dim != 8:
         raise ValueError(
@@ -846,6 +1238,7 @@ def evaluate(cfg: ConfigDict) -> None:
     logging.info("Model cfg: encoder_name=%s | ignore_demos=%s", model_cfg.encoder_name, ignore_demos)
     logging.info("Conditioning cfg: use_mask_id=%s", use_mask_id)
     logging.info("Conditioning support_source=%s", support_source)
+    logging.info("Fast eval support encoding cache=%s", not ignore_demos)
     logging.info("Eval query_stride_mode=%s", query_stride_mode)
     logging.info(
         "Dataset cfg: K=%d L=%d T_obs=%d H=%d stride=%d",
@@ -914,8 +1307,23 @@ def evaluate(cfg: ConfigDict) -> None:
                             rng=rng,
                         )
                         logging.info("Built live support conditioning from %d demos.", dataset_cfg.K)
+                    cached_support_wrapper.update_cache(support_cond, device=device)
+                    logging.info(
+                        "Cached support encoding | demo_tokens=%s | traj_tokens=%s",
+                        (
+                            tuple(cached_support_wrapper._cached_demo_tokens.shape)
+                            if cached_support_wrapper._cached_demo_tokens is not None
+                            else None
+                        ),
+                        (
+                            tuple(cached_support_wrapper._cached_traj_tokens.shape)
+                            if cached_support_wrapper._cached_traj_tokens is not None
+                            else None
+                        ),
+                    )
             else:
                 support_cond = None
+                cached_support_wrapper.clear_cache()
 
             res = _run_eval_episode(
                 episode_index=ep,
@@ -971,6 +1379,131 @@ def main(argv: Sequence[str]) -> None:
     del argv
     cfg = _CONFIG.value
     evaluate(cfg)
+
+
+def _write_action_chunks_html(
+    action_chunks: Sequence[Sequence[Sequence[float]]],
+    chunk_meta: Sequence[Dict[str, Any]],
+    out_path: Path,
+    scene_point_cloud: Optional[np.ndarray] = None,
+) -> Optional[Path]:
+    try:
+        import plotly.graph_objects as go
+    except ImportError:
+        logging.warning("plotly is not installed; skipping HTML action-chunk plot export.")
+        return None
+
+    fig = go.Figure()
+    if scene_point_cloud is not None:
+        scene_pts = np.asarray(scene_point_cloud, dtype=np.float32)
+        if scene_pts.ndim == 2 and scene_pts.shape[0] > 0 and scene_pts.shape[1] >= 3:
+            fig.add_trace(
+                go.Scatter3d(
+                    x=scene_pts[:, 0],
+                    y=scene_pts[:, 1],
+                    z=scene_pts[:, 2],
+                    mode="markers",
+                    name="scene pointcloud",
+                    marker=dict(
+                        size=1.5,
+                        color="rgba(120,120,120,0.35)",
+                    ),
+                )
+            )
+    status_to_color = {
+        "completed": "#1f77b4",
+        "invalid_action_resampled": "#d62728",
+        "invalid_action_after_progress": "#ff7f0e",
+        "invalid_action_terminal": "#8c564b",
+        "exception_terminal": "#7f7f7f",
+        "executing": "#1f77b4",
+        "sampled": "#17becf",
+    }
+    orientation_axis_colors = (
+        ("ee x-axis", "#d62728"),
+        ("ee y-axis", "#2ca02c"),
+        ("ee z-axis", "#1f77b4"),
+    )
+    orientation_axis_length = 0.03
+    for i, chunk in enumerate(action_chunks):
+        arr = np.asarray(chunk, dtype=np.float32)
+        if arr.ndim != 2 or arr.shape[0] == 0:
+            continue
+        x = arr[:, 0] if arr.shape[1] >= 1 else np.zeros((arr.shape[0],), dtype=np.float32)
+        y = arr[:, 1] if arr.shape[1] >= 2 else np.zeros((arr.shape[0],), dtype=np.float32)
+        z = arr[:, 2] if arr.shape[1] >= 3 else np.zeros((arr.shape[0],), dtype=np.float32)
+        meta = chunk_meta[i] if i < len(chunk_meta) else {}
+        status = str(meta.get("status", "unknown"))
+        same_state_attempt = meta.get("same_state_attempt", "?")
+        failed_action_index = meta.get("failed_action_index", None)
+        name = (
+            f"plan {i} | env_step={meta.get('start_env_step', '?')} | "
+            f"attempt={same_state_attempt} | status={status} | "
+            f"exec={meta.get('executed_actions', '?')}/{meta.get('requested_execute_actions', '?')}"
+        )
+        if failed_action_index is not None:
+            name += f" | failed_idx={failed_action_index}"
+        fig.add_trace(
+            go.Scatter3d(
+                x=x,
+                y=y,
+                z=z,
+                mode="lines+markers",
+                name=name,
+                marker=dict(size=3),
+                line=dict(width=4, color=status_to_color.get(status, "#1f77b4")),
+            )
+        )
+        fig.add_trace(
+            go.Scatter3d(
+                x=[x[0]],
+                y=[y[0]],
+                z=[z[0]],
+                mode="markers",
+                name=f"{name} start",
+                marker=dict(size=5, symbol="diamond"),
+                showlegend=False,
+            )
+        )
+        if arr.shape[1] >= 7:
+            positions = arr[:, :3]
+            quats = arr[:, 3:7]
+            axis_xs: List[List[Optional[float]]] = [[], [], []]
+            axis_ys: List[List[Optional[float]]] = [[], [], []]
+            axis_zs: List[List[Optional[float]]] = [[], [], []]
+            for pos, quat in zip(positions, quats):
+                rot = _quat_xyzw_to_rotmat(quat)
+                for axis_idx in range(3):
+                    end = pos + orientation_axis_length * rot[:, axis_idx]
+                    axis_xs[axis_idx].extend([float(pos[0]), float(end[0]), None])
+                    axis_ys[axis_idx].extend([float(pos[1]), float(end[1]), None])
+                    axis_zs[axis_idx].extend([float(pos[2]), float(end[2]), None])
+            for axis_idx, (axis_name, axis_color) in enumerate(orientation_axis_colors):
+                fig.add_trace(
+                    go.Scatter3d(
+                        x=axis_xs[axis_idx],
+                        y=axis_ys[axis_idx],
+                        z=axis_zs[axis_idx],
+                        mode="lines",
+                        name=f"plan {i} {axis_name}",
+                        line=dict(width=3, color=axis_color),
+                        showlegend=True,
+                        legendgroup=f"plan-{i}-orientation-axis-{axis_idx}",
+                    )
+                )
+
+    fig.update_layout(
+        title="Generated Action Chunks",
+        scene=dict(
+            xaxis_title="x",
+            yaxis_title="y",
+            zaxis_title="z",
+        ),
+        margin=dict(l=0, r=0, b=0, t=40),
+    )
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.write_html(str(out_path), include_plotlyjs="cdn")
+    return out_path
 
 
 if __name__ == "__main__":
