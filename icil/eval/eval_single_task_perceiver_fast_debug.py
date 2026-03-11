@@ -605,6 +605,56 @@ def _build_cached_support_conditioning(
     return support
 
 
+def _build_cached_x0_plot_batch(
+    *,
+    store: VariationStore,
+    dataset_cfg: ICILConfig,
+    variation: int,
+    rng: np.random.Generator,
+    batch_size: int,
+) -> Optional[Dict[str, Any]]:
+    vidx = _select_support_vidx(store, variation=variation, rng=rng)
+    sampler = ICILSamplerCore(store=store, cfg=dataset_cfg, seed=int(rng.integers(1 << 31)))
+
+    samples: List[Dict[str, Any]] = []
+    tries = 0
+    max_tries = max(int(batch_size), 1) * int(sampler.num_tries_per_item)
+    while len(samples) < int(batch_size) and tries < max_tries:
+        s = sampler._build_one_sample(rng, vidx=vidx)
+        tries += 1
+        if s is None:
+            continue
+        samples.append(s)
+
+    if not samples:
+        return None
+
+    batch: Dict[str, Any] = {
+        "cond_xyz": torch.stack([s["cond_xyz"] for s in samples], 0),
+        "cond_state": torch.stack([s["cond_state"] for s in samples], 0),
+        "cond_valid": torch.stack([s["cond_valid"] for s in samples], 0),
+        "query_xyz": torch.stack([s["query_xyz"] for s in samples], 0),
+        "query_state": torch.stack([s["query_state"] for s in samples], 0),
+        "query_valid": torch.stack([s["query_valid"] for s in samples], 0),
+        "target_action": torch.stack([s["target_action"] for s in samples], 0),
+        "meta": [s["meta"] for s in samples],
+    }
+    if all("cond_mask_id" in s for s in samples):
+        batch["cond_mask_id"] = torch.stack([s["cond_mask_id"] for s in samples], 0)
+    if all("query_mask_id" in s for s in samples):
+        batch["query_mask_id"] = torch.stack([s["query_mask_id"] for s in samples], 0)
+    if all("cond_rgb" in s for s in samples):
+        batch["cond_rgb"] = torch.stack([s["cond_rgb"] for s in samples], 0)
+    if all("query_rgb" in s for s in samples):
+        batch["query_rgb"] = torch.stack([s["query_rgb"] for s in samples], 0)
+    if all("cond_traj" in s and "cond_traj_mask" in s for s in samples):
+        batch["cond_traj"], batch["cond_traj_mask"] = sampler._pad_traj_items(
+            [s["cond_traj"] for s in samples],
+            [s["cond_traj_mask"] for s in samples],
+        )
+    return batch
+
+
 def _build_query_window(
     history: Sequence[Dict[str, torch.Tensor]],
     *,
@@ -916,6 +966,7 @@ def _run_eval_episode(
     generated_action_chunks: List[List[List[float]]] = []
     generated_action_chunk_meta: List[Dict[str, Any]] = []
     executed_quaternion_deltas: List[Dict[str, Any]] = []
+    query_pointcloud_plot_paths: List[str] = []
     prev_executed_quat: Optional[np.ndarray] = None
     max_plan_attempts = 8
     consecutive_same_state_invalid_attempts = 0
@@ -1006,8 +1057,30 @@ def _run_eval_episode(
                 "failed_action_index": None,
                 "failed_action_quat_delta_rad": None,
                 "failed_action_quat_delta_deg": None,
+                "query_pointcloud_html_path": None,
             }
             generated_action_chunk_meta.append(plan_meta)
+            action_dir = run_dir / "videos"
+            action_dir.mkdir(parents=True, exist_ok=True)
+            query_html_file = action_dir / (
+                f"episode_{episode_index:04d}_plan_{plan_index:03d}_query_pointcloud.html"
+            )
+            actual_query_html = _write_query_pointcloud_html(
+                query_xyz=query["query_xyz"][0].detach().cpu().numpy(),
+                query_valid=(
+                    query["query_valid"][0].detach().cpu().numpy()
+                    if "query_valid" in query
+                    else None
+                ),
+                out_path=query_html_file,
+                title=(
+                    f"Live query pointcloud | episode={episode_index} | "
+                    f"plan={plan_index} | env_step={env_steps}"
+                ),
+            )
+            if actual_query_html is not None:
+                plan_meta["query_pointcloud_html_path"] = str(actual_query_html)
+                query_pointcloud_plot_paths.append(str(actual_query_html))
             logging.info(
                 (
                     "Episode %d | plan %d | start_env_step=%d | requested_execute=%d | "
@@ -1186,6 +1259,7 @@ def _run_eval_episode(
         "video_path": video_path,
         "actions_json_path": actions_json_path,
         "action_plot_path": action_plot_path,
+        "query_pointcloud_plot_paths": query_pointcloud_plot_paths,
         "generated_action_chunks": generated_action_chunks,
         "generated_action_chunk_meta": generated_action_chunk_meta,
         "executed_quaternion_deltas": executed_quaternion_deltas,
@@ -1254,6 +1328,8 @@ def evaluate(cfg: ConfigDict) -> None:
     support_store: Optional[VariationStore] = None
     results: List[Dict[str, Any]] = []
     support_cond: Optional[Dict[str, Any]] = None
+    cached_x0_plot_paths: List[str] = []
+    cached_query_pointcloud_plot_paths: List[str] = []
 
     try:
         if not ignore_demos and support_source == "cache":
@@ -1265,6 +1341,81 @@ def evaluate(cfg: ConfigDict) -> None:
                 raise RuntimeError(f"No cached variations found for task '{task_name}' under {cache_root}.")
             support_store = VariationStore(task_keys, keep_open_per_worker=True)
             logging.info("Using cached support from %s", cache_root)
+
+            # Before enabling the fixed support-token cache for live eval, build a
+            # few train-style cached samples and export pred-vs-gt x0 HTML plots.
+            sanity_rng = np.random.default_rng(seed + 101)
+            sanity_batch = _build_cached_x0_plot_batch(
+                store=support_store,
+                dataset_cfg=dataset_cfg,
+                variation=variation,
+                rng=sanity_rng,
+                batch_size=16,
+            )
+            if sanity_batch is not None:
+                model_batch = _move_tensor_dict_to_device(sanity_batch, device)
+                with torch.no_grad():
+                    pred_x0 = model.sample_actions(
+                        cond_xyz=model_batch["cond_xyz"],
+                        cond_state=model_batch["cond_state"],
+                        cond_traj=model_batch.get("cond_traj", None),
+                        cond_traj_mask=model_batch.get("cond_traj_mask", None),
+                        query_xyz=model_batch["query_xyz"],
+                        query_state=model_batch["query_state"],
+                        action_horizon=int(model_batch["target_action"].shape[1]),
+                        cond_rgb=model_batch.get("cond_rgb", None),
+                        query_rgb=model_batch.get("query_rgb", None),
+                        cond_mask_id=(model_batch.get("cond_mask_id", None) if use_mask_id else None),
+                        query_mask_id=(model_batch.get("query_mask_id", None) if use_mask_id else None),
+                        cond_valid=model_batch.get("cond_valid", None),
+                        query_valid=model_batch.get("query_valid", None),
+                        inference_steps=int(cfg.inference.inference_steps),
+                        eta=float(cfg.inference.eta),
+                    )
+                x0_plot_dir = run_dir / "cached_x0_pred_vs_gt"
+                x0_plot_dir.mkdir(parents=True, exist_ok=True)
+                pred_np = pred_x0.detach().float().cpu().numpy()
+                gt_np = sanity_batch["target_action"].detach().float().cpu().numpy()
+                qxyz_np = sanity_batch["query_xyz"].detach().float().cpu().numpy()
+                qvalid_np = sanity_batch.get("query_valid", None)
+                qvalid_np = qvalid_np.detach().bool().cpu().numpy() if qvalid_np is not None else None
+                for i in range(int(pred_np.shape[0])):
+                    meta = sanity_batch["meta"][i] if i < len(sanity_batch["meta"]) else {}
+                    out_path = x0_plot_dir / (
+                        f"sample_{i:02d}_ep{int(meta.get('query_episode', -1)):04d}_"
+                        f"t0_{int(meta.get('t0', -1)):04d}.html"
+                    )
+                    actual = _write_pred_vs_gt_x0_html(
+                        pred_x0=pred_np[i],
+                        gt_x0=gt_np[i],
+                        query_xyz=qxyz_np[i],
+                        query_valid=(qvalid_np[i] if qvalid_np is not None else None),
+                        out_path=out_path,
+                        title=(
+                            f"Cached x0 pred vs gt | sample={i} | "
+                            f"episode={meta.get('query_episode', '?')} | t0={meta.get('t0', '?')}"
+                        ),
+                    )
+                    if actual is not None:
+                        cached_x0_plot_paths.append(str(actual))
+                    query_out_path = x0_plot_dir / (
+                        f"sample_{i:02d}_ep{int(meta.get('query_episode', -1)):04d}_"
+                        f"t0_{int(meta.get('t0', -1)):04d}_query_pointcloud.html"
+                    )
+                    actual_query = _write_query_pointcloud_html(
+                        query_xyz=qxyz_np[i],
+                        query_valid=(qvalid_np[i] if qvalid_np is not None else None),
+                        out_path=query_out_path,
+                        title=(
+                            f"Cached query pointcloud | sample={i} | "
+                            f"episode={meta.get('query_episode', '?')} | t0={meta.get('t0', '?')}"
+                        ),
+                    )
+                    if actual_query is not None:
+                        cached_query_pointcloud_plot_paths.append(str(actual_query))
+                logging.info("Saved %d cached x0 pred-vs-gt HTML plots under %s", len(cached_x0_plot_paths), x0_plot_dir)
+            else:
+                logging.warning("Could not build cached x0 sanity batch; skipping cached pred-vs-gt plots.")
 
         env, task_env = _build_rlbench_env(cfg, task_name)
         processor = _LiveConditioningProcessor(
@@ -1354,6 +1505,8 @@ def evaluate(cfg: ConfigDict) -> None:
             "task": task_name,
             "variation": variation,
             "checkpoint_path": str(checkpoint_path),
+            "cached_x0_plot_paths": cached_x0_plot_paths,
+            "cached_query_pointcloud_plot_paths": cached_query_pointcloud_plot_paths,
             "num_episodes": len(results),
             "num_success": int(n_success),
             "success_rate": success_rate,
@@ -1494,6 +1647,177 @@ def _write_action_chunks_html(
 
     fig.update_layout(
         title="Generated Action Chunks",
+        scene=dict(
+            xaxis_title="x",
+            yaxis_title="y",
+            zaxis_title="z",
+        ),
+        margin=dict(l=0, r=0, b=0, t=40),
+    )
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.write_html(str(out_path), include_plotlyjs="cdn")
+    return out_path
+
+
+def _write_pred_vs_gt_x0_html(
+    *,
+    pred_x0: np.ndarray,
+    gt_x0: np.ndarray,
+    query_xyz: Optional[np.ndarray],
+    query_valid: Optional[np.ndarray],
+    out_path: Path,
+    title: str,
+) -> Optional[Path]:
+    try:
+        import plotly.graph_objects as go
+    except ImportError:
+        logging.warning("plotly is not installed; skipping cached x0 pred-vs-gt HTML export.")
+        return None
+
+    pred = np.asarray(pred_x0, dtype=np.float32)
+    gt = np.asarray(gt_x0, dtype=np.float32)
+    if pred.ndim != 2 or gt.ndim != 2 or pred.shape[0] == 0 or gt.shape[0] == 0:
+        return None
+
+    fig = go.Figure()
+
+    if query_xyz is not None:
+        pts = np.asarray(query_xyz, dtype=np.float32)
+        if pts.ndim == 3:
+            pts = pts[-1]
+        if pts.ndim == 2 and pts.shape[1] >= 3:
+            if query_valid is not None:
+                valid = np.asarray(query_valid, dtype=bool)
+                if valid.ndim == 2:
+                    valid = valid[-1]
+                if valid.ndim == 1 and valid.shape[0] == pts.shape[0]:
+                    pts = pts[valid]
+            if pts.shape[0] > 0:
+                pts = pts[np.isfinite(pts).all(axis=1)]
+            if pts.shape[0] > 4096:
+                idx = np.linspace(0, pts.shape[0] - 1, 4096, dtype=np.int64)
+                pts = pts[idx]
+            if pts.shape[0] > 0:
+                fig.add_trace(
+                    go.Scatter3d(
+                        x=pts[:, 0],
+                        y=pts[:, 1],
+                        z=pts[:, 2],
+                        mode="markers",
+                        name="query pointcloud",
+                        marker=dict(size=1.5, color="rgba(180,180,180,0.35)"),
+                    )
+                )
+
+    def _xyz(arr: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        H, A = arr.shape
+        x = arr[:, 0] if A >= 1 else np.zeros((H,), dtype=np.float32)
+        y = arr[:, 1] if A >= 2 else np.zeros((H,), dtype=np.float32)
+        z = arr[:, 2] if A >= 3 else np.zeros((H,), dtype=np.float32)
+        return x, y, z
+
+    gx, gy, gz = _xyz(gt)
+    px, py, pz = _xyz(pred)
+    fig.add_trace(
+        go.Scatter3d(
+            x=gx, y=gy, z=gz,
+            mode="lines+markers",
+            name="gt x0",
+            line=dict(width=5, color="#2ca02c"),
+            marker=dict(size=3),
+        )
+    )
+    fig.add_trace(
+        go.Scatter3d(
+            x=px, y=py, z=pz,
+            mode="lines+markers",
+            name="pred x0",
+            line=dict(width=5, color="#ff7f0e"),
+            marker=dict(size=3),
+        )
+    )
+    fig.add_trace(
+        go.Scatter3d(
+            x=[gx[0]], y=[gy[0]], z=[gz[0]],
+            mode="markers",
+            name="gt start",
+            marker=dict(size=5, color="#2ca02c", symbol="diamond"),
+            showlegend=False,
+        )
+    )
+    fig.add_trace(
+        go.Scatter3d(
+            x=[px[0]], y=[py[0]], z=[pz[0]],
+            mode="markers",
+            name="pred start",
+            marker=dict(size=5, color="#ff7f0e", symbol="diamond"),
+            showlegend=False,
+        )
+    )
+
+    fig.update_layout(
+        title=title,
+        scene=dict(
+            xaxis_title="x",
+            yaxis_title="y",
+            zaxis_title="z",
+        ),
+        margin=dict(l=0, r=0, b=0, t=40),
+    )
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.write_html(str(out_path), include_plotlyjs="cdn")
+    return out_path
+
+
+def _write_query_pointcloud_html(
+    *,
+    query_xyz: Optional[np.ndarray],
+    query_valid: Optional[np.ndarray],
+    out_path: Path,
+    title: str,
+) -> Optional[Path]:
+    try:
+        import plotly.graph_objects as go
+    except ImportError:
+        logging.warning("plotly is not installed; skipping query-pointcloud HTML export.")
+        return None
+
+    if query_xyz is None:
+        return None
+
+    pts = np.asarray(query_xyz, dtype=np.float32)
+    if pts.ndim == 3:
+        pts = pts[-1]
+    if pts.ndim != 2 or pts.shape[1] < 3:
+        return None
+
+    if query_valid is not None:
+        valid = np.asarray(query_valid, dtype=bool)
+        if valid.ndim == 2:
+            valid = valid[-1]
+        if valid.ndim == 1 and valid.shape[0] == pts.shape[0]:
+            pts = pts[valid]
+    if pts.shape[0] > 0:
+        pts = pts[np.isfinite(pts).all(axis=1)]
+    if pts.shape[0] > 4096:
+        idx = np.linspace(0, pts.shape[0] - 1, 4096, dtype=np.int64)
+        pts = pts[idx]
+    if pts.shape[0] == 0:
+        return None
+
+    fig = go.Figure()
+    fig.add_trace(
+        go.Scatter3d(
+            x=pts[:, 0],
+            y=pts[:, 1],
+            z=pts[:, 2],
+            mode="markers",
+            name="query pointcloud",
+            marker=dict(size=1.5, color="rgba(180,180,180,0.5)"),
+        )
+    )
+    fig.update_layout(
+        title=title,
         scene=dict(
             xaxis_title="x",
             yaxis_title="y",
