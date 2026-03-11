@@ -7,6 +7,7 @@ from dataclasses import fields, is_dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
+import h5py
 import numpy as np
 import torch
 from absl import app, logging
@@ -242,6 +243,48 @@ def _support_cache_root_from_eval_and_checkpoint(cfg: ConfigDict, ckpt: Dict[str
     if not cache_root.is_dir():
         raise FileNotFoundError(f"Support cache root not found: {cache_root}")
     return cache_root
+
+
+def _warn_if_cached_num_points_mismatch(
+    *,
+    task_keys: Sequence[Any],
+    expected_num_points: int,
+    task_name: str,
+) -> None:
+    detected_values: List[int] = []
+    inspected_paths: List[str] = []
+    for key in task_keys:
+        path = Path(str(key.path)).expanduser().resolve()
+        try:
+            with h5py.File(path, "r") as f:
+                detected = int(f.attrs.get("N", -1))
+        except Exception as exc:
+            logging.warning("Could not inspect cached point count from %s: %s", path, exc)
+            continue
+        if detected > 0:
+            detected_values.append(detected)
+            inspected_paths.append(str(path))
+
+    if not detected_values:
+        return
+
+    unique_detected = sorted(set(int(v) for v in detected_values))
+    if len(unique_detected) > 1 or int(expected_num_points) not in unique_detected:
+        logging.warning("============================================================")
+        logging.warning(
+            "POINT-COUNT MISMATCH: cfg.conditioning.num_points=%d, but cached task '%s' stores N=%s.",
+            int(expected_num_points),
+            task_name,
+            unique_detected,
+        )
+        logging.warning(
+            "Live observations will be resampled to %d points, while cached support/training data uses N=%s.",
+            int(expected_num_points),
+            unique_detected,
+        )
+        if inspected_paths:
+            logging.warning("Inspected cache files: %s", inspected_paths)
+        logging.warning("============================================================")
 
 
 def _normalize_quaternion_xyzw(q: np.ndarray) -> np.ndarray:
@@ -861,17 +904,25 @@ def evaluate(cfg: ConfigDict) -> None:
     support_store: Optional[VariationStore] = None
     results: List[Dict[str, Any]] = []
     support_cond: Optional[Dict[str, Any]] = None
+    cache_root: Optional[Path] = None
+    task_keys: Optional[List[Any]] = None
 
     try:
-        if not ignore_demos and support_source == "cache":
+        if support_source == "cache":
             if variation < 0:
                 raise ValueError("Cached support conditioning requires cfg.task.variation >= 0.")
             cache_root = _support_cache_root_from_eval_and_checkpoint(cfg, ckpt)
             task_keys = build_variation_keys(cache_root, task_name)
             if not task_keys:
                 raise RuntimeError(f"No cached variations found for task '{task_name}' under {cache_root}.")
-            support_store = VariationStore(task_keys, keep_open_per_worker=True)
-            logging.info("Using cached support from %s", cache_root)
+            _warn_if_cached_num_points_mismatch(
+                task_keys=task_keys,
+                expected_num_points=int(cfg.conditioning.num_points),
+                task_name=task_name,
+            )
+            if not ignore_demos:
+                support_store = VariationStore(task_keys, keep_open_per_worker=True)
+                logging.info("Using cached support from %s", cache_root)
 
         env, task_env = _build_rlbench_env(cfg, task_name)
         processor = _LiveConditioningProcessor(

@@ -328,6 +328,7 @@ def _plot_pred_vs_gt_3d(
 
     for i in range(n):
         ax = fig.add_subplot(rows, cols, i + 1, projection="3d")
+        query_pts_for_limits: Optional[np.ndarray] = None
         if include_query_pointcloud and qxyz is not None:
             if qxyz.ndim == 4:
                 pts = qxyz[i, -1]
@@ -346,6 +347,7 @@ def _plot_pred_vs_gt_3d(
                     idx = np.linspace(0, pts.shape[0] - 1, int(max_query_points), dtype=np.int64)
                     pts = pts[idx]
                 if pts.shape[0] > 0:
+                    query_pts_for_limits = pts
                     ax.scatter(
                         pts[:, 0],
                         pts[:, 1],
@@ -368,6 +370,22 @@ def _plot_pred_vs_gt_3d(
         ax.set_xlabel("x")
         ax.set_ylabel("y")
         ax.set_zlabel("z")
+        all_pts = [
+            np.stack([gx, gy, gz], axis=1),
+            np.stack([px, py, pz], axis=1),
+        ]
+        if query_pts_for_limits is not None:
+            all_pts.append(query_pts_for_limits[:, :3])
+        pts_all = np.concatenate(all_pts, axis=0)
+        mins = pts_all.min(axis=0)
+        maxs = pts_all.max(axis=0)
+        center = 0.5 * (mins + maxs)
+        half_range = 0.5 * float(np.max(maxs - mins))
+        if half_range < 1e-6:
+            half_range = 1e-3
+        ax.set_xlim(center[0] - half_range, center[0] + half_range)
+        ax.set_ylim(center[1] - half_range, center[1] + half_range)
+        ax.set_zlim(center[2] - half_range, center[2] + half_range)
 
     fig.tight_layout()
     return fig

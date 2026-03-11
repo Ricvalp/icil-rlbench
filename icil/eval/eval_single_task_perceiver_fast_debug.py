@@ -7,6 +7,7 @@ from dataclasses import fields, is_dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
+import h5py
 import numpy as np
 import torch
 import torch.nn as nn
@@ -246,6 +247,48 @@ def _support_cache_root_from_eval_and_checkpoint(cfg: ConfigDict, ckpt: Dict[str
     if not cache_root.is_dir():
         raise FileNotFoundError(f"Support cache root not found: {cache_root}")
     return cache_root
+
+
+def _warn_if_cached_num_points_mismatch(
+    *,
+    task_keys: Sequence[Any],
+    expected_num_points: int,
+    task_name: str,
+) -> None:
+    detected_values: List[int] = []
+    inspected_paths: List[str] = []
+    for key in task_keys:
+        path = Path(str(key.path)).expanduser().resolve()
+        try:
+            with h5py.File(path, "r") as f:
+                detected = int(f.attrs.get("N", -1))
+        except Exception as exc:
+            logging.warning("Could not inspect cached point count from %s: %s", path, exc)
+            continue
+        if detected > 0:
+            detected_values.append(detected)
+            inspected_paths.append(str(path))
+
+    if not detected_values:
+        return
+
+    unique_detected = sorted(set(int(v) for v in detected_values))
+    if len(unique_detected) > 1 or int(expected_num_points) not in unique_detected:
+        logging.warning("============================================================")
+        logging.warning(
+            "POINT-COUNT MISMATCH: cfg.conditioning.num_points=%d, but cached task '%s' stores N=%s.",
+            int(expected_num_points),
+            task_name,
+            unique_detected,
+        )
+        logging.warning(
+            "Live observations will be resampled to %d points, while cached support/training data uses N=%s.",
+            int(expected_num_points),
+            unique_detected,
+        )
+        if inspected_paths:
+            logging.warning("Inspected cache files: %s", inspected_paths)
+        logging.warning("============================================================")
 
 
 def _normalize_quaternion_xyzw(q: np.ndarray) -> np.ndarray:
@@ -1330,92 +1373,100 @@ def evaluate(cfg: ConfigDict) -> None:
     support_cond: Optional[Dict[str, Any]] = None
     cached_x0_plot_paths: List[str] = []
     cached_query_pointcloud_plot_paths: List[str] = []
+    cache_root: Optional[Path] = None
+    task_keys: Optional[List[Any]] = None
 
     try:
-        if not ignore_demos and support_source == "cache":
+        if support_source == "cache":
             if variation < 0:
                 raise ValueError("Cached support conditioning requires cfg.task.variation >= 0.")
             cache_root = _support_cache_root_from_eval_and_checkpoint(cfg, ckpt)
             task_keys = build_variation_keys(cache_root, task_name)
             if not task_keys:
                 raise RuntimeError(f"No cached variations found for task '{task_name}' under {cache_root}.")
-            support_store = VariationStore(task_keys, keep_open_per_worker=True)
-            logging.info("Using cached support from %s", cache_root)
-
-            # Before enabling the fixed support-token cache for live eval, build a
-            # few train-style cached samples and export pred-vs-gt x0 HTML plots.
-            sanity_rng = np.random.default_rng(seed + 101)
-            sanity_batch = _build_cached_x0_plot_batch(
-                store=support_store,
-                dataset_cfg=dataset_cfg,
-                variation=variation,
-                rng=sanity_rng,
-                batch_size=1,
+            _warn_if_cached_num_points_mismatch(
+                task_keys=task_keys,
+                expected_num_points=int(cfg.conditioning.num_points),
+                task_name=task_name,
             )
-            if sanity_batch is not None:
-                model_batch = _move_tensor_dict_to_device(sanity_batch, device)
-                with torch.no_grad():
-                    pred_x0 = model.sample_actions(
-                        cond_xyz=model_batch["cond_xyz"],
-                        cond_state=model_batch["cond_state"],
-                        cond_traj=model_batch.get("cond_traj", None),
-                        cond_traj_mask=model_batch.get("cond_traj_mask", None),
-                        query_xyz=model_batch["query_xyz"],
-                        query_state=model_batch["query_state"],
-                        action_horizon=int(model_batch["target_action"].shape[1]),
-                        cond_rgb=model_batch.get("cond_rgb", None),
-                        query_rgb=model_batch.get("query_rgb", None),
-                        cond_mask_id=(model_batch.get("cond_mask_id", None) if use_mask_id else None),
-                        query_mask_id=(model_batch.get("query_mask_id", None) if use_mask_id else None),
-                        cond_valid=model_batch.get("cond_valid", None),
-                        query_valid=model_batch.get("query_valid", None),
-                        inference_steps=int(cfg.inference.inference_steps),
-                        eta=float(cfg.inference.eta),
-                    )
-                x0_plot_dir = run_dir / "cached_x0_pred_vs_gt"
-                x0_plot_dir.mkdir(parents=True, exist_ok=True)
-                pred_np = pred_x0.detach().float().cpu().numpy()
-                gt_np = sanity_batch["target_action"].detach().float().cpu().numpy()
-                qxyz_np = sanity_batch["query_xyz"].detach().float().cpu().numpy()
-                qvalid_np = sanity_batch.get("query_valid", None)
-                qvalid_np = qvalid_np.detach().bool().cpu().numpy() if qvalid_np is not None else None
-                for i in range(int(pred_np.shape[0])):
-                    meta = sanity_batch["meta"][i] if i < len(sanity_batch["meta"]) else {}
-                    out_path = x0_plot_dir / (
-                        f"sample_{i:02d}_ep{int(meta.get('query_episode', -1)):04d}_"
-                        f"t0_{int(meta.get('t0', -1)):04d}.html"
-                    )
-                    actual = _write_pred_vs_gt_x0_html(
-                        pred_x0=pred_np[i],
-                        gt_x0=gt_np[i],
-                        query_xyz=qxyz_np[i],
-                        query_valid=(qvalid_np[i] if qvalid_np is not None else None),
-                        out_path=out_path,
-                        title=(
-                            f"Cached x0 pred vs gt | sample={i} | "
-                            f"episode={meta.get('query_episode', '?')} | t0={meta.get('t0', '?')}"
-                        ),
-                    )
-                    if actual is not None:
-                        cached_x0_plot_paths.append(str(actual))
-                    query_out_path = x0_plot_dir / (
-                        f"sample_{i:02d}_ep{int(meta.get('query_episode', -1)):04d}_"
-                        f"t0_{int(meta.get('t0', -1)):04d}_query_pointcloud.html"
-                    )
-                    actual_query = _write_query_pointcloud_html(
-                        query_xyz=qxyz_np[i],
-                        query_valid=(qvalid_np[i] if qvalid_np is not None else None),
-                        out_path=query_out_path,
-                        title=(
-                            f"Cached query pointcloud | sample={i} | "
-                            f"episode={meta.get('query_episode', '?')} | t0={meta.get('t0', '?')}"
-                        ),
-                    )
-                    if actual_query is not None:
-                        cached_query_pointcloud_plot_paths.append(str(actual_query))
-                logging.info("Saved %d cached x0 pred-vs-gt HTML plots under %s", len(cached_x0_plot_paths), x0_plot_dir)
-            else:
-                logging.warning("Could not build cached x0 sanity batch; skipping cached pred-vs-gt plots.")
+            if not ignore_demos:
+                support_store = VariationStore(task_keys, keep_open_per_worker=True)
+                logging.info("Using cached support from %s", cache_root)
+
+                # Before enabling the fixed support-token cache for live eval, build a
+                # few train-style cached samples and export pred-vs-gt x0 HTML plots.
+                sanity_rng = np.random.default_rng(seed + 101)
+                sanity_batch = _build_cached_x0_plot_batch(
+                    store=support_store,
+                    dataset_cfg=dataset_cfg,
+                    variation=variation,
+                    rng=sanity_rng,
+                    batch_size=1,
+                )
+                if sanity_batch is not None:
+                    model_batch = _move_tensor_dict_to_device(sanity_batch, device)
+                    with torch.no_grad():
+                        pred_x0 = model.sample_actions(
+                            cond_xyz=model_batch["cond_xyz"],
+                            cond_state=model_batch["cond_state"],
+                            cond_traj=model_batch.get("cond_traj", None),
+                            cond_traj_mask=model_batch.get("cond_traj_mask", None),
+                            query_xyz=model_batch["query_xyz"],
+                            query_state=model_batch["query_state"],
+                            action_horizon=int(model_batch["target_action"].shape[1]),
+                            cond_rgb=model_batch.get("cond_rgb", None),
+                            query_rgb=model_batch.get("query_rgb", None),
+                            cond_mask_id=(model_batch.get("cond_mask_id", None) if use_mask_id else None),
+                            query_mask_id=(model_batch.get("query_mask_id", None) if use_mask_id else None),
+                            cond_valid=model_batch.get("cond_valid", None),
+                            query_valid=model_batch.get("query_valid", None),
+                            inference_steps=int(cfg.inference.inference_steps),
+                            eta=float(cfg.inference.eta),
+                        )
+                    x0_plot_dir = run_dir / "cached_x0_pred_vs_gt"
+                    x0_plot_dir.mkdir(parents=True, exist_ok=True)
+                    pred_np = pred_x0.detach().float().cpu().numpy()
+                    gt_np = sanity_batch["target_action"].detach().float().cpu().numpy()
+                    qxyz_np = sanity_batch["query_xyz"].detach().float().cpu().numpy()
+                    qvalid_np = sanity_batch.get("query_valid", None)
+                    qvalid_np = qvalid_np.detach().bool().cpu().numpy() if qvalid_np is not None else None
+                    for i in range(int(pred_np.shape[0])):
+                        meta = sanity_batch["meta"][i] if i < len(sanity_batch["meta"]) else {}
+                        out_path = x0_plot_dir / (
+                            f"sample_{i:02d}_ep{int(meta.get('query_episode', -1)):04d}_"
+                            f"t0_{int(meta.get('t0', -1)):04d}.html"
+                        )
+                        actual = _write_pred_vs_gt_x0_html(
+                            pred_x0=pred_np[i],
+                            gt_x0=gt_np[i],
+                            query_xyz=qxyz_np[i],
+                            query_valid=(qvalid_np[i] if qvalid_np is not None else None),
+                            out_path=out_path,
+                            title=(
+                                f"Cached x0 pred vs gt | sample={i} | "
+                                f"episode={meta.get('query_episode', '?')} | t0={meta.get('t0', '?')}"
+                            ),
+                        )
+                        if actual is not None:
+                            cached_x0_plot_paths.append(str(actual))
+                        query_out_path = x0_plot_dir / (
+                            f"sample_{i:02d}_ep{int(meta.get('query_episode', -1)):04d}_"
+                            f"t0_{int(meta.get('t0', -1)):04d}_query_pointcloud.html"
+                        )
+                        actual_query = _write_query_pointcloud_html(
+                            query_xyz=qxyz_np[i],
+                            query_valid=(qvalid_np[i] if qvalid_np is not None else None),
+                            out_path=query_out_path,
+                            title=(
+                                f"Cached query pointcloud | sample={i} | "
+                                f"episode={meta.get('query_episode', '?')} | t0={meta.get('t0', '?')}"
+                            ),
+                        )
+                        if actual_query is not None:
+                            cached_query_pointcloud_plot_paths.append(str(actual_query))
+                    logging.info("Saved %d cached x0 pred-vs-gt HTML plots under %s", len(cached_x0_plot_paths), x0_plot_dir)
+                else:
+                    logging.warning("Could not build cached x0 sanity batch; skipping cached pred-vs-gt plots.")
 
         env, task_env = _build_rlbench_env(cfg, task_name)
         processor = _LiveConditioningProcessor(

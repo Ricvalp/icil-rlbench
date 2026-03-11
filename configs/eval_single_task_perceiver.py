@@ -58,7 +58,7 @@ def get_config():
     cfg.video = ConfigDict()
     cfg.video.enable = True
     cfg.video.camera = "front"  # left_shoulder | right_shoulder | overhead | wrist | front
-    cfg.video.fps = 20
+    cfg.video.fps = 10
     cfg.video.format = "mp4"  # mp4 | gif
 
     cfg.output = ConfigDict()
