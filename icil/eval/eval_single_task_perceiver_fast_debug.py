@@ -1350,7 +1350,7 @@ def evaluate(cfg: ConfigDict) -> None:
                 dataset_cfg=dataset_cfg,
                 variation=variation,
                 rng=sanity_rng,
-                batch_size=16,
+                batch_size=1,
             )
             if sanity_batch is not None:
                 model_batch = _move_tensor_dict_to_device(sanity_batch, device)
