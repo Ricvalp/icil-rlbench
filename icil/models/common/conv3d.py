@@ -143,8 +143,6 @@ class SparseVoxelConvTokenizer(nn.Module):
         h = self._hash_coords(vcoord)
         # sort by hash for searchsorted lookup
         hs, order = torch.sort(h)
-        inv_order = torch.empty_like(order)
-        inv_order[order] = torch.arange(V, device=device)
 
         def lookup(qcoord: torch.Tensor) -> torch.Tensor:
             qh = self._hash_coords(qcoord)
@@ -187,7 +185,7 @@ class SparseVoxelConvTokenizer(nn.Module):
         if point_mask is None:
             point_mask = torch.ones((Bf, N), device=point_tokens.device, dtype=torch.bool)
         else:
-            point_mask = point_mask.to(torch.bool)
+            point_mask = point_mask.to(device=point_tokens.device, dtype=torch.bool)
 
         out = []
         for b in range(Bf):

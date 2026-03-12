@@ -4,10 +4,14 @@ from dataclasses import dataclass, field
 from typing import Callable, Dict, Tuple
 
 from icil.models.encoders import (
+    Conv3dDemoQueryEncoder,
+    Conv3dDemoQueryEncoderConfig,
     ContextEncoder,
     PerceiverDemoQueryEncoder,
     PerceiverDemoQueryEncoderConfig,
+    TrajConv3DConfig,
     TrajPerceiverConfig,
+    TrajectoryConv3DEncoder,
     TrajectoryPerceiverEncoder,
 )
 from icil.models.policies.policy import Policy, PolicyConfig
@@ -17,11 +21,25 @@ from icil.models.policies.policy import Policy, PolicyConfig
 class PolicyBuilderConfig:
     policy: PolicyConfig = field(default_factory=PolicyConfig)
     encoder_name: str = "perceiver_demo_query"
+    conv3d_demo_query: Conv3dDemoQueryEncoderConfig = field(default_factory=Conv3dDemoQueryEncoderConfig)
     perceiver_demo_query: PerceiverDemoQueryEncoderConfig = field(default_factory=PerceiverDemoQueryEncoderConfig)
+    traj_conv3d: TrajConv3DConfig = field(default_factory=TrajConv3DConfig)
     traj_perceiver: TrajPerceiverConfig = field(default_factory=TrajPerceiverConfig)
 
 
 ContextEncoderBuilder = Callable[[PolicyBuilderConfig, int, int], ContextEncoder]
+
+
+def _build_conv3d_demo_query_encoder(
+    cfg: PolicyBuilderConfig,
+    state_dim: int,
+    action_dim: int,
+) -> ContextEncoder:
+    return Conv3dDemoQueryEncoder(
+        cfg=cfg.conv3d_demo_query,
+        state_dim=state_dim,
+        action_dim=action_dim,
+    )
 
 
 def _build_perceiver_demo_query_encoder(
@@ -48,8 +66,22 @@ def _build_traj_perceiver_encoder(
     )
 
 
+def _build_traj_conv3d_encoder(
+    cfg: PolicyBuilderConfig,
+    state_dim: int,
+    action_dim: int,
+) -> ContextEncoder:
+    return TrajectoryConv3DEncoder(
+        cfg=cfg.traj_conv3d,
+        state_dim=state_dim,
+        action_dim=action_dim,
+    )
+
+
 _ENCODER_BUILDERS: Dict[str, ContextEncoderBuilder] = {
+    "conv3d_demo_query": _build_conv3d_demo_query_encoder,
     "perceiver_demo_query": _build_perceiver_demo_query_encoder,
+    "traj_conv3d": _build_traj_conv3d_encoder,
     "traj_perceiver": _build_traj_perceiver_encoder,
 }
 
@@ -78,8 +110,12 @@ def validate_builder_config(cfg: PolicyBuilderConfig) -> None:
             f"Invalid policy heads config: d_model={cfg.policy.d_model}, n_heads={cfg.policy.n_heads}."
         )
 
-    if cfg.encoder_name == "perceiver_demo_query":
+    if cfg.encoder_name == "conv3d_demo_query":
+        enc_d = int(cfg.conv3d_demo_query.d_model)
+    elif cfg.encoder_name == "perceiver_demo_query":
         enc_d = int(cfg.perceiver_demo_query.d_model)
+    elif cfg.encoder_name == "traj_conv3d":
+        enc_d = int(cfg.traj_conv3d.d_model)
     elif cfg.encoder_name == "traj_perceiver":
         enc_d = int(cfg.traj_perceiver.d_model)
     else:  # pragma: no cover - guarded above

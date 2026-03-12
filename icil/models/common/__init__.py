@@ -6,6 +6,7 @@ from icil.models.common.embeddings import (
 )
 from icil.models.common.attention import DiTBlock
 from icil.models.common.perceiver import FramePerceiverTokenizer, DemoMemoryPerceiver, TimeLatentPerceiver
+from icil.models.common.conv3d import SparseVoxelConvTokenizer
 
 __all__ = [
     "TimeMLP",

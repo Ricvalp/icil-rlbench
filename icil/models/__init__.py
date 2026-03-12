@@ -1,9 +1,13 @@
 from icil.models.encoders import (
+    Conv3dDemoQueryEncoder,
+    Conv3dDemoQueryEncoderConfig,
     ContextEncoder,
     ContextEncoderOutput,
     PerceiverDemoQueryEncoder,
     PerceiverDemoQueryEncoderConfig,
+    TrajConv3DConfig,
     TrajPerceiverConfig,
+    TrajectoryConv3DEncoder,
     TrajectoryOnlyPerceiverEncoder,
     TrajectoryPerceiverEncoder,
 )
@@ -22,9 +26,13 @@ from icil.models.policies import (
 __all__ = [
     "ContextEncoder",
     "ContextEncoderOutput",
+    "Conv3dDemoQueryEncoder",
+    "Conv3dDemoQueryEncoderConfig",
     "PerceiverDemoQueryEncoder",
     "PerceiverDemoQueryEncoderConfig",
+    "TrajConv3DConfig",
     "TrajPerceiverConfig",
+    "TrajectoryConv3DEncoder",
     "TrajectoryPerceiverEncoder",
     "TrajectoryOnlyPerceiverEncoder",
     "Policy",

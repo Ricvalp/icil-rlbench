@@ -34,12 +34,12 @@ def get_config():
     cfg.dataset.K = 4
     cfg.dataset.L = 16
     cfg.dataset.T_obs = 2
-    cfg.dataset.H = 8
-    cfg.dataset.stride = 3
+    cfg.dataset.H = 16
+    cfg.dataset.stride = 2
     cfg.dataset.num_tries_per_item = 100
 
     cfg.model = ConfigDict()
-    cfg.model.encoder_name = "traj_perceiver"  # "perceiver_demo_query" | "traj_perceiver"
+    cfg.model.encoder_name = "traj_perceiver"  # "perceiver_demo_query" | "conv3d_demo_query" | "traj_perceiver" | "traj_conv3d"
 
     # Core policy/denoiser config.
     cfg.model.policy = ConfigDict()
@@ -96,6 +96,32 @@ def get_config():
     cfg.model.traj_perceiver.use_demo_id_embed = True
     cfg.model.traj_perceiver.include_traj_tokens = True
     cfg.model.traj_perceiver.use_cond_state_as_traj_fallback = False
+
+    # Trajectory Conv3D context encoder (unused unless encoder_name=traj_conv3d).
+    cfg.model.traj_conv3d = ConfigDict()
+    cfg.model.traj_conv3d.d_model = 512
+    cfg.model.traj_conv3d.n_heads = 8
+    cfg.model.traj_conv3d.dropout = 0.0
+    cfg.model.traj_conv3d.m_frame_tokens = 128
+    cfg.model.traj_conv3d.n_mix_layers = 2
+    cfg.model.traj_conv3d.max_voxels = 4096
+    cfg.model.traj_conv3d.voxel_size = 0.01
+    cfg.model.traj_conv3d.use_learned_topk = True
+    cfg.model.traj_conv3d.M_demo_latents = 256
+    cfg.model.traj_conv3d.demo_perceiver_layers = 3
+    cfg.model.traj_conv3d.mask_hash_buckets = 1
+    cfg.model.traj_conv3d.use_mask_id = False
+    cfg.model.traj_conv3d.role_embed_max_K = 4
+    cfg.model.traj_conv3d.role_embed_max_L = 16
+    cfg.model.traj_conv3d.role_embed_max_Tobs = 2
+    cfg.model.traj_conv3d.rgb_alpha_init = 1.0
+    cfg.model.traj_conv3d.ignore_demos = False
+    cfg.model.traj_conv3d.m_traj_tokens = 16
+    cfg.model.traj_conv3d.traj_perceiver_layers = 2
+    cfg.model.traj_conv3d.traj_dim = 8
+    cfg.model.traj_conv3d.use_demo_id_embed = True
+    cfg.model.traj_conv3d.include_traj_tokens = True
+    cfg.model.traj_conv3d.use_cond_state_as_traj_fallback = False
 
     cfg.train = ConfigDict()
     cfg.train.num_steps = 100000
