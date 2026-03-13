@@ -157,6 +157,7 @@ def get_config():
     cfg.wandb.n_loss_steps = 20
     cfg.wandb.n_sample_steps = 1000
     cfg.wandb.sample_batch_items = 16
+    cfg.wandb.sample_mse_items = 64
     cfg.wandb.sample_inference_steps = 100
     cfg.wandb.sample_trace_frames = 8
     cfg.wandb.sample_eta = 0.0

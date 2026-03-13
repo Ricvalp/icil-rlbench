@@ -28,9 +28,11 @@ from icil.datasets.in_context_imitation_learning.variation_store import (
     build_variation_keys,
 )
 from icil.models import (
+    Conv3dDemoQueryEncoderConfig,
     PerceiverDemoQueryEncoderConfig,
     PolicyBuilderConfig,
     PolicyConfig,
+    TrajConv3DConfig,
     TrajPerceiverConfig,
     build_policy,
 )
@@ -135,6 +137,26 @@ def _build_store(
     return VariationStore(keys, keep_open_per_worker=keep_open_per_worker), selected_tasks
 
 
+def _build_optional_store(
+    cache_root: Path,
+    tasks: Sequence[str],
+    keep_open_per_worker: bool,
+) -> Tuple[Optional[VariationStore], List[str]]:
+    normalized_tasks = _normalize_task_list(tasks)
+    if not normalized_tasks:
+        return None, []
+    try:
+        return _build_store(
+            cache_root=cache_root,
+            tasks=normalized_tasks,
+            exclude_tasks=(),
+            keep_open_per_worker=keep_open_per_worker,
+        )
+    except RuntimeError as exc:
+        logging.warning("Skipping auxiliary sampling store for tasks=%s: %s", normalized_tasks, exc)
+        return None, []
+
+
 def _infer_dims(store: VariationStore) -> Tuple[int, int]:
     for vidx in range(len(store)):
         episode_ids = store.list_episode_ids(vidx)
@@ -159,7 +181,9 @@ def _infer_dims(store: VariationStore) -> Tuple[int, int]:
 
 def _build_model_cfg(cfg: ConfigDict) -> PolicyBuilderConfig:
     policy_cfg_raw = cfg.policy
+    conv3d_cfg_raw = getattr(cfg, "conv3d_demo_query", ConfigDict())
     perceiver_cfg_raw = cfg.perceiver_demo_query
+    traj_conv3d_cfg_raw = getattr(cfg, "traj_conv3d", ConfigDict())
     traj_cfg_raw = cfg.traj_perceiver
 
     policy_cfg = PolicyConfig(
@@ -197,6 +221,25 @@ def _build_model_cfg(cfg: ConfigDict) -> PolicyBuilderConfig:
         dropout=float(perceiver_cfg_raw.dropout),
         ignore_demos=_as_bool(getattr(perceiver_cfg_raw, "ignore_demos", False)),
     )
+    conv3d_cfg = Conv3dDemoQueryEncoderConfig(
+        d_model=int(getattr(conv3d_cfg_raw, "d_model", policy_cfg.d_model)),
+        n_heads=int(getattr(conv3d_cfg_raw, "n_heads", policy_cfg.n_heads)),
+        m_frame_tokens=int(getattr(conv3d_cfg_raw, "m_frame_tokens", 64)),
+        max_voxels=int(getattr(conv3d_cfg_raw, "max_voxels", 4096)),
+        voxel_size=float(getattr(conv3d_cfg_raw, "voxel_size", 0.01)),
+        use_learned_topk=_as_bool(getattr(conv3d_cfg_raw, "use_learned_topk", True)),
+        n_mix_layers=int(getattr(conv3d_cfg_raw, "n_mix_layers", 2)),
+        M_demo_latents=int(getattr(conv3d_cfg_raw, "M_demo_latents", 256)),
+        demo_perceiver_layers=int(getattr(conv3d_cfg_raw, "demo_perceiver_layers", 3)),
+        mask_hash_buckets=int(getattr(conv3d_cfg_raw, "mask_hash_buckets", 2048)),
+        use_mask_id=_as_bool(getattr(conv3d_cfg_raw, "use_mask_id", True)),
+        role_embed_max_K=int(getattr(conv3d_cfg_raw, "role_embed_max_K", 32)),
+        role_embed_max_L=int(getattr(conv3d_cfg_raw, "role_embed_max_L", 64)),
+        role_embed_max_Tobs=int(getattr(conv3d_cfg_raw, "role_embed_max_Tobs", 16)),
+        rgb_alpha_init=float(getattr(conv3d_cfg_raw, "rgb_alpha_init", 1.0)),
+        dropout=float(getattr(conv3d_cfg_raw, "dropout", 0.0)),
+        ignore_demos=_as_bool(getattr(conv3d_cfg_raw, "ignore_demos", False)),
+    )
     traj_cfg = TrajPerceiverConfig(
         d_model=int(getattr(traj_cfg_raw, "d_model", policy_cfg.d_model)),
         n_heads=int(getattr(traj_cfg_raw, "n_heads", policy_cfg.n_heads)),
@@ -221,12 +264,166 @@ def _build_model_cfg(cfg: ConfigDict) -> PolicyBuilderConfig:
             getattr(traj_cfg_raw, "use_cond_state_as_traj_fallback", True)
         ),
     )
+    traj_conv3d_cfg = TrajConv3DConfig(
+        d_model=int(getattr(traj_conv3d_cfg_raw, "d_model", policy_cfg.d_model)),
+        n_heads=int(getattr(traj_conv3d_cfg_raw, "n_heads", policy_cfg.n_heads)),
+        dropout=float(getattr(traj_conv3d_cfg_raw, "dropout", 0.0)),
+        m_frame_tokens=int(getattr(traj_conv3d_cfg_raw, "m_frame_tokens", 64)),
+        n_mix_layers=int(getattr(traj_conv3d_cfg_raw, "n_mix_layers", 2)),
+        max_voxels=int(getattr(traj_conv3d_cfg_raw, "max_voxels", 4096)),
+        voxel_size=float(getattr(traj_conv3d_cfg_raw, "voxel_size", 0.01)),
+        use_learned_topk=_as_bool(getattr(traj_conv3d_cfg_raw, "use_learned_topk", True)),
+        M_demo_latents=int(getattr(traj_conv3d_cfg_raw, "M_demo_latents", 256)),
+        demo_perceiver_layers=int(getattr(traj_conv3d_cfg_raw, "demo_perceiver_layers", 3)),
+        mask_hash_buckets=int(getattr(traj_conv3d_cfg_raw, "mask_hash_buckets", 2048)),
+        use_mask_id=_as_bool(getattr(traj_conv3d_cfg_raw, "use_mask_id", True)),
+        role_embed_max_K=int(getattr(traj_conv3d_cfg_raw, "role_embed_max_K", 32)),
+        role_embed_max_L=int(getattr(traj_conv3d_cfg_raw, "role_embed_max_L", 64)),
+        role_embed_max_Tobs=int(getattr(traj_conv3d_cfg_raw, "role_embed_max_Tobs", 16)),
+        rgb_alpha_init=float(getattr(traj_conv3d_cfg_raw, "rgb_alpha_init", 1.0)),
+        ignore_demos=_as_bool(getattr(traj_conv3d_cfg_raw, "ignore_demos", False)),
+        m_traj_tokens=int(getattr(traj_conv3d_cfg_raw, "m_traj_tokens", 16)),
+        traj_perceiver_layers=int(getattr(traj_conv3d_cfg_raw, "traj_perceiver_layers", 2)),
+        traj_dim=int(getattr(traj_conv3d_cfg_raw, "traj_dim", 8)),
+        use_demo_id_embed=_as_bool(getattr(traj_conv3d_cfg_raw, "use_demo_id_embed", True)),
+        include_traj_tokens=_as_bool(getattr(traj_conv3d_cfg_raw, "include_traj_tokens", True)),
+        use_cond_state_as_traj_fallback=_as_bool(
+            getattr(traj_conv3d_cfg_raw, "use_cond_state_as_traj_fallback", True)
+        ),
+    )
     return PolicyBuilderConfig(
         policy=policy_cfg,
         encoder_name=str(cfg.encoder_name),
+        conv3d_demo_query=conv3d_cfg,
         perceiver_demo_query=perceiver_cfg,
+        traj_conv3d=traj_conv3d_cfg,
         traj_perceiver=traj_cfg,
     )
+
+
+def _resolve_use_mask_id(model_cfg: ConfigDict) -> bool:
+    encoder_name = str(getattr(model_cfg, "encoder_name", "perceiver_demo_query"))
+    if encoder_name == "traj_perceiver":
+        return _as_bool(getattr(getattr(model_cfg, "traj_perceiver", ConfigDict()), "use_mask_id", True))
+    if encoder_name == "traj_conv3d":
+        return _as_bool(getattr(getattr(model_cfg, "traj_conv3d", ConfigDict()), "use_mask_id", True))
+    if encoder_name == "conv3d_demo_query":
+        return _as_bool(getattr(getattr(model_cfg, "conv3d_demo_query", ConfigDict()), "use_mask_id", True))
+    return _as_bool(getattr(getattr(model_cfg, "perceiver_demo_query", ConfigDict()), "use_mask_id", True))
+
+
+def _build_logging_batch(
+    *,
+    store: VariationStore,
+    dataset_cfg: ICILConfig,
+    batch_size: int,
+    seed: int,
+    num_tries_per_item: int,
+) -> Optional[Dict[str, Any]]:
+    if batch_size <= 0:
+        return None
+    dataset = ICILPretrainBatchIterable(
+        store=store,
+        cfg=dataset_cfg,
+        batch_size_B=int(batch_size),
+        num_batches=1,
+        seed=int(seed),
+        num_tries_per_item=int(num_tries_per_item),
+    )
+    try:
+        return next(iter(dataset))
+    except StopIteration:
+        return None
+    except RuntimeError as exc:
+        logging.warning("Skipping auxiliary logging batch (batch_size=%d): %s", int(batch_size), exc)
+        return None
+
+
+@torch.no_grad()
+def _sample_actions_for_logging(
+    model: torch.nn.Module,
+    batch: Dict[str, Any],
+    *,
+    use_mask_id: bool,
+    inference_steps: int,
+    eta: float,
+    return_trace: bool,
+    trace_steps: Optional[int] = None,
+) -> Any:
+    return model.sample_actions(
+        cond_xyz=batch["cond_xyz"],
+        cond_state=batch["cond_state"],
+        cond_traj=batch.get("cond_traj", None),
+        cond_traj_mask=batch.get("cond_traj_mask", None),
+        query_xyz=batch["query_xyz"],
+        query_state=batch["query_state"],
+        action_horizon=int(batch["target_action"].shape[1]),
+        cond_rgb=batch.get("cond_rgb", None),
+        query_rgb=batch.get("query_rgb", None),
+        cond_mask_id=(batch.get("cond_mask_id", None) if use_mask_id else None),
+        query_mask_id=(batch.get("query_mask_id", None) if use_mask_id else None),
+        cond_valid=batch.get("cond_valid", None),
+        query_valid=batch.get("query_valid", None),
+        inference_steps=(inference_steps if inference_steps > 0 else None),
+        eta=float(eta),
+        return_trace=return_trace,
+        trace_steps=trace_steps,
+    )
+
+
+@torch.no_grad()
+def _estimate_x0_mse(
+    *,
+    model: torch.nn.Module,
+    store: Optional[VariationStore],
+    dataset_cfg: ICILConfig,
+    total_items: int,
+    per_batch_items: int,
+    seed: int,
+    num_tries_per_item: int,
+    device: torch.device,
+    use_mask_id: bool,
+    inference_steps: int,
+    eta: float,
+) -> Optional[float]:
+    if store is None or total_items <= 0:
+        return None
+
+    remaining = int(total_items)
+    seed_cursor = int(seed)
+    mse_sum = 0.0
+    n_seen = 0
+    chunk_size = max(1, int(per_batch_items))
+    while remaining > 0:
+        batch_size = min(chunk_size, remaining)
+        batch = _build_logging_batch(
+            store=store,
+            dataset_cfg=dataset_cfg,
+            batch_size=batch_size,
+            seed=seed_cursor,
+            num_tries_per_item=num_tries_per_item,
+        )
+        seed_cursor += 1
+        if batch is None:
+            break
+        batch = _to_device(batch, device)
+        pred_x0 = _sample_actions_for_logging(
+            model,
+            batch,
+            use_mask_id=use_mask_id,
+            inference_steps=inference_steps,
+            eta=eta,
+            return_trace=False,
+        )
+        mse_sum += float(
+            F.mse_loss(pred_x0, batch["target_action"], reduction="sum").detach().cpu()
+        )
+        n_seen += int(batch["target_action"].numel())
+        remaining -= int(batch["target_action"].shape[0])
+
+    if n_seen == 0:
+        return None
+    return mse_sum / float(n_seen)
 
 
 def _save_checkpoint(
@@ -488,6 +685,7 @@ def train(cfg: ConfigDict) -> None:
     distributed, rank, world_size, local_rank = _init_distributed()
     is_main = rank == 0
     store: Optional[VariationStore] = None
+    excluded_store: Optional[VariationStore] = None
     wandb_run = None
 
     try:
@@ -513,6 +711,11 @@ def train(cfg: ConfigDict) -> None:
             cache_root=cache_root,
             tasks=tasks,
             exclude_tasks=exclude_tasks,
+            keep_open_per_worker=_as_bool(cfg.data.keep_open_per_worker),
+        )
+        excluded_store, excluded_tasks_used = _build_optional_store(
+            cache_root=cache_root,
+            tasks=exclude_tasks,
             keep_open_per_worker=_as_bool(cfg.data.keep_open_per_worker),
         )
 
@@ -584,6 +787,12 @@ def train(cfg: ConfigDict) -> None:
             logging.info("Using cache_root=%s", cache_root)
             logging.info("Tasks=%s | variations=%d", tasks_used, len(store))
             logging.info("Excluded tasks=%s", exclude_tasks)
+            if excluded_store is not None:
+                logging.info(
+                    "Excluded-task sampling store=%s | variations=%d",
+                    excluded_tasks_used,
+                    len(excluded_store),
+                )
             logging.info("Inferred dims: state_dim=%d, action_dim=%d", state_dim, action_dim)
 
         dataset_cfg = ICILConfig(
@@ -680,6 +889,9 @@ def train(cfg: ConfigDict) -> None:
         wandb_loss_every = int(getattr(cfg.wandb, "n_loss_steps", 0)) if wandb_run is not None else 0
         wandb_sample_every = int(getattr(cfg.wandb, "n_sample_steps", 0)) if wandb_run is not None else 0
         wandb_sample_batch = int(getattr(cfg.wandb, "sample_batch_items", 4)) if wandb_run is not None else 0
+        wandb_sample_mse_items = (
+            int(getattr(cfg.wandb, "sample_mse_items", wandb_sample_batch)) if wandb_run is not None else 0
+        )
         wandb_sample_inference_steps = (
             int(getattr(cfg.wandb, "sample_inference_steps", 0)) if wandb_run is not None else 0
         )
@@ -695,14 +907,7 @@ def train(cfg: ConfigDict) -> None:
             if wandb_run is not None
             else 2048
         )
-        if str(getattr(cfg.model, "encoder_name", "perceiver_demo_query")) == "traj_perceiver":
-            use_mask_id = _as_bool(
-                getattr(getattr(cfg.model, "traj_perceiver", ConfigDict()), "use_mask_id", True)
-            )
-        else:
-            use_mask_id = _as_bool(
-                getattr(getattr(cfg.model, "perceiver_demo_query", ConfigDict()), "use_mask_id", True)
-            )
+        use_mask_id = _resolve_use_mask_id(cfg.model)
 
         step = 0
         resume_path = str(cfg.train.resume_path) if cfg.train.resume_path is not None else ""
@@ -813,35 +1018,76 @@ def train(cfg: ConfigDict) -> None:
                     was_training = ddp_model.training
                     ddp_model.eval()
                     with torch.no_grad():
-                        sample_out = policy_for_io.sample_actions(
-                            cond_xyz=batch["cond_xyz"],
-                            cond_state=batch["cond_state"],
-                            query_xyz=batch["query_xyz"],
-                            query_state=batch["query_state"],
-                            action_horizon=int(batch["target_action"].shape[1]),
-                            cond_traj=batch.get("cond_traj", None),
-                            cond_traj_mask=batch.get("cond_traj_mask", None),
-                            cond_rgb=batch.get("cond_rgb", None),
-                            query_rgb=batch.get("query_rgb", None),
-                            cond_mask_id=(batch.get("cond_mask_id", None) if use_mask_id else None),
-                            query_mask_id=(batch.get("query_mask_id", None) if use_mask_id else None),
-                            cond_valid=batch.get("cond_valid", None),
-                            query_valid=batch.get("query_valid", None),
-                            inference_steps=(
-                                wandb_sample_inference_steps if wandb_sample_inference_steps > 0 else None
-                            ),
+                        sample_out = _sample_actions_for_logging(
+                            policy_for_io,
+                            batch,
+                            use_mask_id=use_mask_id,
+                            inference_steps=wandb_sample_inference_steps,
                             eta=wandb_sample_eta,
                             return_trace=True,
-                            trace_steps=(wandb_sample_trace_frames if wandb_sample_trace_frames > 0 else None),
+                            trace_steps=(
+                                wandb_sample_trace_frames if wandb_sample_trace_frames > 0 else None
+                            ),
                         )
                         if isinstance(sample_out, tuple):
                             pred_x0, denoise_trace = sample_out
                         else:
                             pred_x0, denoise_trace = sample_out, None
+                        sample_mse = _estimate_x0_mse(
+                            model=policy_for_io,
+                            store=store,
+                            dataset_cfg=dataset_cfg,
+                            total_items=wandb_sample_mse_items,
+                            per_batch_items=wandb_sample_batch,
+                            seed=int(cfg.seed) + 1000003 + step,
+                            num_tries_per_item=int(getattr(cfg.dataset, "num_tries_per_item", 32)),
+                            device=device,
+                            use_mask_id=use_mask_id,
+                            inference_steps=wandb_sample_inference_steps,
+                            eta=wandb_sample_eta,
+                        )
+                        excluded_batch = _build_logging_batch(
+                            store=excluded_store,
+                            dataset_cfg=dataset_cfg,
+                            batch_size=wandb_sample_batch,
+                            seed=int(cfg.seed) + 2000003 + step,
+                            num_tries_per_item=int(getattr(cfg.dataset, "num_tries_per_item", 32)),
+                        )
+                        pred_x0_excluded = None
+                        denoise_trace_excluded = None
+                        if excluded_batch is not None:
+                            excluded_batch = _to_device(excluded_batch, device)
+                            sample_out_excluded = _sample_actions_for_logging(
+                                policy_for_io,
+                                excluded_batch,
+                                use_mask_id=use_mask_id,
+                                inference_steps=wandb_sample_inference_steps,
+                                eta=wandb_sample_eta,
+                                return_trace=True,
+                                trace_steps=(
+                                    wandb_sample_trace_frames if wandb_sample_trace_frames > 0 else None
+                                ),
+                            )
+                            if isinstance(sample_out_excluded, tuple):
+                                pred_x0_excluded, denoise_trace_excluded = sample_out_excluded
+                            else:
+                                pred_x0_excluded, denoise_trace_excluded = sample_out_excluded, None
+                        sample_mse_excluded = _estimate_x0_mse(
+                            model=policy_for_io,
+                            store=excluded_store,
+                            dataset_cfg=dataset_cfg,
+                            total_items=wandb_sample_mse_items,
+                            per_batch_items=wandb_sample_batch,
+                            seed=int(cfg.seed) + 3000003 + step,
+                            num_tries_per_item=int(getattr(cfg.dataset, "num_tries_per_item", 32)),
+                            device=device,
+                            use_mask_id=use_mask_id,
+                            inference_steps=wandb_sample_inference_steps,
+                            eta=wandb_sample_eta,
+                        )
                     if was_training:
                         ddp_model.train()
 
-                    sample_mse = float(F.mse_loss(pred_x0, batch["target_action"]).detach().cpu())
                     fig = _plot_pred_vs_gt_3d(
                         pred_x0=pred_x0,
                         gt_x0=batch["target_action"],
@@ -858,19 +1104,44 @@ def train(cfg: ConfigDict) -> None:
                             denoise_trace["timesteps"],
                             max_items=max(1, min(2, wandb_sample_batch)),
                         )
+                    fig_excluded = None
+                    fig_trace_excluded = None
+                    if excluded_batch is not None and pred_x0_excluded is not None:
+                        fig_excluded = _plot_pred_vs_gt_3d(
+                            pred_x0=pred_x0_excluded,
+                            gt_x0=excluded_batch["target_action"],
+                            max_items=wandb_sample_batch,
+                            include_query_pointcloud=wandb_include_query_pc,
+                            query_xyz=excluded_batch.get("query_xyz", None),
+                            query_valid=excluded_batch.get("query_valid", None),
+                            max_query_points=wandb_query_pc_max_points,
+                        )
+                        if denoise_trace_excluded is not None:
+                            fig_trace_excluded = _plot_denoising_trace_3d(
+                                denoise_trace_excluded["x0_hat"],
+                                denoise_trace_excluded["timesteps"],
+                                max_items=max(1, min(2, wandb_sample_batch)),
+                            )
                     log_dict: Dict[str, Any] = {
-                        "samples/x0_mse": sample_mse,
                         "train/step": step,
                     }
-                    if fig is not None or fig_trace is not None:
+                    if sample_mse is not None:
+                        log_dict["samples/x0_mse"] = float(sample_mse)
+                    if sample_mse_excluded is not None:
+                        log_dict["samples_excluded/x0_mse"] = float(sample_mse_excluded)
+                    if fig is not None or fig_trace is not None or fig_excluded is not None or fig_trace_excluded is not None:
                         import wandb
 
                         if fig is not None:
                             log_dict["samples/x0_pred_vs_gt_3d"] = wandb.Image(fig)
                         if fig_trace is not None:
                             log_dict["samples/x0_denoising_trace_3d"] = wandb.Image(fig_trace)
+                        if fig_excluded is not None:
+                            log_dict["samples_excluded/x0_pred_vs_gt_3d"] = wandb.Image(fig_excluded)
+                        if fig_trace_excluded is not None:
+                            log_dict["samples_excluded/x0_denoising_trace_3d"] = wandb.Image(fig_trace_excluded)
                     wandb_run.log(log_dict, step=step)
-                    if fig is not None or fig_trace is not None:
+                    if fig is not None or fig_trace is not None or fig_excluded is not None or fig_trace_excluded is not None:
                         try:
                             import matplotlib.pyplot as plt
 
@@ -878,6 +1149,10 @@ def train(cfg: ConfigDict) -> None:
                                 plt.close(fig)
                             if fig_trace is not None:
                                 plt.close(fig_trace)
+                            if fig_excluded is not None:
+                                plt.close(fig_excluded)
+                            if fig_trace_excluded is not None:
+                                plt.close(fig_trace_excluded)
                         except Exception:
                             pass
 
@@ -908,6 +1183,8 @@ def train(cfg: ConfigDict) -> None:
     finally:
         if wandb_run is not None:
             wandb_run.finish()
+        if excluded_store is not None:
+            excluded_store.close()
         if store is not None:
             store.close()
         _cleanup_distributed()
