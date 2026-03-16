@@ -189,6 +189,7 @@ def _build_model_cfg(cfg: ConfigDict) -> PolicyBuilderConfig:
         denoiser_layers=int(policy_cfg_raw.denoiser_layers),
         denoiser_mlp_mult=int(policy_cfg_raw.denoiser_mlp_mult),
         dropout=float(policy_cfg_raw.dropout),
+        grad_checkpoint_dit=_as_bool(getattr(policy_cfg_raw, "grad_checkpoint_dit", False)),
         num_train_timesteps=int(policy_cfg_raw.num_train_timesteps),
         beta_start=float(getattr(policy_cfg_raw, "beta_start", 1e-4)),
         beta_end=float(getattr(policy_cfg_raw, "beta_end", 2e-2)),
@@ -218,6 +219,13 @@ def _build_model_cfg(cfg: ConfigDict) -> PolicyBuilderConfig:
         dropout=float(perceiver_cfg_raw.dropout),
         ignore_demos=_as_bool(getattr(perceiver_cfg_raw, "ignore_demos", False)),
         compress_demo_latents=_as_bool(getattr(perceiver_cfg_raw, "compress_demo_latents", True)),
+        checkpoint_demo_memory=_as_bool(getattr(perceiver_cfg_raw, "checkpoint_demo_memory", False)),
+        checkpoint_build_demo_memory=_as_bool(
+            getattr(perceiver_cfg_raw, "checkpoint_build_demo_memory", False)
+        ),
+        checkpoint_frame_tokenizer=_as_bool(
+            getattr(perceiver_cfg_raw, "checkpoint_frame_tokenizer", False)
+        ),
     )
     conv3d_cfg = Conv3dDemoQueryEncoderConfig(
         d_model=int(getattr(conv3d_cfg_raw, "d_model", policy_cfg.d_model)),
@@ -254,6 +262,13 @@ def _build_model_cfg(cfg: ConfigDict) -> PolicyBuilderConfig:
         rgb_alpha_init=float(getattr(traj_cfg_raw, "rgb_alpha_init", 1.0)),
         ignore_demos=_as_bool(getattr(traj_cfg_raw, "ignore_demos", False)),
         compress_demo_latents=_as_bool(getattr(traj_cfg_raw, "compress_demo_latents", True)),
+        checkpoint_demo_memory=_as_bool(getattr(traj_cfg_raw, "checkpoint_demo_memory", False)),
+        checkpoint_build_demo_memory=_as_bool(
+            getattr(traj_cfg_raw, "checkpoint_build_demo_memory", False)
+        ),
+        checkpoint_frame_tokenizer=_as_bool(
+            getattr(traj_cfg_raw, "checkpoint_frame_tokenizer", False)
+        ),
         m_traj_tokens=int(getattr(traj_cfg_raw, "m_traj_tokens", 16)),
         traj_perceiver_layers=int(getattr(traj_cfg_raw, "traj_perceiver_layers", getattr(traj_cfg_raw, "n_layers", 2))),
         traj_dim=int(getattr(traj_cfg_raw, "traj_dim", 8)),

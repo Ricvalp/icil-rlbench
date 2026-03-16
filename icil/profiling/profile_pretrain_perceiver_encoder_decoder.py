@@ -1,11 +1,14 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+import json
+from collections import OrderedDict
 from pathlib import Path
 from typing import Any, Dict, Optional, Sequence
 
 import torch
-from absl import app
+import torch.nn as nn
+from absl import app, logging
 from ml_collections import ConfigDict
 from ml_collections.config_flags import config_flags
 from torch.profiler import profile, record_function
@@ -43,6 +46,58 @@ _PROFILE_CONFIG = config_flags.DEFINE_config_file(
     default="configs/profile_pretrain_perceiver_encoder_decoder.py",
     help_string="Path to the profiling ml_collections config file.",
 )
+
+
+def _shape(x: Any) -> Any:
+    if torch.is_tensor(x):
+        return tuple(int(dim) for dim in x.shape)
+    if isinstance(x, tuple):
+        return [_shape(y) for y in x]
+    if isinstance(x, list):
+        return [_shape(y) for y in x]
+    if isinstance(x, dict):
+        return {str(k): _shape(v) for k, v in x.items()}
+    return str(type(x))
+
+
+def _register_shape_hooks(model: nn.Module) -> tuple[OrderedDict[str, Dict[str, Any]], list[Any]]:
+    records: OrderedDict[str, Dict[str, Any]] = OrderedDict()
+    hooks = []
+
+    def hook_fn(name: str):
+        def _hook(module: nn.Module, inputs: tuple[Any, ...], output: Any) -> None:
+            records[name] = {
+                "type": module.__class__.__name__,
+                "in": _shape(inputs),
+                "out": _shape(output),
+            }
+
+        return _hook
+
+    for name, module in model.named_modules():
+        if isinstance(module, (nn.Sequential, nn.ModuleList, nn.ModuleDict)):
+            continue
+        hooks.append(module.register_forward_hook(hook_fn(name)))
+
+    return records, hooks
+
+
+def _write_shape_records(records: OrderedDict[str, Dict[str, Any]], trace_path: Path) -> None:
+    base = Path(str(trace_path))
+    json_path = Path(f"{base}.activation_shapes.json")
+    txt_path = Path(f"{base}.activation_shapes.txt")
+
+    rows = [{"name": name, **record} for name, record in records.items()]
+    with json_path.open("w", encoding="utf-8") as f:
+        json.dump(rows, f, indent=2)
+
+    with txt_path.open("w", encoding="utf-8") as f:
+        for row in rows:
+            f.write(
+                f"{row['name']:60s} {row['type']:25s} in={row['in']} out={row['out']}\n"
+            )
+
+    logging.info("Saved activation shapes to %s and %s", json_path, txt_path)
 
 
 def profile_train(train_cfg: ConfigDict, profile_cfg: ConfigDict) -> Path:
@@ -142,6 +197,26 @@ def profile_train(train_cfg: ConfigDict, profile_cfg: ConfigDict) -> Path:
         if device.type == "cuda":
             torch.cuda.synchronize(device)
 
+        with record_function("shape_hooks.capture_batch"):
+            try:
+                prefetched_batch = next(data_iter)
+            except StopIteration as exc:
+                raise RuntimeError("Dataloader exhausted before shape-hook capture.") from exc
+
+            prefetched_batch = to_device(prefetched_batch, device)
+            prefetched_model_batch = drop_mask_ids_if_disabled(prefetched_batch, use_mask_id)
+
+            shape_records, shape_hooks = _register_shape_hooks(model)
+            try:
+                with torch.no_grad():
+                    with torch.autocast(device_type=device.type, enabled=use_amp):
+                        _ = model.forward_loss(prefetched_model_batch)
+            finally:
+                for hook in shape_hooks:
+                    hook.remove()
+
+            _write_shape_records(shape_records, trace_path)
+
         with profile(
             activities=activities,
             record_shapes=as_bool(getattr(profile_cfg, "record_shapes", True)),
@@ -152,17 +227,25 @@ def profile_train(train_cfg: ConfigDict, profile_cfg: ConfigDict) -> Path:
             pbar = tqdm(total=trace_n_steps, desc="Profiling train steps", dynamic_ncols=True)
             try:
                 while step < trace_n_steps:
+                    use_prefetched = False
                     with record_function("dataloader.next"):
-                        try:
-                            batch = next(data_iter)
-                        except StopIteration as exc:
-                            raise RuntimeError(
-                                "Dataloader exhausted before reaching trace_n_steps."
-                            ) from exc
+                        if prefetched_model_batch is not None:
+                            model_batch = prefetched_model_batch
+                            use_prefetched = True
+                            prefetched_model_batch = None
+                        else:
+                            try:
+                                batch = next(data_iter)
+                            except StopIteration as exc:
+                                raise RuntimeError(
+                                    "Dataloader exhausted before reaching trace_n_steps."
+                                ) from exc
 
                     with record_function("batch.to_device"):
-                        batch = to_device(batch, device)
-                        model_batch = drop_mask_ids_if_disabled(batch, use_mask_id)
+                        if not use_prefetched:
+                            batch = to_device(batch, device)
+                            batch = drop_mask_ids_if_disabled(batch, use_mask_id)
+                            model_batch = batch
 
                     with record_function("train.forward"):
                         with torch.autocast(device_type=device.type, enabled=use_amp):

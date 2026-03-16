@@ -34,6 +34,9 @@ class TrajPerceiverConfig:
     rgb_alpha_init: float = 1.0
     ignore_demos: bool = False
     compress_demo_latents: bool = True
+    checkpoint_demo_memory: bool = False
+    checkpoint_build_demo_memory: bool = False
+    checkpoint_frame_tokenizer: bool = False
 
     # Trajectory branch.
     m_traj_tokens: int = 16
@@ -85,6 +88,9 @@ class TrajectoryPerceiverEncoder(ContextEncoder):
                 dropout=float(cfg.dropout),
                 ignore_demos=bool(cfg.ignore_demos),
                 compress_demo_latents=bool(cfg.compress_demo_latents),
+                checkpoint_demo_memory=bool(cfg.checkpoint_demo_memory),
+                checkpoint_build_demo_memory=bool(cfg.checkpoint_build_demo_memory),
+                checkpoint_frame_tokenizer=bool(cfg.checkpoint_frame_tokenizer),
             ),
             state_dim=int(state_dim),
             action_dim=0,

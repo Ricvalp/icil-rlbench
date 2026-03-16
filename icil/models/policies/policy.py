@@ -7,6 +7,7 @@ from typing import Any, Dict, List, Optional
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torch.utils.checkpoint as ckpt
 from diffusers.schedulers.scheduling_ddim import DDIMScheduler
 
 
@@ -24,6 +25,7 @@ class PolicyConfig:
     denoiser_layers: int = 10
     denoiser_mlp_mult: int = 4
     dropout: float = 0.0
+    grad_checkpoint_dit: bool = False
 
     # diffusion (DDIM via diffusers)
     num_train_timesteps: int = 1000
@@ -148,8 +150,32 @@ class Policy(nn.Module):
         h = self.action_in(x_t)  # [B,H,d]
         # Add action-position signal so chunk order is identifiable.
         h = h + sinusoidal_position_embedding(H, d, device=x_t.device).to(dtype=h.dtype).unsqueeze(0)
+        use_dit_ckpt = bool(self.training and self.cfg.grad_checkpoint_dit and torch.is_grad_enabled())
         for blk in self.denoiser:
-            h = blk(h, t_cond=t_cond, ctx=ctx, ctx_mask=ctx_mask)
+            if use_dit_ckpt:
+                if ctx_mask is None:
+                    h = ckpt.checkpoint(
+                        lambda h_, t_cond_, ctx_, blk_=blk: blk_(
+                            h_, t_cond=t_cond_, ctx=ctx_, ctx_mask=None
+                        ),
+                        h,
+                        t_cond,
+                        ctx,
+                        use_reentrant=False,
+                    )
+                else:
+                    h = ckpt.checkpoint(
+                        lambda h_, t_cond_, ctx_, ctx_mask_, blk_=blk: blk_(
+                            h_, t_cond=t_cond_, ctx=ctx_, ctx_mask=ctx_mask_
+                        ),
+                        h,
+                        t_cond,
+                        ctx,
+                        ctx_mask,
+                        use_reentrant=False,
+                    )
+            else:
+                h = blk(h, t_cond=t_cond, ctx=ctx, ctx_mask=ctx_mask)
         model_out = self.action_out(h)  # [B,H,A]
         return model_out
 

@@ -7,7 +7,7 @@ def get_config():
     cfg = ConfigDict()
 
     # Number of optimizer steps to trace before stopping.
-    cfg.trace_n_steps = 20
+    cfg.trace_n_steps = 5
 
     # Perfetto/Chrome-trace JSON output.
     cfg.output_dir = os.environ.get(

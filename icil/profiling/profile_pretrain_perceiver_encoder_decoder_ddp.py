@@ -11,6 +11,7 @@ import torch.nn as nn
 from absl import app
 from ml_collections import ConfigDict
 from ml_collections.config_flags import config_flags
+from contextlib import nullcontext
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.profiler import profile, record_function
 from torch.utils.data import DataLoader
@@ -209,13 +210,16 @@ def profile_train_ddp(train_cfg: ConfigDict, profile_cfg: ConfigDict) -> Path:
                             batch = to_device(batch, device)
                             model_batch = drop_mask_ids_if_disabled(batch, use_mask_id)
 
-                        with record_function("train.forward"):
-                            with torch.autocast(device_type=device.type, enabled=use_amp):
-                                out = ddp_model(model_batch)
-                                loss = out["loss"] / grad_accum
+                        sync_this_micro = ((micro_count + 1) % grad_accum == 0)
+                        sync_context = ddp_model.no_sync() if not sync_this_micro else nullcontext()
+                        with sync_context:
+                            with record_function("train.forward"):
+                                with torch.autocast(device_type=device.type, enabled=use_amp):
+                                    out = ddp_model(model_batch)
+                                    loss = out["loss"] / grad_accum
 
-                        with record_function("train.backward"):
-                            scaler.scale(loss).backward()
+                            with record_function("train.backward"):
+                                scaler.scale(loss).backward()
                         micro_count += 1
 
                         if micro_count % grad_accum == 0:

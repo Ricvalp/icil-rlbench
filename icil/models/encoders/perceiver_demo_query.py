@@ -6,6 +6,7 @@ from typing import Optional
 
 import torch
 from torch import nn
+from torch.utils.checkpoint import checkpoint
 
 from icil.models.common import FramePerceiverTokenizer, DemoMemoryPerceiver
 from icil.models.encoders.base import ContextEncoder, ContextEncoderOutput
@@ -28,6 +29,9 @@ class PerceiverDemoQueryEncoderConfig:
     dropout: float = 0.0
     ignore_demos: bool = False
     compress_demo_latents: bool = True
+    checkpoint_demo_memory: bool = False
+    checkpoint_build_demo_memory: bool = False
+    checkpoint_frame_tokenizer: bool = False
 
 class PerceiverDemoQueryEncoder(ContextEncoder):
 
@@ -111,7 +115,22 @@ class PerceiverDemoQueryEncoder(ContextEncoder):
           [Bf, m+1, d]  (m point-derived + 1 state token)
         """
         pt = self._encode_points(xyz, mask_id, rgb=rgb)  # [Bf,N,d]
-        z = self.frame_tokenizer(pt, point_mask=point_valid)  # [Bf,m,d]
+        if self.cfg.checkpoint_frame_tokenizer and self.training and torch.is_grad_enabled():
+            if point_valid is None:
+                z = checkpoint(
+                    lambda pt_: self.frame_tokenizer(pt_, point_mask=None),
+                    pt,
+                    use_reentrant=False,
+                )  # [Bf,m,d]
+            else:
+                z = checkpoint(
+                    lambda pt_, point_valid_: self.frame_tokenizer(pt_, point_mask=point_valid_),
+                    pt,
+                    point_valid,
+                    use_reentrant=False,
+                )  # [Bf,m,d]
+        else:
+            z = self.frame_tokenizer(pt, point_mask=point_valid)  # [Bf,m,d]
         s_tok = self.state_proj(state).unsqueeze(1)  # [Bf,1,d]
         return torch.cat([z, s_tok], dim=1)          # [Bf,m+1,d]
 
@@ -168,7 +187,10 @@ class PerceiverDemoQueryEncoder(ContextEncoder):
 
         # compress to demo memory latents
         if self.cfg.compress_demo_latents:
-            Z_demo = self.demo_memory(tokens)  # [B,M,d]
+            if self.cfg.checkpoint_demo_memory and self.training and torch.is_grad_enabled():
+                Z_demo = checkpoint(self.demo_memory, tokens, use_reentrant=False)  # [B,M,d]
+            else:
+                Z_demo = self.demo_memory(tokens)  # [B,M,d]
         else:
             Z_demo = tokens
             
@@ -238,9 +260,26 @@ class PerceiverDemoQueryEncoder(ContextEncoder):
         else:
             if cond_xyz is None or cond_state is None:
                 raise ValueError("PerceiverDemoQueryEncoder requires cond_xyz and cond_state when ignore_demos=False.")
-            Z_demo = self._build_demo_memory(
-                cond_xyz, cond_state, cond_rgb=cond_rgb, cond_mask_id=cond_mask_id, cond_valid=cond_valid
-            )  # [B,M,d]
+            use_demo_ckpt = bool(
+                self.cfg.checkpoint_build_demo_memory and self.training and torch.is_grad_enabled()
+            )
+            if use_demo_ckpt:
+                Z_demo = checkpoint(
+                    lambda cond_xyz_, cond_state_: self._build_demo_memory(
+                        cond_xyz_,
+                        cond_state_,
+                        cond_rgb=cond_rgb,
+                        cond_mask_id=cond_mask_id,
+                        cond_valid=cond_valid,
+                    ),
+                    cond_xyz,
+                    cond_state,
+                    use_reentrant=False,
+                )  # [B,M,d]
+            else:
+                Z_demo = self._build_demo_memory(
+                    cond_xyz, cond_state, cond_rgb=cond_rgb, cond_mask_id=cond_mask_id, cond_valid=cond_valid
+                )  # [B,M,d]
             ctx = torch.cat([Z_demo, Z_query], dim=1)  # [B, M+Sq, d]
 
         return ContextEncoderOutput(tokens=ctx, token_mask=None)

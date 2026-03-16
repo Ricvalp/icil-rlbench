@@ -15,9 +15,11 @@ from icil.datasets.in_context_imitation_learning.variation_store import (
     build_variation_keys,
 )
 from icil.models import (
+    Conv3dDemoQueryEncoderConfig,
     PerceiverDemoQueryEncoderConfig,
     PolicyBuilderConfig,
     PolicyConfig,
+    TrajConv3DConfig,
     TrajPerceiverConfig,
 )
 
@@ -120,7 +122,9 @@ def infer_dims(store: VariationStore) -> Tuple[int, int]:
 
 def build_model_cfg(cfg: ConfigDict) -> PolicyBuilderConfig:
     policy_cfg_raw = cfg.policy
+    conv3d_cfg_raw = getattr(cfg, "conv3d_demo_query", ConfigDict())
     perceiver_cfg_raw = cfg.perceiver_demo_query
+    traj_conv3d_cfg_raw = getattr(cfg, "traj_conv3d", ConfigDict())
     traj_cfg_raw = cfg.traj_perceiver
 
     policy_cfg = PolicyConfig(
@@ -129,6 +133,7 @@ def build_model_cfg(cfg: ConfigDict) -> PolicyBuilderConfig:
         denoiser_layers=int(policy_cfg_raw.denoiser_layers),
         denoiser_mlp_mult=int(policy_cfg_raw.denoiser_mlp_mult),
         dropout=float(policy_cfg_raw.dropout),
+        grad_checkpoint_dit=as_bool(getattr(policy_cfg_raw, "grad_checkpoint_dit", False)),
         num_train_timesteps=int(policy_cfg_raw.num_train_timesteps),
         beta_start=float(getattr(policy_cfg_raw, "beta_start", 1e-4)),
         beta_end=float(getattr(policy_cfg_raw, "beta_end", 2e-2)),
@@ -157,6 +162,33 @@ def build_model_cfg(cfg: ConfigDict) -> PolicyBuilderConfig:
         rgb_alpha_init=float(getattr(perceiver_cfg_raw, "rgb_alpha_init", 1.0)),
         dropout=float(perceiver_cfg_raw.dropout),
         ignore_demos=as_bool(getattr(perceiver_cfg_raw, "ignore_demos", False)),
+        compress_demo_latents=as_bool(getattr(perceiver_cfg_raw, "compress_demo_latents", True)),
+        checkpoint_demo_memory=as_bool(getattr(perceiver_cfg_raw, "checkpoint_demo_memory", False)),
+        checkpoint_build_demo_memory=as_bool(
+            getattr(perceiver_cfg_raw, "checkpoint_build_demo_memory", False)
+        ),
+        checkpoint_frame_tokenizer=as_bool(
+            getattr(perceiver_cfg_raw, "checkpoint_frame_tokenizer", False)
+        ),
+    )
+    conv3d_cfg = Conv3dDemoQueryEncoderConfig(
+        d_model=int(getattr(conv3d_cfg_raw, "d_model", policy_cfg.d_model)),
+        n_heads=int(getattr(conv3d_cfg_raw, "n_heads", policy_cfg.n_heads)),
+        m_frame_tokens=int(getattr(conv3d_cfg_raw, "m_frame_tokens", 64)),
+        max_voxels=int(getattr(conv3d_cfg_raw, "max_voxels", 4096)),
+        voxel_size=float(getattr(conv3d_cfg_raw, "voxel_size", 0.01)),
+        use_learned_topk=as_bool(getattr(conv3d_cfg_raw, "use_learned_topk", True)),
+        n_mix_layers=int(getattr(conv3d_cfg_raw, "n_mix_layers", 2)),
+        M_demo_latents=int(getattr(conv3d_cfg_raw, "M_demo_latents", 256)),
+        demo_perceiver_layers=int(getattr(conv3d_cfg_raw, "demo_perceiver_layers", 3)),
+        mask_hash_buckets=int(getattr(conv3d_cfg_raw, "mask_hash_buckets", 2048)),
+        use_mask_id=as_bool(getattr(conv3d_cfg_raw, "use_mask_id", True)),
+        role_embed_max_K=int(getattr(conv3d_cfg_raw, "role_embed_max_K", 32)),
+        role_embed_max_L=int(getattr(conv3d_cfg_raw, "role_embed_max_L", 64)),
+        role_embed_max_Tobs=int(getattr(conv3d_cfg_raw, "role_embed_max_Tobs", 16)),
+        rgb_alpha_init=float(getattr(conv3d_cfg_raw, "rgb_alpha_init", 1.0)),
+        dropout=float(getattr(conv3d_cfg_raw, "dropout", 0.0)),
+        ignore_demos=as_bool(getattr(conv3d_cfg_raw, "ignore_demos", False)),
     )
     traj_cfg = TrajPerceiverConfig(
         d_model=int(getattr(traj_cfg_raw, "d_model", policy_cfg.d_model)),
@@ -173,6 +205,14 @@ def build_model_cfg(cfg: ConfigDict) -> PolicyBuilderConfig:
         role_embed_max_Tobs=int(getattr(traj_cfg_raw, "role_embed_max_Tobs", 16)),
         rgb_alpha_init=float(getattr(traj_cfg_raw, "rgb_alpha_init", 1.0)),
         ignore_demos=as_bool(getattr(traj_cfg_raw, "ignore_demos", False)),
+        compress_demo_latents=as_bool(getattr(traj_cfg_raw, "compress_demo_latents", True)),
+        checkpoint_demo_memory=as_bool(getattr(traj_cfg_raw, "checkpoint_demo_memory", False)),
+        checkpoint_build_demo_memory=as_bool(
+            getattr(traj_cfg_raw, "checkpoint_build_demo_memory", False)
+        ),
+        checkpoint_frame_tokenizer=as_bool(
+            getattr(traj_cfg_raw, "checkpoint_frame_tokenizer", False)
+        ),
         m_traj_tokens=int(getattr(traj_cfg_raw, "m_traj_tokens", 16)),
         traj_perceiver_layers=int(
             getattr(traj_cfg_raw, "traj_perceiver_layers", getattr(traj_cfg_raw, "n_layers", 2))
@@ -184,10 +224,39 @@ def build_model_cfg(cfg: ConfigDict) -> PolicyBuilderConfig:
             getattr(traj_cfg_raw, "use_cond_state_as_traj_fallback", True)
         ),
     )
+    traj_conv3d_cfg = TrajConv3DConfig(
+        d_model=int(getattr(traj_conv3d_cfg_raw, "d_model", policy_cfg.d_model)),
+        n_heads=int(getattr(traj_conv3d_cfg_raw, "n_heads", policy_cfg.n_heads)),
+        dropout=float(getattr(traj_conv3d_cfg_raw, "dropout", 0.0)),
+        m_frame_tokens=int(getattr(traj_conv3d_cfg_raw, "m_frame_tokens", 64)),
+        n_mix_layers=int(getattr(traj_conv3d_cfg_raw, "n_mix_layers", 2)),
+        max_voxels=int(getattr(traj_conv3d_cfg_raw, "max_voxels", 4096)),
+        voxel_size=float(getattr(traj_conv3d_cfg_raw, "voxel_size", 0.01)),
+        use_learned_topk=as_bool(getattr(traj_conv3d_cfg_raw, "use_learned_topk", True)),
+        M_demo_latents=int(getattr(traj_conv3d_cfg_raw, "M_demo_latents", 256)),
+        demo_perceiver_layers=int(getattr(traj_conv3d_cfg_raw, "demo_perceiver_layers", 3)),
+        mask_hash_buckets=int(getattr(traj_conv3d_cfg_raw, "mask_hash_buckets", 2048)),
+        use_mask_id=as_bool(getattr(traj_conv3d_cfg_raw, "use_mask_id", True)),
+        role_embed_max_K=int(getattr(traj_conv3d_cfg_raw, "role_embed_max_K", 32)),
+        role_embed_max_L=int(getattr(traj_conv3d_cfg_raw, "role_embed_max_L", 64)),
+        role_embed_max_Tobs=int(getattr(traj_conv3d_cfg_raw, "role_embed_max_Tobs", 16)),
+        rgb_alpha_init=float(getattr(traj_conv3d_cfg_raw, "rgb_alpha_init", 1.0)),
+        ignore_demos=as_bool(getattr(traj_conv3d_cfg_raw, "ignore_demos", False)),
+        m_traj_tokens=int(getattr(traj_conv3d_cfg_raw, "m_traj_tokens", 16)),
+        traj_perceiver_layers=int(getattr(traj_conv3d_cfg_raw, "traj_perceiver_layers", 2)),
+        traj_dim=int(getattr(traj_conv3d_cfg_raw, "traj_dim", 8)),
+        use_demo_id_embed=as_bool(getattr(traj_conv3d_cfg_raw, "use_demo_id_embed", True)),
+        include_traj_tokens=as_bool(getattr(traj_conv3d_cfg_raw, "include_traj_tokens", True)),
+        use_cond_state_as_traj_fallback=as_bool(
+            getattr(traj_conv3d_cfg_raw, "use_cond_state_as_traj_fallback", True)
+        ),
+    )
     return PolicyBuilderConfig(
         policy=policy_cfg,
         encoder_name=str(cfg.encoder_name),
+        conv3d_demo_query=conv3d_cfg,
         perceiver_demo_query=perceiver_cfg,
+        traj_conv3d=traj_conv3d_cfg,
         traj_perceiver=traj_cfg,
     )
 
@@ -196,6 +265,10 @@ def resolve_use_mask_id(train_model_cfg: ConfigDict) -> bool:
     encoder_name = str(getattr(train_model_cfg, "encoder_name", "perceiver_demo_query"))
     if encoder_name == "traj_perceiver":
         return as_bool(getattr(getattr(train_model_cfg, "traj_perceiver", ConfigDict()), "use_mask_id", True))
+    if encoder_name == "traj_conv3d":
+        return as_bool(getattr(getattr(train_model_cfg, "traj_conv3d", ConfigDict()), "use_mask_id", True))
+    if encoder_name == "conv3d_demo_query":
+        return as_bool(getattr(getattr(train_model_cfg, "conv3d_demo_query", ConfigDict()), "use_mask_id", True))
     return as_bool(
         getattr(getattr(train_model_cfg, "perceiver_demo_query", ConfigDict()), "use_mask_id", True)
     )
@@ -225,7 +298,15 @@ def export_memory_timeline_artifacts(
     device: torch.device,
     cuda_device_index: Optional[int] = None,
 ) -> None:
-    memory_device = f"cuda:{cuda_device_index}" if device.type == "cuda" else "cpu"
+    if device.type == "cuda":
+        resolved_cuda_index = cuda_device_index
+        if resolved_cuda_index is None:
+            resolved_cuda_index = device.index
+        if resolved_cuda_index is None:
+            resolved_cuda_index = torch.cuda.current_device()
+        memory_device = f"cuda:{int(resolved_cuda_index)}"
+    else:
+        memory_device = "cpu"
     memory_json_path = trace_path.with_suffix(".memory.json")
     memory_html_path = trace_path.with_suffix(".memory.html")
     memory_png_path = trace_path.with_suffix(".memory.png")

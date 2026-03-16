@@ -48,6 +48,7 @@ def get_config():
     cfg.model.policy.denoiser_layers = 10
     cfg.model.policy.denoiser_mlp_mult = 4
     cfg.model.policy.dropout = 0.0
+    cfg.model.policy.grad_checkpoint_dit = False
     cfg.model.policy.num_train_timesteps = 1000
     cfg.model.policy.beta_start = 1e-4
     cfg.model.policy.beta_end = 2e-2
@@ -74,6 +75,9 @@ def get_config():
     cfg.model.perceiver_demo_query.rgb_alpha_init = 1.0
     cfg.model.perceiver_demo_query.dropout = 0.0
     cfg.model.perceiver_demo_query.compress_demo_latents = True
+    cfg.model.perceiver_demo_query.checkpoint_demo_memory = False
+    cfg.model.perceiver_demo_query.checkpoint_build_demo_memory = False
+    cfg.model.perceiver_demo_query.checkpoint_frame_tokenizer = False
 
     # Trajectory perceiver context encoder (unused unless encoder_name=traj_perceiver).
     cfg.model.traj_perceiver = ConfigDict()
@@ -92,6 +96,9 @@ def get_config():
     cfg.model.traj_perceiver.rgb_alpha_init = 1.0
     cfg.model.traj_perceiver.ignore_demos = False
     cfg.model.traj_perceiver.compress_demo_latents = True
+    cfg.model.traj_perceiver.checkpoint_demo_memory = False
+    cfg.model.traj_perceiver.checkpoint_build_demo_memory = False
+    cfg.model.traj_perceiver.checkpoint_frame_tokenizer = False
     cfg.model.traj_perceiver.m_traj_tokens = 16
     cfg.model.traj_perceiver.traj_perceiver_layers = 2
     cfg.model.traj_perceiver.traj_dim = 8
