@@ -27,6 +27,7 @@ class PerceiverDemoQueryEncoderConfig:
     rgb_alpha_init: float = 1.0
     dropout: float = 0.0
     ignore_demos: bool = False
+    compress_demo_latents: bool = True
 
 class PerceiverDemoQueryEncoder(ContextEncoder):
 
@@ -64,10 +65,12 @@ class PerceiverDemoQueryEncoder(ContextEncoder):
         )
 
         # demo memory perceiver
-        self.demo_memory = DemoMemoryPerceiver(
-            d=d, M=cfg.M_demo_latents, n_heads=cfg.n_heads,
-            n_layers=cfg.demo_perceiver_layers, dropout=cfg.dropout
-        )
+        self.demo_memory = None
+        if self.cfg.compress_demo_latents:
+            self.demo_memory = DemoMemoryPerceiver(
+                d=d, M=cfg.M_demo_latents, n_heads=cfg.n_heads,
+                n_layers=cfg.demo_perceiver_layers, dropout=cfg.dropout
+            )
 
     # --------------------
     # Encoding helpers
@@ -121,7 +124,9 @@ class PerceiverDemoQueryEncoder(ContextEncoder):
         cond_valid: Optional[torch.Tensor] = None,   # [B,K,L,N] bool
     ) -> torch.Tensor:
         """
-        returns Z_demo: [B, M, d]
+        Returns support tokens:
+          - [B, M, d] if compress_demo_latents=True
+          - [B, K*L*(m+1), d] otherwise
         """
         B, K, L, N, _ = cond_xyz.shape
         d = self.cfg.d_model
@@ -162,7 +167,11 @@ class PerceiverDemoQueryEncoder(ContextEncoder):
         tokens = frame_tokens.reshape(B, K * L * m1, d)  # [B,S,d]
 
         # compress to demo memory latents
-        Z_demo = self.demo_memory(tokens)  # [B,M,d]
+        if self.cfg.compress_demo_latents:
+            Z_demo = self.demo_memory(tokens)  # [B,M,d]
+        else:
+            Z_demo = tokens
+            
         return Z_demo
 
     def _build_query_tokens(

@@ -217,6 +217,7 @@ def _build_model_cfg(cfg: ConfigDict) -> PolicyBuilderConfig:
         rgb_alpha_init=float(getattr(perceiver_cfg_raw, "rgb_alpha_init", 1.0)),
         dropout=float(perceiver_cfg_raw.dropout),
         ignore_demos=_as_bool(getattr(perceiver_cfg_raw, "ignore_demos", False)),
+        compress_demo_latents=_as_bool(getattr(perceiver_cfg_raw, "compress_demo_latents", True)),
     )
     conv3d_cfg = Conv3dDemoQueryEncoderConfig(
         d_model=int(getattr(conv3d_cfg_raw, "d_model", policy_cfg.d_model)),
@@ -252,6 +253,7 @@ def _build_model_cfg(cfg: ConfigDict) -> PolicyBuilderConfig:
         role_embed_max_Tobs=int(getattr(traj_cfg_raw, "role_embed_max_Tobs", 16)),
         rgb_alpha_init=float(getattr(traj_cfg_raw, "rgb_alpha_init", 1.0)),
         ignore_demos=_as_bool(getattr(traj_cfg_raw, "ignore_demos", False)),
+        compress_demo_latents=_as_bool(getattr(traj_cfg_raw, "compress_demo_latents", True)),
         m_traj_tokens=int(getattr(traj_cfg_raw, "m_traj_tokens", 16)),
         traj_perceiver_layers=int(getattr(traj_cfg_raw, "traj_perceiver_layers", getattr(traj_cfg_raw, "n_layers", 2))),
         traj_dim=int(getattr(traj_cfg_raw, "traj_dim", 8)),

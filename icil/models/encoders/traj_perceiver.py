@@ -33,6 +33,7 @@ class TrajPerceiverConfig:
     role_embed_max_Tobs: int = 16
     rgb_alpha_init: float = 1.0
     ignore_demos: bool = False
+    compress_demo_latents: bool = True
 
     # Trajectory branch.
     m_traj_tokens: int = 16
@@ -83,6 +84,7 @@ class TrajectoryPerceiverEncoder(ContextEncoder):
                 rgb_alpha_init=float(cfg.rgb_alpha_init),
                 dropout=float(cfg.dropout),
                 ignore_demos=bool(cfg.ignore_demos),
+                compress_demo_latents=bool(cfg.compress_demo_latents),
             ),
             state_dim=int(state_dim),
             action_dim=0,

@@ -180,16 +180,24 @@ def _conditioning_use_mask_id_from_eval_and_checkpoint(
     cfg: ConfigDict,
     model_cfg: PolicyBuilderConfig,
 ) -> bool:
+    if str(model_cfg.encoder_name) == "conv3d_demo_query":
+        return bool(model_cfg.conv3d_demo_query.use_mask_id)
     if str(model_cfg.encoder_name) == "perceiver_demo_query":
         return bool(model_cfg.perceiver_demo_query.use_mask_id)
+    if str(model_cfg.encoder_name) == "traj_conv3d":
+        return bool(model_cfg.traj_conv3d.use_mask_id)
     if str(model_cfg.encoder_name) == "traj_perceiver":
         return bool(model_cfg.traj_perceiver.use_mask_id)
     return _as_bool(getattr(cfg.conditioning, "use_mask_id", True))
 
 
 def _ignore_demos_from_model_cfg(model_cfg: PolicyBuilderConfig) -> bool:
+    if str(model_cfg.encoder_name) == "conv3d_demo_query":
+        return bool(model_cfg.conv3d_demo_query.ignore_demos)
     if str(model_cfg.encoder_name) == "perceiver_demo_query":
         return bool(model_cfg.perceiver_demo_query.ignore_demos)
+    if str(model_cfg.encoder_name) == "traj_conv3d":
+        return bool(model_cfg.traj_conv3d.ignore_demos)
     if str(model_cfg.encoder_name) == "traj_perceiver":
         return bool(model_cfg.traj_perceiver.ignore_demos)
     return False

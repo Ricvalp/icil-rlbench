@@ -73,6 +73,7 @@ def get_config():
     cfg.model.perceiver_demo_query.role_embed_max_Tobs = 2
     cfg.model.perceiver_demo_query.rgb_alpha_init = 1.0
     cfg.model.perceiver_demo_query.dropout = 0.0
+    cfg.model.perceiver_demo_query.compress_demo_latents = True
 
     # Trajectory perceiver context encoder (unused unless encoder_name=traj_perceiver).
     cfg.model.traj_perceiver = ConfigDict()
@@ -90,6 +91,7 @@ def get_config():
     cfg.model.traj_perceiver.role_embed_max_Tobs = 2
     cfg.model.traj_perceiver.rgb_alpha_init = 1.0
     cfg.model.traj_perceiver.ignore_demos = False
+    cfg.model.traj_perceiver.compress_demo_latents = True
     cfg.model.traj_perceiver.m_traj_tokens = 16
     cfg.model.traj_perceiver.traj_perceiver_layers = 2
     cfg.model.traj_perceiver.traj_dim = 8
