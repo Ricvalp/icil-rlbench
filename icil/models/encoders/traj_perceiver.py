@@ -37,6 +37,8 @@ class TrajPerceiverConfig:
     checkpoint_demo_memory: bool = False
     checkpoint_build_demo_memory: bool = False
     checkpoint_frame_tokenizer: bool = False
+    tokenize_frames_chunked: bool = False
+    chunk_frames: int = 32
 
     # Trajectory branch.
     m_traj_tokens: int = 16
@@ -91,6 +93,8 @@ class TrajectoryPerceiverEncoder(ContextEncoder):
                 checkpoint_demo_memory=bool(cfg.checkpoint_demo_memory),
                 checkpoint_build_demo_memory=bool(cfg.checkpoint_build_demo_memory),
                 checkpoint_frame_tokenizer=bool(cfg.checkpoint_frame_tokenizer),
+                tokenize_frames_chunked=bool(cfg.tokenize_frames_chunked),
+                chunk_frames=int(cfg.chunk_frames),
             ),
             state_dim=int(state_dim),
             action_dim=0,

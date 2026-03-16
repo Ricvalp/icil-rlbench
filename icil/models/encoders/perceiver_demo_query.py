@@ -32,6 +32,8 @@ class PerceiverDemoQueryEncoderConfig:
     checkpoint_demo_memory: bool = False
     checkpoint_build_demo_memory: bool = False
     checkpoint_frame_tokenizer: bool = False
+    tokenize_frames_chunked: bool = False
+    chunk_frames: int = 32
 
 class PerceiverDemoQueryEncoder(ContextEncoder):
 
@@ -133,6 +135,34 @@ class PerceiverDemoQueryEncoder(ContextEncoder):
             z = self.frame_tokenizer(pt, point_mask=point_valid)  # [Bf,m,d]
         s_tok = self.state_proj(state).unsqueeze(1)  # [Bf,1,d]
         return torch.cat([z, s_tok], dim=1)          # [Bf,m+1,d]
+    
+    def _tokenize_frames_chunked(
+        self,
+        xyz: torch.Tensor,               # [Bf, N, 3]
+        state: torch.Tensor,             # [Bf, S]
+        mask_id: Optional[torch.Tensor], # [Bf, N]
+        rgb: Optional[torch.Tensor] = None, # [Bf, N, 3]
+        point_valid: Optional[torch.Tensor] = None,  # [Bf, N] bool
+        *, chunk_frames: int,
+    ) -> torch.Tensor:
+        """
+        returns per-frame tokens including state token, computed in frame chunks:
+          [Bf, m+1, d]
+        """
+        if int(chunk_frames) < 1:
+            raise ValueError(f"chunk_frames must be >= 1, got {chunk_frames}.")
+        outs = []
+        Bf = xyz.shape[0]
+        for s in range(0, Bf, chunk_frames):
+            e = min(Bf, s + chunk_frames)
+            outs.append(self._tokenize_frames(
+                xyz=xyz[s:e],
+                state=state[s:e],
+                mask_id=None if mask_id is None else mask_id[s:e],
+                rgb=None if rgb is None else rgb[s:e],
+                point_valid=None if point_valid is None else point_valid[s:e],
+            ))
+        return torch.cat(outs, dim=0)  # [Bf, m+1, d]
 
     def _build_demo_memory(
         self,
@@ -168,7 +198,18 @@ class PerceiverDemoQueryEncoder(ContextEncoder):
         mask_f = cond_mask_id.reshape(B * K * L, N) if cond_mask_id is not None else None
         valid_f = cond_valid.reshape(B * K * L, N).to(torch.bool) if cond_valid is not None else None
 
-        frame_tokens = self._tokenize_frames(xyz_f, state_f, mask_f, rgb=rgb_f, point_valid=valid_f)  # [B*K*L, m+1, d]
+        if self.cfg.tokenize_frames_chunked:
+            frame_tokens = self._tokenize_frames_chunked(
+                xyz_f,
+                state_f,
+                mask_f,
+                rgb=rgb_f,
+                point_valid=valid_f,
+                chunk_frames=self.cfg.chunk_frames
+            )  # [B*K*L, m+1, d]
+        else:
+            frame_tokens = self._tokenize_frames(xyz_f, state_f, mask_f, rgb=rgb_f, point_valid=valid_f)  # [B*K*L, m+1, d]
+        
         m1 = frame_tokens.shape[1]
         frame_tokens = frame_tokens.reshape(B, K, L, m1, d)
 

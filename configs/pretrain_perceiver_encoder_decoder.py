@@ -78,6 +78,8 @@ def get_config():
     cfg.model.perceiver_demo_query.checkpoint_demo_memory = False
     cfg.model.perceiver_demo_query.checkpoint_build_demo_memory = False
     cfg.model.perceiver_demo_query.checkpoint_frame_tokenizer = False
+    cfg.model.perceiver_demo_query.tokenize_frames_chunked = False
+    cfg.model.perceiver_demo_query.chunk_frames = 32
 
     # Trajectory perceiver context encoder (unused unless encoder_name=traj_perceiver).
     cfg.model.traj_perceiver = ConfigDict()
@@ -99,6 +101,8 @@ def get_config():
     cfg.model.traj_perceiver.checkpoint_demo_memory = False
     cfg.model.traj_perceiver.checkpoint_build_demo_memory = False
     cfg.model.traj_perceiver.checkpoint_frame_tokenizer = False
+    cfg.model.traj_perceiver.tokenize_frames_chunked = False
+    cfg.model.traj_perceiver.chunk_frames = 8
     cfg.model.traj_perceiver.m_traj_tokens = 16
     cfg.model.traj_perceiver.traj_perceiver_layers = 2
     cfg.model.traj_perceiver.traj_dim = 8

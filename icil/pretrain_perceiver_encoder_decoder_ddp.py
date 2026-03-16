@@ -229,6 +229,10 @@ def _build_model_cfg(cfg: ConfigDict) -> PolicyBuilderConfig:
         checkpoint_frame_tokenizer=_as_bool(
             getattr(perceiver_cfg_raw, "checkpoint_frame_tokenizer", False)
         ),
+        tokenize_frames_chunked=_as_bool(
+            getattr(perceiver_cfg_raw, "tokenize_frames_chunked", False)
+        ),
+        chunk_frames=int(getattr(perceiver_cfg_raw, "chunk_frames", 32)),
     )
     conv3d_cfg = Conv3dDemoQueryEncoderConfig(
         d_model=int(getattr(conv3d_cfg_raw, "d_model", policy_cfg.d_model)),
@@ -272,6 +276,10 @@ def _build_model_cfg(cfg: ConfigDict) -> PolicyBuilderConfig:
         checkpoint_frame_tokenizer=_as_bool(
             getattr(traj_cfg_raw, "checkpoint_frame_tokenizer", False)
         ),
+        tokenize_frames_chunked=_as_bool(
+            getattr(traj_cfg_raw, "tokenize_frames_chunked", False)
+        ),
+        chunk_frames=int(getattr(traj_cfg_raw, "chunk_frames", 32)),
         m_traj_tokens=int(getattr(traj_cfg_raw, "m_traj_tokens", 16)),
         traj_perceiver_layers=int(getattr(traj_cfg_raw, "traj_perceiver_layers", getattr(traj_cfg_raw, "n_layers", 2))),
         traj_dim=int(getattr(traj_cfg_raw, "traj_dim", 8)),
