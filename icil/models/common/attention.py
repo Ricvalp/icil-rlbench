@@ -109,3 +109,46 @@ class DiTBlock(nn.Module):
         x = x + self.drop(self.mlp(self.adaln3(x, t_cond)))
         return x
 
+
+class DiTBlock2Ctx(nn.Module):
+    def __init__(self, d: int, n_heads: int, cond_dim: int, mlp_mult: int = 4, dropout: float = 0.0):
+        super().__init__()
+        self.adaln1 = AdaLN(d, cond_dim)
+        self.self_attn = SelfAttention(d, n_heads, dropout)
+
+        # cross-attn #1: query
+        self.adaln_q = AdaLN(d, cond_dim)
+        self.cross_attn_q = CrossAttention(d, n_heads, dropout)
+
+        # cross-attn #2: support
+        self.adaln_s = AdaLN(d, cond_dim)
+        self.cross_attn_s = CrossAttention(d, n_heads, dropout)
+
+        self.adaln3 = AdaLN(d, cond_dim)
+        self.mlp = nn.Sequential(
+            nn.Linear(d, mlp_mult * d),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(mlp_mult * d, d),
+        )
+        self.drop = nn.Dropout(dropout)
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        t_cond: torch.Tensor,
+        ctx_query: torch.Tensor,
+        ctx_support: torch.Tensor,
+        ctx_query_mask: Optional[torch.Tensor] = None,
+        ctx_support_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        x = x + self.drop(self.self_attn(self.adaln1(x, t_cond)))
+
+        # query-first cross-attn (forces grounding in current obs)
+        x = x + self.drop(self.cross_attn_q(self.adaln_q(x, t_cond), ctx_query, kv_mask=ctx_query_mask))
+
+        # then support cross-attn (demos / traj)
+        x = x + self.drop(self.cross_attn_s(self.adaln_s(x, t_cond), ctx_support, kv_mask=ctx_support_mask))
+
+        x = x + self.drop(self.mlp(self.adaln3(x, t_cond)))
+        return x

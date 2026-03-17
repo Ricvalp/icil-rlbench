@@ -4,7 +4,7 @@ from icil.models.common.embeddings import (
     sinusoidal_position_embedding,
     sinusoidal_time_embedding,
 )
-from icil.models.common.attention import DiTBlock
+from icil.models.common.attention import DiTBlock, DiTBlock2Ctx
 from icil.models.common.perceiver import FramePerceiverTokenizer, DemoMemoryPerceiver, TimeLatentPerceiver
 from icil.models.common.conv3d import SparseVoxelConvTokenizer
 
