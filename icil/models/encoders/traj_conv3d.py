@@ -217,6 +217,11 @@ class TrajectoryConv3DEncoder(ContextEncoder):
             cond_valid=cond_valid,
         )
         ctx = dq_out.tokens
+        ctx_mask = dq_out.token_mask
+        support_tokens = dq_out.support_tokens
+        support_token_mask = dq_out.support_token_mask
+        query_tokens = dq_out.query_tokens
+        query_token_mask = dq_out.query_token_mask
 
         # Optional trajectory tokens.
         if bool(self.cfg.include_traj_tokens):
@@ -227,6 +232,20 @@ class TrajectoryConv3DEncoder(ContextEncoder):
             )
             if traj_src is not None and traj_mask is not None:
                 z_traj = self._build_traj_tokens(cond_traj=traj_src, cond_traj_mask=traj_mask)
-                ctx = torch.cat([ctx, z_traj], dim=1)
+                ctx = z_traj if ctx is None else torch.cat([ctx, z_traj], dim=1)
+                support_tokens = z_traj if support_tokens is None else torch.cat([support_tokens, z_traj], dim=1)
+                if ctx_mask is not None:
+                    traj_keep = torch.ones(z_traj.shape[:2], device=z_traj.device, dtype=torch.bool)
+                    ctx_mask = torch.cat([ctx_mask.to(torch.bool), traj_keep], dim=1)
+                if support_token_mask is not None:
+                    traj_keep = torch.ones(z_traj.shape[:2], device=z_traj.device, dtype=torch.bool)
+                    support_token_mask = torch.cat([support_token_mask.to(torch.bool), traj_keep], dim=1)
 
-        return ContextEncoderOutput(tokens=ctx, token_mask=None)
+        return ContextEncoderOutput(
+            tokens=ctx,
+            token_mask=ctx_mask,
+            support_tokens=support_tokens,
+            support_token_mask=support_token_mask,
+            query_tokens=query_tokens,
+            query_token_mask=query_token_mask,
+        )

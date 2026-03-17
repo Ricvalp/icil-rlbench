@@ -31,5 +31,9 @@ class ContextEncoder(nn.Module):
 
 @dataclass
 class ContextEncoderOutput:
-    tokens: torch.Tensor
+    tokens: Optional[torch.Tensor] = None
     token_mask: Optional[torch.Tensor] = None
+    support_tokens: Optional[torch.Tensor] = None
+    support_token_mask: Optional[torch.Tensor] = None
+    query_tokens: Optional[torch.Tensor] = None
+    query_token_mask: Optional[torch.Tensor] = None

@@ -138,7 +138,7 @@ class DiTBlock2Ctx(nn.Module):
         x: torch.Tensor,
         t_cond: torch.Tensor,
         ctx_query: torch.Tensor,
-        ctx_support: torch.Tensor,
+        ctx_support: Optional[torch.Tensor] = None,
         ctx_query_mask: Optional[torch.Tensor] = None,
         ctx_support_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
@@ -148,7 +148,10 @@ class DiTBlock2Ctx(nn.Module):
         x = x + self.drop(self.cross_attn_q(self.adaln_q(x, t_cond), ctx_query, kv_mask=ctx_query_mask))
 
         # then support cross-attn (demos / traj)
-        x = x + self.drop(self.cross_attn_s(self.adaln_s(x, t_cond), ctx_support, kv_mask=ctx_support_mask))
+        if ctx_support is not None:
+            x = x + self.drop(
+                self.cross_attn_s(self.adaln_s(x, t_cond), ctx_support, kv_mask=ctx_support_mask)
+            )
 
         x = x + self.drop(self.mlp(self.adaln3(x, t_cond)))
         return x

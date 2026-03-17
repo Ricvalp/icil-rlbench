@@ -190,6 +190,7 @@ def _build_model_cfg(cfg: ConfigDict) -> PolicyBuilderConfig:
         denoiser_mlp_mult=int(policy_cfg_raw.denoiser_mlp_mult),
         dropout=float(policy_cfg_raw.dropout),
         grad_checkpoint_dit=_as_bool(getattr(policy_cfg_raw, "grad_checkpoint_dit", False)),
+        context_attention_mode=str(getattr(policy_cfg_raw, "context_attention_mode", "single")),
         num_train_timesteps=int(policy_cfg_raw.num_train_timesteps),
         beta_start=float(getattr(policy_cfg_raw, "beta_start", 1e-4)),
         beta_end=float(getattr(policy_cfg_raw, "beta_end", 2e-2)),

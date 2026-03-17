@@ -49,6 +49,7 @@ def get_config():
     cfg.model.policy.denoiser_mlp_mult = 4
     cfg.model.policy.dropout = 0.0
     cfg.model.policy.grad_checkpoint_dit = False
+    cfg.model.policy.context_attention_mode = "single"  # "single" | "two_ctx"
     cfg.model.policy.num_train_timesteps = 1000
     cfg.model.policy.beta_start = 1e-4
     cfg.model.policy.beta_end = 2e-2

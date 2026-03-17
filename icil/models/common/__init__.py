@@ -14,7 +14,9 @@ __all__ = [
     "sinusoidal_position_embedding",
     "continuous_sinusoidal_embedding",
     "DiTBlock",
+    "DiTBlock2Ctx",
     "FramePerceiverTokenizer",
     "DemoMemoryPerceiver",
     "TimeLatentPerceiver",
+    "SparseVoxelConvTokenizer",
 ]

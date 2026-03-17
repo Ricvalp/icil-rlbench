@@ -32,11 +32,13 @@ from icil.datasets.in_context_imitation_learning.variation_store import (
     build_variation_keys,
 )
 from icil.models import (
+    Conv3dDemoQueryEncoder,
     ContextEncoderOutput,
     PerceiverDemoQueryEncoder,
     Policy,
     PolicyBuilderConfig,
     PolicyConfig,
+    TrajectoryConv3DEncoder,
     TrajectoryPerceiverEncoder,
     build_policy,
 )
@@ -705,7 +707,7 @@ class _CachedSupportContextEncoder(nn.Module):
         support = _move_tensor_dict_to_device(support_cond, device)
         enc = self.base_encoder
 
-        if isinstance(enc, PerceiverDemoQueryEncoder):
+        if isinstance(enc, (PerceiverDemoQueryEncoder, Conv3dDemoQueryEncoder)):
             if bool(getattr(enc.cfg, "ignore_demos", False)):
                 self._cached_demo_tokens = None
             else:
@@ -720,7 +722,7 @@ class _CachedSupportContextEncoder(nn.Module):
             self._cache_enabled = True
             return
 
-        if isinstance(enc, TrajectoryPerceiverEncoder):
+        if isinstance(enc, (TrajectoryPerceiverEncoder, TrajectoryConv3DEncoder)):
             demo_enc = enc.demo_query_encoder
             if bool(getattr(demo_enc.cfg, "ignore_demos", False)):
                 self._cached_demo_tokens = None
@@ -798,7 +800,7 @@ class _CachedSupportContextEncoder(nn.Module):
         self._check_batch_size(query_xyz)
         enc = self.base_encoder
 
-        if isinstance(enc, PerceiverDemoQueryEncoder):
+        if isinstance(enc, (PerceiverDemoQueryEncoder, Conv3dDemoQueryEncoder)):
             z_query = enc._build_query_tokens(
                 query_xyz,
                 query_state,
@@ -806,15 +808,24 @@ class _CachedSupportContextEncoder(nn.Module):
                 query_mask_id=query_mask_id,
                 query_valid=query_valid,
             )
+            support_tokens = None
             if bool(getattr(enc.cfg, "ignore_demos", False)):
                 ctx = z_query
             else:
                 if self._cached_demo_tokens is None:
                     raise RuntimeError("Support cache is enabled but cached demo tokens are missing.")
-                ctx = torch.cat([self._cached_demo_tokens, z_query], dim=1)
-            return ContextEncoderOutput(tokens=ctx, token_mask=None)
+                support_tokens = self._cached_demo_tokens
+                ctx = torch.cat([support_tokens, z_query], dim=1)
+            return ContextEncoderOutput(
+                tokens=ctx,
+                token_mask=None,
+                support_tokens=support_tokens,
+                support_token_mask=None,
+                query_tokens=z_query,
+                query_token_mask=None,
+            )
 
-        if isinstance(enc, TrajectoryPerceiverEncoder):
+        if isinstance(enc, (TrajectoryPerceiverEncoder, TrajectoryConv3DEncoder)):
             demo_enc = enc.demo_query_encoder
             z_query = demo_enc._build_query_tokens(
                 query_xyz,
@@ -823,15 +834,29 @@ class _CachedSupportContextEncoder(nn.Module):
                 query_mask_id=query_mask_id,
                 query_valid=query_valid,
             )
+            support_tokens = None
             if bool(getattr(demo_enc.cfg, "ignore_demos", False)):
                 ctx = z_query
             else:
                 if self._cached_demo_tokens is None:
                     raise RuntimeError("Support cache is enabled but cached demo tokens are missing.")
-                ctx = torch.cat([self._cached_demo_tokens, z_query], dim=1)
+                support_tokens = self._cached_demo_tokens
+                ctx = torch.cat([support_tokens, z_query], dim=1)
             if self._cached_traj_tokens is not None:
                 ctx = torch.cat([ctx, self._cached_traj_tokens], dim=1)
-            return ContextEncoderOutput(tokens=ctx, token_mask=None)
+                support_tokens = (
+                    self._cached_traj_tokens
+                    if support_tokens is None
+                    else torch.cat([support_tokens, self._cached_traj_tokens], dim=1)
+                )
+            return ContextEncoderOutput(
+                tokens=ctx,
+                token_mask=None,
+                support_tokens=support_tokens,
+                support_token_mask=None,
+                query_tokens=z_query,
+                query_token_mask=None,
+            )
 
         return self.base_encoder(
             query_xyz=query_xyz,

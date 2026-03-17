@@ -295,6 +295,7 @@ class PerceiverDemoQueryEncoder(ContextEncoder):
         Z_query = self._build_query_tokens(
             query_xyz, query_state, query_rgb=query_rgb, query_mask_id=query_mask_id, query_valid=query_valid
         )  # [B,Sq,d]
+        support_tokens: Optional[torch.Tensor] = None
         # Optional ablation: ignore support demos and condition only on query tokens.
         if bool(getattr(self.cfg, "ignore_demos", False)):
             ctx = Z_query
@@ -321,6 +322,14 @@ class PerceiverDemoQueryEncoder(ContextEncoder):
                 Z_demo = self._build_demo_memory(
                     cond_xyz, cond_state, cond_rgb=cond_rgb, cond_mask_id=cond_mask_id, cond_valid=cond_valid
                 )  # [B,M,d]
+            support_tokens = Z_demo
             ctx = torch.cat([Z_demo, Z_query], dim=1)  # [B, M+Sq, d]
 
-        return ContextEncoderOutput(tokens=ctx, token_mask=None)
+        return ContextEncoderOutput(
+            tokens=ctx,
+            token_mask=None,
+            support_tokens=support_tokens,
+            support_token_mask=None,
+            query_tokens=Z_query,
+            query_token_mask=None,
+        )
