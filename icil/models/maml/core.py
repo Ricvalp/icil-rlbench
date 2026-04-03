@@ -58,6 +58,13 @@ def _clip_grads_in_list(grads: List[torch.Tensor], max_norm: float) -> List[torc
     return [grad * scale if grad is not None else None for grad in grads]
 
 
+def _grad_list_global_norm(grads: Sequence[torch.Tensor]) -> torch.Tensor:
+    valid_grads = [grad.detach() for grad in grads if grad is not None]
+    if not valid_grads:
+        return torch.tensor(0.0, dtype=torch.float32)
+    return torch.norm(torch.stack([grad.norm(2) for grad in valid_grads]), 2)
+
+
 def _sample_loo_indices(
     K: int,
     *,
@@ -180,6 +187,7 @@ def adapt_fast_params_for_prepared_task(
     create_graph: bool,
     base_params: Optional[Dict[str, torch.Tensor]] = None,
     buffers: Optional[Dict[str, torch.Tensor]] = None,
+    inner_grad_norms_out: Optional[List[torch.Tensor]] = None,
 ) -> Dict[str, torch.Tensor]:
     adapted_params = base_params if base_params is not None else dict(model.named_parameters())
     model_buffers = buffers if buffers is not None else dict(model.named_buffers())
@@ -194,6 +202,8 @@ def adapt_fast_params_for_prepared_task(
             retain_graph=create_graph,
             allow_unused=False,
         )
+        if inner_grad_norms_out is not None:
+            inner_grad_norms_out.append(_grad_list_global_norm(grads))
         grads = _clip_grads_in_list(list(grads), float(cfg.max_grad_norm))
 
         new_params = dict(adapted_params)
@@ -248,6 +258,36 @@ def maml_step(
             )
         )
     return torch.stack(losses).mean()
+
+
+def maml_step_with_stats(
+    model: nn.Module,
+    prepared_tasks: Sequence[Dict[str, Any]],
+    *,
+    fast_names: Sequence[str],
+    cfg: MAMLConfig,
+) -> tuple[torch.Tensor, float]:
+    base_params = dict(model.named_parameters())
+    buffers = dict(model.named_buffers())
+    losses: List[torch.Tensor] = []
+    inner_grad_norms: List[torch.Tensor] = []
+    for prepared_task in prepared_tasks:
+        adapted_params = adapt_fast_params_for_prepared_task(
+            model,
+            prepared_task,
+            fast_names=fast_names,
+            cfg=cfg,
+            create_graph=True,
+            base_params=base_params,
+            buffers=buffers,
+            inner_grad_norms_out=inner_grad_norms,
+        )
+        losses.append(functional_call(model, (adapted_params, buffers), (prepared_task["query_batch"],)))
+    meta_loss = torch.stack(losses).mean()
+    avg_inner_grad_norm = (
+        float(torch.stack(inner_grad_norms).mean().item()) if inner_grad_norms else 0.0
+    )
+    return meta_loss, avg_inner_grad_norm
 
 
 def copy_fast_params_into_policy(

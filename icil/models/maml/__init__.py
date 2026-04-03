@@ -3,6 +3,7 @@ from icil.models.maml.core import (
     adapt_fast_params_for_prepared_task,
     copy_fast_params_into_policy,
     maml_step,
+    maml_step_with_stats,
     prepare_outer_batch_for_meta_step,
     prepare_task_for_meta_step,
 )
@@ -29,6 +30,7 @@ __all__ = [
     "get_fast_param_names",
     "get_outer_param_names",
     "maml_step",
+    "maml_step_with_stats",
     "prefix_param_names",
     "prepare_outer_batch_for_meta_step",
     "prepare_task_for_meta_step",

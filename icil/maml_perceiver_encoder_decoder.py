@@ -29,7 +29,7 @@ from icil.models.maml import (
     count_params_by_name,
     get_fast_param_names,
     get_outer_param_names,
-    maml_step,
+    maml_step_with_stats,
     prefix_param_names,
     prepare_outer_batch_for_meta_step,
     set_outer_trainable_params,
@@ -166,6 +166,94 @@ def _resolve_outer_context_size(
     if resolved > data_k:
         raise ValueError(f'outer_context_size={resolved} exceeds data.K={data_k}.')
     return resolved
+
+
+def _resolve_checkpoint_field(
+    *,
+    local_value: Any,
+    section_name: str,
+    field_name: str,
+    resume_config: Optional[Dict[str, Any]],
+    pretrained_config: Optional[Dict[str, Any]],
+    transform: Optional[Any] = None,
+) -> Any:
+    for source_config in (resume_config, pretrained_config):
+        if not isinstance(source_config, dict):
+            continue
+        section = source_config.get(section_name, {})
+        if isinstance(section, dict) and field_name in section:
+            value = section[field_name]
+            return transform(value) if transform is not None else value
+    return transform(local_value) if transform is not None else local_value
+
+
+def _resolve_dataset_cfg(
+    cfg: ConfigDict,
+    *,
+    resolved_data_k: int,
+    resume_config: Optional[Dict[str, Any]],
+    pretrained_config: Optional[Dict[str, Any]],
+) -> ICILConfig:
+    return ICILConfig(
+        K=int(resolved_data_k),
+        L=_resolve_checkpoint_field(
+            local_value=cfg.dataset.L,
+            section_name='dataset',
+            field_name='L',
+            resume_config=resume_config,
+            pretrained_config=pretrained_config,
+            transform=int,
+        ),
+        T_obs=_resolve_checkpoint_field(
+            local_value=cfg.dataset.T_obs,
+            section_name='dataset',
+            field_name='T_obs',
+            resume_config=resume_config,
+            pretrained_config=pretrained_config,
+            transform=int,
+        ),
+        H=_resolve_checkpoint_field(
+            local_value=cfg.dataset.H,
+            section_name='dataset',
+            field_name='H',
+            resume_config=resume_config,
+            pretrained_config=pretrained_config,
+            transform=int,
+        ),
+        stride=_resolve_checkpoint_field(
+            local_value=cfg.dataset.stride,
+            section_name='dataset',
+            field_name='stride',
+            resume_config=resume_config,
+            pretrained_config=pretrained_config,
+            transform=int,
+        ),
+    )
+
+
+def _resolve_task_filters(
+    cfg: ConfigDict,
+    *,
+    resume_config: Optional[Dict[str, Any]],
+    pretrained_config: Optional[Dict[str, Any]],
+) -> Tuple[List[str], List[str]]:
+    tasks = _resolve_checkpoint_field(
+        local_value=getattr(cfg.data, 'tasks', ()),
+        section_name='data',
+        field_name='tasks',
+        resume_config=resume_config,
+        pretrained_config=pretrained_config,
+        transform=_normalize_task_list,
+    )
+    exclude_tasks = _resolve_checkpoint_field(
+        local_value=getattr(cfg.data, 'exclude_tasks', ()),
+        section_name='data',
+        field_name='exclude_tasks',
+        resume_config=resume_config,
+        pretrained_config=pretrained_config,
+        transform=_normalize_task_list,
+    )
+    return tasks, exclude_tasks
 
 
 def _build_logging_task_batch(
@@ -449,10 +537,19 @@ def train(cfg: ConfigDict) -> None:
         resume_config=resume_config,
         pretrained_config=pretrained_config,
     )
+    dataset_cfg = _resolve_dataset_cfg(
+        cfg,
+        resolved_data_k=resolved_data_k,
+        resume_config=resume_config,
+        pretrained_config=pretrained_config,
+    )
 
     cache_root = Path(str(cfg.data.cache_root))
-    tasks = _normalize_task_list(getattr(cfg.data, 'tasks', ()))
-    exclude_tasks = _normalize_task_list(getattr(cfg.data, 'exclude_tasks', ()))
+    tasks, exclude_tasks = _resolve_task_filters(
+        cfg,
+        resume_config=resume_config,
+        pretrained_config=pretrained_config,
+    )
     store, tasks_used = _build_store(
         cache_root=cache_root,
         tasks=tasks,
@@ -497,13 +594,6 @@ def train(cfg: ConfigDict) -> None:
         checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
         state_dim, action_dim = _infer_dims(store)
-        dataset_cfg = ICILConfig(
-            K=int(resolved_data_k),
-            L=int(cfg.dataset.L),
-            T_obs=int(cfg.dataset.T_obs),
-            H=int(cfg.dataset.H),
-            stride=int(cfg.dataset.stride),
-        )
         task_dataset = ICILMAMLTaskBatchIterable(
             store=store,
             cfg=dataset_cfg,
@@ -618,6 +708,8 @@ def train(cfg: ConfigDict) -> None:
             logging.info('Resumed optimizer state from %s at step=%d', resume_path, global_step)
 
         n_total, n_trainable = _count_parameters(policy)
+        n_fast = count_params_by_name(policy, fast_names)
+        n_outer = count_params_by_name(policy, outer_names)
         logging.info('Run id=%s', run_id)
         logging.info('Output dir=%s', workdir)
         logging.info('Checkpoint dir=%s', checkpoint_dir)
@@ -631,11 +723,13 @@ def train(cfg: ConfigDict) -> None:
                 len(excluded_store),
             )
         logging.info(
-            'Model params: total=%s (%.3fM) | trainable=%s (%.3fM)',
+            'Model params: total=%s (%.3fM) | trainable=%s (%.3fM) | fast=%s (%.3fM)',
             f'{n_total:,}',
             n_total / 1e6,
             f'{n_trainable:,}',
             n_trainable / 1e6,
+            f'{n_fast:,}',
+            n_fast / 1e6,
         )
         logging.info(
             'Resolved MAML setup: model_source=%s | data.K=%d | outer_context_size=%d | '
@@ -645,13 +739,27 @@ def train(cfg: ConfigDict) -> None:
             resolved_outer_context_size,
             len(fast_names),
             len(outer_names),
-            f'{count_params_by_name(policy, outer_names):,}',
+            f'{n_outer:,}',
             str(_as_bool(cfg.outer.train_encoder)),
+        )
+        logging.info(
+            'Resolved dataset: K=%d | L=%d | T_obs=%d | H=%d | stride=%d',
+            int(dataset_cfg.K),
+            int(dataset_cfg.L),
+            int(dataset_cfg.T_obs),
+            int(dataset_cfg.H),
+            int(dataset_cfg.stride),
         )
 
         config_payload = cfg.to_dict()
         config_payload['model'] = asdict(model_cfg)
-        config_payload['dataset']['K'] = int(resolved_data_k)
+        config_payload['dataset']['K'] = int(dataset_cfg.K)
+        config_payload['dataset']['L'] = int(dataset_cfg.L)
+        config_payload['dataset']['T_obs'] = int(dataset_cfg.T_obs)
+        config_payload['dataset']['H'] = int(dataset_cfg.H)
+        config_payload['dataset']['stride'] = int(dataset_cfg.stride)
+        config_payload['data']['tasks'] = list(tasks)
+        config_payload['data']['exclude_tasks'] = list(exclude_tasks)
         config_payload['maml']['outer_context_size'] = int(resolved_outer_context_size)
         config_payload['runtime'] = {
             'run_id': run_id,
@@ -677,6 +785,7 @@ def train(cfg: ConfigDict) -> None:
                     'runtime': config_payload['runtime'],
                     'resolved': config_payload['resolved'],
                     'model': config_payload['model'],
+                    'data': config_payload['data'],
                     'dataset': config_payload['dataset'],
                     'maml': config_payload['maml'],
                 },
@@ -687,6 +796,8 @@ def train(cfg: ConfigDict) -> None:
                 {
                     'model/num_params_total': n_total,
                     'model/num_params_trainable': n_trainable,
+                    'model/num_params_fast': n_fast,
+                    'model/num_params_outer': n_outer,
                 },
                 step=global_step,
             )
@@ -720,6 +831,7 @@ def train(cfg: ConfigDict) -> None:
         log_loss = 0.0
         log_count = 0
         wb_loss_sum = 0.0
+        wb_inner_fast_grad_norm_sum = 0.0
         wb_count = 0
         window_start = time.time()
 
@@ -744,7 +856,7 @@ def train(cfg: ConfigDict) -> None:
             )
 
             optimizer.zero_grad(set_to_none=True)
-            meta_loss = maml_step(
+            meta_loss, avg_inner_fast_grad_norm = maml_step_with_stats(
                 loss_wrapper,
                 prepared_tasks,
                 fast_names=fast_names_wrapped,
@@ -760,6 +872,7 @@ def train(cfg: ConfigDict) -> None:
             log_loss += loss_value
             log_count += 1
             wb_loss_sum += loss_value
+            wb_inner_fast_grad_norm_sum += float(avg_inner_fast_grad_norm)
             wb_count += 1
 
             if log_every > 0 and (global_step % log_every == 0 or global_step == 1):
@@ -783,12 +896,14 @@ def train(cfg: ConfigDict) -> None:
                     {
                         'train/meta_loss': wb_loss_sum / max(1, wb_count),
                         'train/outer_loss': wb_loss_sum / max(1, wb_count),
+                        'train/inner_fast_grad_norm': wb_inner_fast_grad_norm_sum / max(1, wb_count),
                         'train/lr': float(optimizer.param_groups[0]['lr']),
                         'train/step': global_step,
                     },
                     step=global_step,
                 )
                 wb_loss_sum = 0.0
+                wb_inner_fast_grad_norm_sum = 0.0
                 wb_count = 0
 
             if wandb_run is not None and wandb_sample_every > 0 and (global_step % wandb_sample_every == 0):
