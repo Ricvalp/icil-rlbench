@@ -52,9 +52,9 @@ _CAMERAS: Tuple[str, ...] = (
 )
 
 
-def _build_run_name(*, task_name: str, variation: int) -> str:
+def _build_run_name(*, task_name: str, variation: int, unique_suffix: Optional[str] = None) -> str:
     timestamp = datetime.now().strftime('%Y%m%d-%H%M%S-%f')[:-3]
-    unique_id = uuid.uuid4().hex[:8]
+    unique_id = str(unique_suffix) if unique_suffix else uuid.uuid4().hex[:8]
     return f'{task_name}_var{variation}_{timestamp}_{unique_id}'
 
 
@@ -1588,11 +1588,15 @@ def evaluate(cfg: ConfigDict) -> None:
 
     task_name = str(cfg.task.name)
     variation = int(cfg.task.variation)
-    run_name = _build_run_name(task_name=task_name, variation=variation)
-    run_dir = Path(str(cfg.output.root_dir)).expanduser().resolve() / run_name
+    output_root = Path(str(cfg.output.root_dir)).expanduser().resolve()
+    output_root.mkdir(parents=True, exist_ok=True)
+
+    wandb_run = _maybe_init_wandb(cfg, output_root)
+    run_suffix = str(wandb_run.id) if wandb_run is not None else None
+    run_name = _build_run_name(task_name=task_name, variation=variation, unique_suffix=run_suffix)
+    run_dir = output_root / run_name
     run_dir.mkdir(parents=True, exist_ok=True)
 
-    wandb_run = _maybe_init_wandb(cfg, run_dir)
     if wandb_run is not None:
         wandb_run.name = run_name
 
