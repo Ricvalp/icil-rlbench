@@ -12,7 +12,7 @@ def get_config():
     cfg.checkpoint_path = ''
 
     cfg.task = ConfigDict()
-    cfg.task.name = 'put_item_in_drawer'
+    cfg.task.name = 'open_drawer'
     cfg.task.variation = 0
     cfg.task.num_eval_episodes = 10
     cfg.task.max_env_steps = 220
