@@ -2,7 +2,8 @@ from __future__ import annotations
 
 import json
 import random
-import time
+import uuid
+from datetime import datetime
 from dataclasses import fields, is_dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
@@ -49,6 +50,12 @@ _CAMERAS: Tuple[str, ...] = (
     'wrist',
     'front',
 )
+
+
+def _build_run_name(*, task_name: str, variation: int) -> str:
+    timestamp = datetime.now().strftime('%Y%m%d-%H%M%S-%f')[:-3]
+    unique_id = uuid.uuid4().hex[:8]
+    return f'{task_name}_var{variation}_{timestamp}_{unique_id}'
 
 
 def _as_bool(v: Any) -> bool:
@@ -1492,8 +1499,8 @@ def evaluate(cfg: ConfigDict) -> None:
 
     task_name = str(cfg.task.name)
     variation = int(cfg.task.variation)
-    run_id = time.strftime('%Y%m%d-%H%M%S')
-    run_dir = Path(str(cfg.output.root_dir)).expanduser().resolve() / f'{task_name}_var{variation}_{run_id}'
+    run_name = _build_run_name(task_name=task_name, variation=variation)
+    run_dir = Path(str(cfg.output.root_dir)).expanduser().resolve() / run_name
     run_dir.mkdir(parents=True, exist_ok=True)
 
     resolved_payload = cfg.to_dict()
@@ -1505,6 +1512,8 @@ def evaluate(cfg: ConfigDict) -> None:
     resolved_payload['ttt']['outer_context_size'] = int(resolved_outer_context_size)
     resolved_payload['resolved'] = {
         'checkpoint_path': str(checkpoint_path),
+        'run_name': run_name,
+        'run_dir': str(run_dir),
         'fast_param_names': list(fast_names),
         'fast_param_tensors': len(fast_names),
         'fast_param_count': int(fast_param_count),
