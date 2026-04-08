@@ -22,7 +22,7 @@ def get_config():
     cfg.data = ConfigDict()
     cfg.data.cache_root = os.environ.get(
         'ICIL_CACHE_ROOT',
-        os.path.join('output_data_playground_v3', '.rlbench_cache_dense'),
+        os.path.join('output_data_playground_v4', '.rlbench_cache_dense'),
     )
     cfg.data.tasks = ()
     cfg.data.exclude_tasks = ('put_item_in_drawer', 'lamp_on')

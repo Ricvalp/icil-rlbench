@@ -31,7 +31,10 @@ def get_config():
 
     cfg.conditioning = ConfigDict()
     cfg.conditioning.support_source = "cache"  # "cache" | "live"
-    cfg.conditioning.cache_root = ""  # empty => use checkpoint["config"]["data"]["cache_root"]
+    cfg.conditioning.cache_root = os.environ.get(
+        "ICIL_CACHE_ROOT",
+        "",
+    )  # empty => use checkpoint["config"]["data"]["cache_root"]
     cfg.conditioning.regenerate_demos_each_episode = False
     cfg.conditioning.use_rgb = True
     # Fallback for checkpoints that do not store mask-id usage in model config.
