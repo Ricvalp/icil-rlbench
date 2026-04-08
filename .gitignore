@@ -7,6 +7,8 @@ inspect_*
 legacy/
 eval_checkpoints/
 
+.smanager/
+
 TODO.md
 
 # Python cache and bytecode
