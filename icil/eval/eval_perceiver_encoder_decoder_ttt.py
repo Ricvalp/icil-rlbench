@@ -62,6 +62,32 @@ def _as_bool(v: Any) -> bool:
     return bool(v)
 
 
+def _maybe_init_wandb(cfg: ConfigDict, workdir: Path) -> Optional[Any]:
+    if not hasattr(cfg, 'wandb') or not _as_bool(cfg.wandb.enable):
+        return None
+    try:
+        import wandb
+    except ImportError as exc:
+        raise ImportError('cfg.wandb.enable=True but wandb is not installed.') from exc
+
+    tags = list(cfg.wandb.tags) if getattr(cfg.wandb, 'tags', None) else None
+    project = str(cfg.wandb.project)
+    entity = str(cfg.wandb.entity) if str(cfg.wandb.entity) else None
+    name = str(cfg.wandb.name) if str(cfg.wandb.name) else None
+    group = str(cfg.wandb.group) if str(cfg.wandb.group) else None
+    mode = str(cfg.wandb.mode) if str(cfg.wandb.mode) else None
+
+    return wandb.init(
+        project=project,
+        entity=entity,
+        name=name,
+        group=group,
+        mode=mode,
+        dir=str(workdir),
+        config=cfg.to_dict(),
+        tags=tags,
+    )
+
 
 def _set_seed(seed: int) -> None:
     random.seed(seed)
@@ -1301,6 +1327,69 @@ def _save_inner_loss_artifacts(
     }
 
 
+def _find_success_gif_path(result: Dict[str, Any]) -> Optional[Path]:
+    video_paths = result.get('video_paths', {}) or {}
+    if isinstance(video_paths, dict):
+        front_paths = video_paths.get('front', None)
+        if isinstance(front_paths, dict):
+            gif_path = front_paths.get('gif', '')
+            if gif_path:
+                return Path(str(gif_path))
+
+        for camera_paths in video_paths.values():
+            if isinstance(camera_paths, dict):
+                gif_path = camera_paths.get('gif', '')
+                if gif_path:
+                    return Path(str(gif_path))
+
+    legacy_path = str(result.get('video_path', '') or '')
+    if legacy_path.lower().endswith('.gif'):
+        return Path(legacy_path)
+    return None
+
+
+def _maybe_log_wandb_eval_summary(
+    wandb_run: Optional[Any],
+    *,
+    results: Sequence[Dict[str, Any]],
+    success_rate: float,
+    task_name: str,
+    variation: int,
+) -> None:
+    if wandb_run is None:
+        return
+    try:
+        import wandb
+    except ImportError as exc:
+        raise ImportError('wandb must be installed to log eval results.') from exc
+
+    log_dict: Dict[str, Any] = {
+        'eval/success_rate': float(success_rate),
+    }
+
+    success_result = next((result for result in results if bool(result.get('success', False))), None)
+    if success_result is not None:
+        gif_path = _find_success_gif_path(success_result)
+        if gif_path is None:
+            logging.warning(
+                'wandb logging requested, but no GIF was found for the first successful episode. '
+                'Keep cfg.video.enable=True and include "gif" in cfg.video.formats to log a successful rollout GIF.'
+            )
+        elif not gif_path.is_file():
+            logging.warning('Successful GIF path does not exist on disk: %s', gif_path)
+        else:
+            log_dict['eval/success_gif'] = wandb.Video(
+                str(gif_path),
+                format='gif',
+                caption=(
+                    f'task={task_name} variation={variation} episode={int(success_result["episode_index"])} '
+                    f'success_rate={float(success_rate):.3f}'
+                ),
+            )
+
+    wandb_run.log(log_dict)
+
+
 def _run_eval_episode(
     *,
     episode_index: int,
@@ -1503,6 +1592,10 @@ def evaluate(cfg: ConfigDict) -> None:
     run_dir = Path(str(cfg.output.root_dir)).expanduser().resolve() / run_name
     run_dir.mkdir(parents=True, exist_ok=True)
 
+    wandb_run = _maybe_init_wandb(cfg, run_dir)
+    if wandb_run is not None:
+        wandb_run.name = run_name
+
     resolved_payload = cfg.to_dict()
     resolved_payload['dataset']['K'] = int(dataset_cfg.K)
     resolved_payload['dataset']['L'] = int(dataset_cfg.L)
@@ -1519,8 +1612,12 @@ def evaluate(cfg: ConfigDict) -> None:
         'fast_param_count': int(fast_param_count),
         'support_source': support_source,
     }
-    with (run_dir / 'resolved_eval_config.json').open('w', encoding='utf-8') as f:
+    config_path = run_dir / 'resolved_eval_config.json'
+    with config_path.open('w', encoding='utf-8') as f:
         json.dump(resolved_payload, f, indent=2)
+    if wandb_run is not None:
+        wandb_run.config.update(resolved_payload, allow_val_change=True)
+        wandb_run.save(str(config_path), policy='now')
 
     logging.info('Loading task=%r variation=%d', task_name, variation)
     logging.info('Checkpoint=%s', checkpoint_path)
@@ -1711,8 +1808,18 @@ def evaluate(cfg: ConfigDict) -> None:
             },
             'results': results,
         }
-        with (run_dir / 'summary.json').open('w', encoding='utf-8') as f:
+        summary_path = run_dir / 'summary.json'
+        with summary_path.open('w', encoding='utf-8') as f:
             json.dump(summary, f, indent=2)
+        if wandb_run is not None:
+            wandb_run.save(str(summary_path), policy='now')
+            _maybe_log_wandb_eval_summary(
+                wandb_run,
+                results=results,
+                success_rate=success_rate,
+                task_name=task_name,
+                variation=variation,
+            )
         logging.info(
             'Evaluation complete | success=%d/%d (%.3f) | outputs=%s',
             n_success,
@@ -1721,6 +1828,8 @@ def evaluate(cfg: ConfigDict) -> None:
             run_dir,
         )
     finally:
+        if wandb_run is not None:
+            wandb_run.finish()
         if support_store is not None:
             support_store.close()
         if env is not None:

@@ -81,6 +81,15 @@ def get_config():
     cfg.video.formats = ('mp4', 'gif')  # subset of: mp4, gif
     cfg.video.format = 'mp4'  # mp4 | gif
 
+    cfg.wandb = ConfigDict()
+    cfg.wandb.enable = False
+    cfg.wandb.project = os.environ.get('WANDB_PROJECT', 'icil-perceiver-eval-ttt')
+    cfg.wandb.entity = os.environ.get('WANDB_ENTITY', 'ricvalp')
+    cfg.wandb.group = ''
+    cfg.wandb.name = ''
+    cfg.wandb.mode = os.environ.get('WANDB_MODE', 'online')
+    cfg.wandb.tags = ()
+
     cfg.output = ConfigDict()
     cfg.output.root_dir = os.environ.get(
         'ICIL_EVAL_OUTPUT_DIR',
