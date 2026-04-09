@@ -12,9 +12,9 @@ def get_config():
     cfg.checkpoint_path = ''
 
     cfg.task = ConfigDict()
-    cfg.task.name = 'open_drawer'
+    cfg.task.name = 'close_drawer'
     cfg.task.variation = 0
-    cfg.task.num_eval_episodes = 10
+    cfg.task.num_eval_episodes = 50
     cfg.task.max_env_steps = 220
 
     cfg.dataset = ConfigDict()
