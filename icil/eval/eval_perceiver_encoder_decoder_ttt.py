@@ -1042,14 +1042,19 @@ def _build_cached_ttt_package(
 ) -> Dict[str, Any]:
     vidx = _select_support_vidx(store, variation=variation, rng=rng)
     episode_ids = store.list_episode_ids(vidx)
-    if episode_ids.shape[0] < dataset_cfg.K:
+    log_query_loss = _as_bool(getattr(ttt_cfg, 'log_query_loss', False))
+    required_episodes = int(dataset_cfg.K) + (1 if log_query_loss else 0)
+    if episode_ids.shape[0] < required_episodes:
         raise RuntimeError(
-            f'Need at least K={dataset_cfg.K} cached support episodes, got {episode_ids.shape[0]} '
-            f'for task={store.keys[vidx].task} variation={store.keys[vidx].variation}.'
+            f'Need at least {required_episodes} cached episodes, got {episode_ids.shape[0]} '
+            f'for task={store.keys[vidx].task} variation={store.keys[vidx].variation}. '
+            f'TTT support K={dataset_cfg.K}, log_query_loss={log_query_loss}.'
         )
 
-    support_ids_np = rng.choice(episode_ids, size=dataset_cfg.K, replace=False)
-    support_ids = [int(eid) for eid in np.asarray(support_ids_np).tolist()]
+    chosen_ids_np = rng.choice(episode_ids, size=required_episodes, replace=False)
+    chosen_ids = [int(eid) for eid in np.asarray(chosen_ids_np).tolist()]
+    support_ids = chosen_ids[: int(dataset_cfg.K)]
+    query_episode_id = int(chosen_ids[int(dataset_cfg.K)]) if log_query_loss else None
     holdout_indices = _sample_loo_indices(
         len(support_ids),
         num_loo_per_task=int(ttt_cfg.num_loo_per_task),
@@ -1077,7 +1082,7 @@ def _build_cached_ttt_package(
     task_spec = MAMLTaskSpec(
         vidx=int(vidx),
         support_episode_ids=tuple(support_ids),
-        query_episode_id=int(support_ids[0]),
+        query_episode_id=int(query_episode_id) if query_episode_id is not None else int(support_ids[0]),
     )
 
     support_batches: List[Dict[str, Any]] = []
@@ -1135,15 +1140,54 @@ def _build_cached_ttt_package(
         'variation': int(store.keys[vidx].variation),
         'support_episodes': list(support_ids),
         'rollout_context_episodes': list(rollout_support_ids),
+        'query_episode': int(query_episode_id) if query_episode_id is not None else None,
         'holdout_indices': list(holdout_indices),
     }
+
+    query_batch = None
+    if log_query_loss:
+        query_noise = shared_noise
+        query_timesteps = shared_timesteps
+        if query_noise is None:
+            query_noise = torch.randn(
+                (1, int(dataset_cfg.H), int(action_dim)),
+                device=device,
+                dtype=torch.float32,
+                generator=torch_generator,
+            )
+        if query_timesteps is None:
+            query_timesteps = torch.randint(
+                low=0,
+                high=int(num_train_timesteps),
+                size=(1,),
+                device=device,
+                dtype=torch.long,
+                generator=torch_generator,
+            )
+        query_task = MAMLTaskSpec(
+            vidx=int(vidx),
+            support_episode_ids=tuple(rollout_support_ids),
+            query_episode_id=int(query_episode_id),
+        )
+        query_batch = task_builder.build_query_batch(
+            query_task,
+            rng=rng,
+            noise=query_noise,
+            timesteps=query_timesteps,
+            load_rgb=use_rgb,
+            load_mask_id=use_mask_id,
+        )
+        query_batch = _to_device_batch(query_batch, device)
+        query_batch = _drop_mask_ids_if_disabled(query_batch, use_mask_id)
 
     return {
         'vidx': int(vidx),
         'support_ids': list(support_ids),
         'rollout_support_ids': list(rollout_support_ids),
+        'query_episode_id': int(query_episode_id) if query_episode_id is not None else None,
         'holdout_indices': list(holdout_indices),
         'support_batches': support_batches,
+        'query_batch': query_batch,
         'support_cond': rollout_support,
         'meta': rollout_support['meta'],
     }
@@ -1157,14 +1201,26 @@ def _adapt_fast_params_with_stats(
     fast_names_wrapped: Sequence[str],
     inner_lr: float,
     max_grad_norm: float,
+    query_batch: Optional[Dict[str, Any]] = None,
     progress_desc: str = 'TTT Inner',
 ) -> Tuple[Dict[str, torch.Tensor], Dict[str, Any]]:
     adapted_params = dict(loss_wrapper.named_parameters())
     buffers = dict(loss_wrapper.named_buffers())
     inner_losses: List[float] = []
     inner_grad_norms: List[float] = []
+    query_losses: List[float] = []
     unused_fast_param_names: List[str] = []
     logged_unused_warning = False
+
+    def _eval_query_loss(params: Dict[str, torch.Tensor]) -> float:
+        if query_batch is None:
+            return 0.0
+        with torch.no_grad():
+            loss = functional_call(loss_wrapper, (params, buffers), (query_batch,))
+        return float(loss.detach().cpu().item())
+
+    if query_batch is not None:
+        query_losses.append(_eval_query_loss(adapted_params))
 
     pbar = None
     if len(support_batches) > 0:
@@ -1210,6 +1266,8 @@ def _adapt_fast_params_with_stats(
                     continue
                 new_params[name] = param - float(inner_lr) * grad
             adapted_params = new_params
+            if query_batch is not None:
+                query_losses.append(_eval_query_loss(adapted_params))
 
             if pbar is not None:
                 pbar.update(1)
@@ -1228,6 +1286,8 @@ def _adapt_fast_params_with_stats(
         'avg_inner_grad_norm': float(sum(inner_grad_norms) / max(1, len(inner_grad_norms)))
         if inner_grad_norms
         else 0.0,
+        'query_losses': query_losses,
+        'avg_query_loss': float(sum(query_losses) / max(1, len(query_losses))) if query_losses else 0.0,
         'unused_fast_params': unused_fast_param_names,
     }
     return adapted_params, stats
@@ -1253,6 +1313,7 @@ def _apply_ttt_adaptation_in_place(
         adapted_params, stats = _adapt_fast_params_with_stats(
             loss_wrapper,
             support_batches=support_package['support_batches'],
+            query_batch=support_package.get('query_batch', None),
             fast_names_wrapped=_prefix_param_names(fast_names),
             inner_lr=float(ttt_cfg.inner_lr),
             max_grad_norm=float(ttt_cfg.max_grad_norm),
@@ -1272,6 +1333,7 @@ def _apply_ttt_adaptation_in_place(
         {
             'support_ids': list(support_package['support_ids']),
             'rollout_support_ids': list(support_package['rollout_support_ids']),
+            'query_episode_id': support_package.get('query_episode_id', None),
             'holdout_indices': list(support_package['holdout_indices']),
         }
     )
@@ -1281,21 +1343,25 @@ def _apply_ttt_adaptation_in_place(
 def _save_inner_loss_artifacts(
     *,
     inner_losses: Sequence[float],
+    query_losses: Optional[Sequence[float]] = None,
     run_dir: Path,
     stem: str,
 ) -> Dict[str, str]:
     run_dir.mkdir(parents=True, exist_ok=True)
 
     losses_path = run_dir / f'{stem}.inner_losses.json'
+    payload: Dict[str, Any] = {
+        'inner_step': list(range(1, len(inner_losses) + 1)),
+        'support_loss': [float(v) for v in inner_losses],
+        # Backward-compatible alias for the original support-loss-only artifact.
+        'loss': [float(v) for v in inner_losses],
+    }
+    if query_losses is not None and len(query_losses) > 0:
+        payload['query_inner_step'] = list(range(0, len(query_losses)))
+        payload['query_loss'] = [float(v) for v in query_losses]
+
     with losses_path.open('w', encoding='utf-8') as f:
-        json.dump(
-            {
-                'inner_step': list(range(1, len(inner_losses) + 1)),
-                'loss': [float(v) for v in inner_losses],
-            },
-            f,
-            indent=2,
-        )
+        json.dump(payload, f, indent=2)
 
     plot_path = run_dir / f'{stem}.inner_losses.png'
     try:
@@ -1303,17 +1369,33 @@ def _save_inner_loss_artifacts(
 
         xs = np.arange(1, len(inner_losses) + 1, dtype=np.int64)
         ys = np.asarray(inner_losses, dtype=np.float64)
+        has_query = query_losses is not None and len(query_losses) > 0
+        if has_query:
+            xs_query = np.arange(0, len(query_losses), dtype=np.int64)
+            ys_query = np.asarray(query_losses, dtype=np.float64)
+        else:
+            xs_query = np.zeros((0,), dtype=np.int64)
+            ys_query = np.zeros((0,), dtype=np.float64)
 
         fig, ax = plt.subplots(figsize=(6.0, 4.0))
-        ax.plot(xs, ys, marker='o', linewidth=1.5)
+        if len(xs) > 0:
+            ax.plot(xs, ys, marker='o', linewidth=1.5, label='support LOO')
+        if has_query:
+            ax.plot(xs_query, ys_query, marker='s', linewidth=1.5, label='held-out query')
         ax.set_xlabel('Inner Step')
         ax.set_ylabel('Diffusion Loss')
         ax.set_yscale('log')
         ax.set_title('TTT Inner-Loop Loss')
         ax.grid(True, which='both', alpha=0.3)
-        max_xticks = min(8, len(xs))
-        xticks = np.unique(np.linspace(1, len(xs), num=max_xticks, dtype=np.int64))
-        ax.set_xticks(xticks.tolist())
+        max_x = int(max(len(inner_losses), len(query_losses) - 1 if has_query else 0))
+        if max_x > 0:
+            max_xticks = min(8, max_x + 1)
+            xticks = np.unique(np.linspace(0, max_x, num=max_xticks, dtype=np.int64))
+            ax.set_xticks(xticks.tolist())
+        elif has_query or len(xs) > 0:
+            ax.set_xticks([0])
+        if len(xs) > 0 or has_query:
+            ax.legend()
         fig.tight_layout()
         fig.savefig(plot_path, dpi=160)
         plt.close(fig)
@@ -1638,13 +1720,14 @@ def evaluate(cfg: ConfigDict) -> None:
     )
     logging.info(
         'TTT cfg: inner_steps=%d | inner_lr=%.3e | max_grad_norm=%.3f | outer_context_size=%d | '
-        'num_loo_per_task=%d | reuse_diffusion_noise=%s',
+        'num_loo_per_task=%d | reuse_diffusion_noise=%s | log_query_loss=%s',
         int(cfg.ttt.inner_steps),
         float(cfg.ttt.inner_lr),
         float(cfg.ttt.max_grad_norm),
         int(resolved_outer_context_size),
         int(cfg.ttt.num_loo_per_task),
         str(_as_bool(cfg.ttt.reuse_diffusion_noise)),
+        str(_as_bool(getattr(cfg.ttt, 'log_query_loss', False))),
     )
     logging.info(
         'TTT fast params: tensors=%d | params=%s | examples=%s',
@@ -1722,6 +1805,7 @@ def evaluate(cfg: ConfigDict) -> None:
                             'num_loo_per_task': int(cfg.ttt.num_loo_per_task),
                             'outer_context_size': int(resolved_outer_context_size),
                             'reuse_diffusion_noise': _as_bool(cfg.ttt.reuse_diffusion_noise),
+                            'log_query_loss': _as_bool(getattr(cfg.ttt, 'log_query_loss', False)),
                         }
                     ),
                 )
@@ -1736,21 +1820,37 @@ def evaluate(cfg: ConfigDict) -> None:
                 current_ttt_stats.update(
                     _save_inner_loss_artifacts(
                         inner_losses=current_ttt_stats.get('inner_losses', []),
+                        query_losses=current_ttt_stats.get('query_losses', None),
                         run_dir=run_dir,
                         stem=f'ttt_episode_{ep:04d}',
                     )
                 )
                 model.eval()
-                logging.info(
-                    'TTT adaptation ready for episode %d | support_episodes=%s | rollout_context=%s | '
-                    'holdout_indices=%s | avg_inner_loss=%.6f | avg_inner_grad_norm=%.6f',
-                    ep,
-                    current_ttt_stats['support_ids'],
-                    current_ttt_stats['rollout_support_ids'],
-                    current_ttt_stats['holdout_indices'],
-                    float(current_ttt_stats['avg_inner_loss']),
-                    float(current_ttt_stats['avg_inner_grad_norm']),
-                )
+                if current_ttt_stats.get('query_losses', None):
+                    logging.info(
+                        'TTT adaptation ready for episode %d | support_episodes=%s | rollout_context=%s | '
+                        'query_episode=%s | holdout_indices=%s | avg_inner_loss=%.6f | '
+                        'avg_query_loss=%.6f | avg_inner_grad_norm=%.6f',
+                        ep,
+                        current_ttt_stats['support_ids'],
+                        current_ttt_stats['rollout_support_ids'],
+                        current_ttt_stats.get('query_episode_id', None),
+                        current_ttt_stats['holdout_indices'],
+                        float(current_ttt_stats['avg_inner_loss']),
+                        float(current_ttt_stats['avg_query_loss']),
+                        float(current_ttt_stats['avg_inner_grad_norm']),
+                    )
+                else:
+                    logging.info(
+                        'TTT adaptation ready for episode %d | support_episodes=%s | rollout_context=%s | '
+                        'holdout_indices=%s | avg_inner_loss=%.6f | avg_inner_grad_norm=%.6f',
+                        ep,
+                        current_ttt_stats['support_ids'],
+                        current_ttt_stats['rollout_support_ids'],
+                        current_ttt_stats['holdout_indices'],
+                        float(current_ttt_stats['avg_inner_loss']),
+                        float(current_ttt_stats['avg_inner_grad_norm']),
+                    )
 
             res = _run_eval_episode(
                 episode_index=ep,
@@ -1809,6 +1909,7 @@ def evaluate(cfg: ConfigDict) -> None:
                 'max_grad_norm': float(cfg.ttt.max_grad_norm),
                 'num_loo_per_task': int(cfg.ttt.num_loo_per_task),
                 'reuse_diffusion_noise': _as_bool(cfg.ttt.reuse_diffusion_noise),
+                'log_query_loss': _as_bool(getattr(cfg.ttt, 'log_query_loss', False)),
             },
             'results': results,
         }
