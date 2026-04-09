@@ -33,7 +33,13 @@ def normalize_task_list(values: Any) -> List[str]:
         return []
     if isinstance(values, str):
         values = [values]
-    return [str(value) for value in values if str(value).strip()]
+    out: List[str] = []
+    for value in values:
+        for part in str(value).split(','):
+            task = part.strip()
+            if task:
+                out.append(task)
+    return out
 
 
 
@@ -57,6 +63,9 @@ def resolve_selected_tasks(
     exclude_set = set(exclude_tasks)
     if exclude_set:
         selected_tasks = [task for task in selected_tasks if task not in exclude_set]
+    leaked = sorted(exclude_set.intersection(selected_tasks))
+    if leaked:
+        raise RuntimeError(f'Excluded tasks leaked into the training selection: {leaked}')
     return selected_tasks
 
 
