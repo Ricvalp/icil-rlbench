@@ -19,7 +19,7 @@ def get_config():
 
     cfg.dataset = ConfigDict()
     cfg.dataset.use_checkpoint_dataset_config = True
-    cfg.dataset.K = 0  # 0 => infer as K_pretrain + 1 from checkpoint['config']['dataset']['K']
+    cfg.dataset.K = 0  # 0 => infer from checkpoint['config']['dataset']['K'] used during MAML training
     cfg.dataset.L = 16
     cfg.dataset.T_obs = 2
     cfg.dataset.H = 16
@@ -27,7 +27,7 @@ def get_config():
     cfg.dataset.query_stride_mode = 'consecutive'  # 'dataset' | 'consecutive'
 
     cfg.conditioning = ConfigDict()
-    cfg.conditioning.support_source = 'cache'  # TTT currently supports cached support only.
+    cfg.conditioning.support_source = 'cache'  # MAML eval currently supports cached support only.
     cfg.conditioning.cache_root = os.environ.get(
         'ICIL_CACHE_ROOT',
         '',
@@ -37,27 +37,10 @@ def get_config():
     cfg.conditioning.use_mask_id = False  # fallback only if checkpoint model config does not specify it
     cfg.conditioning.num_points = 1024
 
-    cfg.ttt = ConfigDict()
-    cfg.ttt.inner_steps = 100
-    cfg.ttt.inner_lr = 3e-4
-    cfg.ttt.max_grad_norm = 1.0
-    cfg.ttt.last_frac_fast = 0.25
-    cfg.ttt.include_decoder_mlp_fast = True
-    cfg.ttt.include_ada_fast = True
-    cfg.ttt.include_final_norm_fast = True
-    cfg.ttt.include_decoder_self_attention_fast = True # False
-    cfg.ttt.include_decoder_cross_attention_fast = False
-    cfg.ttt.include_encoder_fast = False
-    cfg.ttt.include_input_projections_fast = False
-    cfg.ttt.include_output_head_fast = False
-    cfg.ttt.include_diffusion_conditioning_fast = False
-    cfg.ttt.num_loo_per_task = 2
-    cfg.ttt.num_support_batches_loo = 0  # 0 => build inner_steps support batches, else reuse min(this, inner_steps).
-    cfg.ttt.outer_context_size = 0  # 0 => infer as K_pretrain from checkpoint['config']['dataset']['K']
-    cfg.ttt.reuse_diffusion_noise = False
-    cfg.ttt.preload_support_batches_to_device = False
-    cfg.ttt.log_query_loss = True  # If True, evaluate loss on one extra episode not used for TTT updates.
-    cfg.ttt.num_tries_per_item = 100
+    cfg.maml_eval = ConfigDict()
+    cfg.maml_eval.preload_support_batches_to_device = False
+    cfg.maml_eval.log_query_loss = False  # If True, evaluate loss on one extra episode not used for MAML adaptation.
+    cfg.maml_eval.num_tries_per_item = 100
 
     cfg.sim = ConfigDict()
     cfg.sim.headless = True
@@ -86,7 +69,7 @@ def get_config():
 
     cfg.wandb = ConfigDict()
     cfg.wandb.enable = False
-    cfg.wandb.project = os.environ.get('WANDB_PROJECT', 'icil-perceiver-eval-ttt')
+    cfg.wandb.project = os.environ.get('WANDB_PROJECT', 'icil-perceiver-eval-maml')
     cfg.wandb.entity = os.environ.get('WANDB_ENTITY', 'ricvalp')
     cfg.wandb.group = ''
     cfg.wandb.name = ''
@@ -99,7 +82,7 @@ def get_config():
         os.path.join(
             'output',
             '.experiments',
-            'perceiver_encoder_decoder_eval_ttt',
+            'perceiver_encoder_decoder_eval_maml',
         ),
     )
 

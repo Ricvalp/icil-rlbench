@@ -35,11 +35,18 @@ from icil.models import (
     PolicyConfig,
     build_policy,
 )
-from icil.models.maml import MAMLTaskBuilder, MAMLTaskSpec, PolicyLossWrapper, copy_fast_params_into_policy
+from icil.models.maml import (
+    MAMLConfig,
+    MAMLTaskBuilder,
+    MAMLTaskSpec,
+    PolicyLossWrapper,
+    copy_fast_params_into_policy,
+    get_fast_param_names,
+)
 
 _CONFIG = config_flags.DEFINE_config_file(
     'config',
-    default='configs/eval_perceiver_encoder_decoder_ttt.py',
+    default='configs/eval_perceiver_encoder_decoder_maml.py',
     help_string='Path to ml_collections config file.',
 )
 
@@ -249,30 +256,39 @@ def _resolve_data_k(cfg: ConfigDict, ckpt: Dict[str, Any]) -> int:
     if isinstance(ckpt.get('config', None), dict):
         ckpt_dataset = ckpt['config'].get('dataset', {}) or {}
     if isinstance(ckpt_dataset, dict) and int(ckpt_dataset.get('K', 0)) > 0:
-        return int(ckpt_dataset['K']) + 1
+        return int(ckpt_dataset['K'])
     raise ValueError(
-        'cfg.dataset.K=0 requires checkpoint["config"]["dataset"]["K"] > 0 so TTT can use K_pretrain + 1.'
+        'cfg.dataset.K=0 requires checkpoint["config"]["dataset"]["K"] > 0 so MAML eval can reuse the '
+        'training support count.'
     )
 
 
+def _resolve_maml_cfg_from_checkpoint(ckpt: Dict[str, Any], *, data_k: int) -> MAMLConfig:
+    ckpt_config = ckpt.get('config', None)
+    if not isinstance(ckpt_config, dict):
+        raise ValueError('MAML eval requires checkpoint["config"] to be present.')
 
-def _resolve_outer_context_size(cfg: ConfigDict, *, data_k: int, ckpt: Dict[str, Any]) -> int:
-    configured = int(cfg.ttt.outer_context_size)
-    if configured > 0:
-        resolved = configured
-    else:
-        resolved = 0
-        if isinstance(ckpt.get('config', None), dict):
-            dataset_cfg = ckpt['config'].get('dataset', {}) or {}
-            if isinstance(dataset_cfg, dict) and int(dataset_cfg.get('K', 0)) > 0:
-                resolved = int(dataset_cfg['K'])
-        if resolved <= 0:
-            resolved = int(data_k)
-    if resolved <= 0:
-        raise ValueError('Resolved outer_context_size must be positive.')
-    if resolved > data_k:
-        raise ValueError(f'outer_context_size={resolved} exceeds data.K={data_k}.')
-    return resolved
+    maml_src = ckpt_config.get('maml', {}) or {}
+    if not isinstance(maml_src, dict) or not maml_src:
+        raise ValueError('MAML eval requires checkpoint["config"]["maml"] to be present.')
+
+    maml_cfg = _dataclass_from_dict(MAMLConfig(), maml_src)
+    resolved_outer_context_size = int(getattr(maml_cfg, 'outer_context_size', 0))
+    if resolved_outer_context_size <= 0:
+        resolved_payload = ckpt_config.get('resolved', {}) or {}
+        if isinstance(resolved_payload, dict) and int(resolved_payload.get('outer_context_size', 0)) > 0:
+            resolved_outer_context_size = int(resolved_payload['outer_context_size'])
+        elif int(data_k) > 0:
+            resolved_outer_context_size = int(data_k)
+
+    if resolved_outer_context_size <= 0:
+        raise ValueError('Resolved MAML outer_context_size must be positive.')
+    if resolved_outer_context_size > int(data_k):
+        raise ValueError(
+            f'MAML outer_context_size={resolved_outer_context_size} exceeds eval data.K={int(data_k)}.'
+        )
+    maml_cfg.outer_context_size = int(resolved_outer_context_size)
+    return maml_cfg
 
 
 
@@ -311,7 +327,7 @@ def _support_source_from_eval(cfg: ConfigDict) -> str:
     source = str(getattr(cfg.conditioning, 'support_source', 'cache')).lower()
     if source != 'cache':
         raise ValueError(
-            'TTT eval currently supports cfg.conditioning.support_source="cache" only, '
+            'MAML eval currently supports cfg.conditioning.support_source="cache" only, '
             'because inner-loop diffusion supervision requires cached action trajectories.'
         )
     return source
@@ -727,66 +743,36 @@ def _build_rlbench_env(cfg: ConfigDict, task_name: str):
 
 
 
-def _denoiser_ada_prefixes(block_idx: int) -> List[str]:
-    return [
-        f'denoiser.{block_idx}.adaln1.to_scale_shift.',
-        f'denoiser.{block_idx}.adaln2.to_scale_shift.',
-        f'denoiser.{block_idx}.adaln3.to_scale_shift.',
-        f'denoiser.{block_idx}.adaln_q.to_scale_shift.',
-        f'denoiser.{block_idx}.adaln_s.to_scale_shift.',
-    ]
+def _resolve_maml_fast_param_names(
+    model: Policy,
+    ckpt: Dict[str, Any],
+    maml_cfg: MAMLConfig,
+) -> List[str]:
+    ckpt_config = ckpt.get('config', None)
+    resolved_payload = ckpt_config.get('resolved', {}) if isinstance(ckpt_config, dict) else {}
+    model_param_names = {name for name, _ in model.named_parameters()}
 
+    if isinstance(resolved_payload, dict):
+        fast_names = resolved_payload.get('fast_param_names', None)
+        if isinstance(fast_names, list) and fast_names:
+            fast_names = [str(name) for name in fast_names]
+            missing = [name for name in fast_names if name not in model_param_names]
+            if missing:
+                raise ValueError(
+                    'Checkpoint-resolved fast_param_names do not match the loaded model. '
+                    f'Examples: {missing[:8]}'
+                )
+            return fast_names
 
-
-def _select_ttt_fast_param_names(model: Policy, ttt_cfg: ConfigDict) -> List[str]:
-    if not hasattr(model, 'denoiser'):
-        raise AttributeError('Policy has no attribute denoiser.')
-
-    prefixes: List[str] = []
-    n_blocks = len(model.denoiser)
-    if n_blocks <= 0:
-        raise ValueError('Policy denoiser is empty.')
-
-    last_frac = float(ttt_cfg.last_frac_fast)
-    if last_frac <= 0.0:
-        num_blocks = 1
-    else:
-        num_blocks = max(1, int(round(float(n_blocks) * last_frac)))
-        num_blocks = min(num_blocks, n_blocks)
-    start_idx = n_blocks - num_blocks
-
-    for block_idx in range(start_idx, n_blocks):
-        if _as_bool(ttt_cfg.include_decoder_mlp_fast):
-            prefixes.append(f'denoiser.{block_idx}.mlp.')
-        if _as_bool(ttt_cfg.include_ada_fast):
-            prefixes.extend(_denoiser_ada_prefixes(block_idx))
-        if _as_bool(ttt_cfg.include_decoder_self_attention_fast):
-            prefixes.append(f'denoiser.{block_idx}.self_attn.')
-        if _as_bool(ttt_cfg.include_decoder_cross_attention_fast):
-            prefixes.append(f'denoiser.{block_idx}.cross_attn.')
-            prefixes.append(f'denoiser.{block_idx}.cross_attn_q.')
-            prefixes.append(f'denoiser.{block_idx}.cross_attn_s.')
-
-    if _as_bool(ttt_cfg.include_encoder_fast):
-        prefixes.append('context_encoder.')
-    if _as_bool(ttt_cfg.include_input_projections_fast):
-        prefixes.append('action_in.')
-    if _as_bool(ttt_cfg.include_output_head_fast):
-        prefixes.append('action_out.')
-    if _as_bool(ttt_cfg.include_diffusion_conditioning_fast):
-        prefixes.append('t_mlp.')
-
-    if _as_bool(ttt_cfg.include_final_norm_fast):
-        logging.info('cfg.ttt.include_final_norm_fast=True, but current Policy has no final norm block; ignoring.')
-
-    if not prefixes:
-        raise ValueError('No TTT fast-parameter groups were enabled in cfg.ttt.')
-
-    param_names = [name for name, _ in model.named_parameters()]
-    selected = sorted({name for name in param_names if any(name.startswith(prefix) for prefix in prefixes)})
-    if not selected:
-        raise RuntimeError('No parameters matched the requested TTT fast-parameter selection.')
-    return selected
+    logging.warning(
+        'Checkpoint has no resolved fast_param_names; recomputing from checkpoint maml config.'
+    )
+    return get_fast_param_names(
+        model,
+        last_frac=float(maml_cfg.last_frac_fast),
+        include_ada=bool(maml_cfg.include_ada_fast),
+        include_final_norm=bool(maml_cfg.include_final_norm_fast),
+    )
 
 
 
@@ -812,17 +798,10 @@ def _sample_balanced_indices(total: int, *, count: int, rng: np.random.Generator
 
 
 def _sample_loo_indices(K: int, *, num_loo_per_task: int, rng: np.random.Generator) -> List[int]:
-    return _sample_balanced_indices(K, count=num_loo_per_task, rng=rng)
-
-
-def _resolve_num_support_batches_loo(ttt_cfg: ConfigDict) -> int:
-    inner_steps = int(getattr(ttt_cfg, 'inner_steps', 0))
-    configured = int(getattr(ttt_cfg, 'num_support_batches_loo', 0))
-    if inner_steps <= 0:
-        return 0
-    if configured <= 0:
-        return inner_steps
-    return min(configured, inner_steps)
+    if num_loo_per_task >= K:
+        return list(range(K))
+    perm = rng.permutation(K)
+    return [int(idx) for idx in perm[:num_loo_per_task].tolist()]
 
 
 
@@ -1035,7 +1014,7 @@ def _unsqueeze_support_batch_dim(support: Dict[str, Any]) -> Dict[str, Any]:
 
 
 
-def _build_cached_ttt_package(
+def _build_cached_maml_package(
     *,
     store: VariationStore,
     task_builder: MAMLTaskBuilder,
@@ -1048,17 +1027,17 @@ def _build_cached_ttt_package(
     action_dim: int,
     use_rgb: bool,
     use_mask_id: bool,
-    ttt_cfg: ConfigDict,
+    adapt_cfg: ConfigDict,
 ) -> Dict[str, Any]:
     vidx = _select_support_vidx(store, variation=variation, rng=rng)
     episode_ids = store.list_episode_ids(vidx)
-    log_query_loss = _as_bool(getattr(ttt_cfg, 'log_query_loss', False))
+    log_query_loss = _as_bool(getattr(adapt_cfg, 'log_query_loss', False))
     required_episodes = int(dataset_cfg.K) + (1 if log_query_loss else 0)
     if episode_ids.shape[0] < required_episodes:
         raise RuntimeError(
             f'Need at least {required_episodes} cached episodes, got {episode_ids.shape[0]} '
             f'for task={store.keys[vidx].task} variation={store.keys[vidx].variation}. '
-            f'TTT support K={dataset_cfg.K}, log_query_loss={log_query_loss}.'
+            f'MAML eval support K={dataset_cfg.K}, log_query_loss={log_query_loss}.'
         )
 
     chosen_ids_np = rng.choice(episode_ids, size=required_episodes, replace=False)
@@ -1067,11 +1046,10 @@ def _build_cached_ttt_package(
     query_episode_id = int(chosen_ids[int(dataset_cfg.K)]) if log_query_loss else None
     holdout_indices = _sample_loo_indices(
         len(support_ids),
-        num_loo_per_task=int(ttt_cfg.num_loo_per_task),
+        num_loo_per_task=int(adapt_cfg.num_loo_per_task),
         rng=rng,
     )
-    preload_support_batches = _as_bool(getattr(ttt_cfg, 'preload_support_batches_to_device', False))
-    num_support_batches = _resolve_num_support_batches_loo(ttt_cfg)
+    preload_support_batches = _as_bool(getattr(adapt_cfg, 'preload_support_batches_to_device', False))
     support_batch_device = device if preload_support_batches else torch.device('cpu')
     support_batch_generator = torch_generator
     if support_batch_device.type == 'cpu' and torch_generator is not None:
@@ -1080,7 +1058,7 @@ def _build_cached_ttt_package(
 
     shared_noise = None
     shared_timesteps = None
-    if _as_bool(ttt_cfg.reuse_diffusion_noise):
+    if _as_bool(adapt_cfg.reuse_diffusion_noise):
         shared_noise = torch.randn(
             (1, int(dataset_cfg.H), int(action_dim)),
             device=support_batch_device,
@@ -1104,22 +1082,22 @@ def _build_cached_ttt_package(
 
     support_batches: List[Dict[str, Any]] = []
     prepare_pbar = None
-    if num_support_batches > 0:
+    if int(adapt_cfg.inner_steps) > 0:
         prepare_pbar = tqdm(
-            total=num_support_batches,
-            desc='TTT Prepare',
+            total=int(adapt_cfg.inner_steps),
+            desc='MAML Prepare',
             leave=True,
             unit='step',
         )
     try:
-        for batch_idx in range(num_support_batches):
+        for step_idx in range(int(adapt_cfg.inner_steps)):
             support_batch = _build_support_batch_loo(
                 task_builder,
                 task_spec,
                 holdout_indices=holdout_indices,
                 rng=rng,
-                noise=shared_noise if _as_bool(ttt_cfg.reuse_diffusion_noise) else None,
-                timesteps=shared_timesteps if _as_bool(ttt_cfg.reuse_diffusion_noise) else None,
+                noise=shared_noise if _as_bool(adapt_cfg.reuse_diffusion_noise) else None,
+                timesteps=shared_timesteps if _as_bool(adapt_cfg.reuse_diffusion_noise) else None,
                 load_rgb=use_rgb,
                 load_mask_id=use_mask_id,
             )
@@ -1129,13 +1107,13 @@ def _build_cached_ttt_package(
             support_batches.append(support_batch)
             if prepare_pbar is not None:
                 prepare_pbar.update(1)
-                prepare_pbar.set_postfix(batch=batch_idx + 1)
+                prepare_pbar.set_postfix(step=step_idx + 1)
     finally:
         if prepare_pbar is not None:
             prepare_pbar.close()
 
     rollout_support_ids = list(support_ids)
-    outer_context_size = int(ttt_cfg.outer_context_size)
+    outer_context_size = int(adapt_cfg.outer_context_size)
     if outer_context_size > 0 and outer_context_size < len(rollout_support_ids):
         keep = np.sort(rng.choice(len(rollout_support_ids), size=outer_context_size, replace=False))
         rollout_support_ids = [rollout_support_ids[int(idx)] for idx in keep.tolist()]
@@ -1206,7 +1184,6 @@ def _build_cached_ttt_package(
         'query_episode_id': int(query_episode_id) if query_episode_id is not None else None,
         'holdout_indices': list(holdout_indices),
         'support_batches': support_batches,
-        'num_support_batches': int(num_support_batches),
         'query_batch': query_batch,
         'support_cond': rollout_support,
         'meta': rollout_support['meta'],
@@ -1220,11 +1197,10 @@ def _adapt_fast_params_with_stats(
     support_batches: Sequence[Dict[str, Any]],
     fast_names_wrapped: Sequence[str],
     device: torch.device,
-    inner_steps: int,
     inner_lr: float,
     max_grad_norm: float,
     query_batch: Optional[Dict[str, Any]] = None,
-    progress_desc: str = 'TTT Inner',
+    progress_desc: str = 'MAML Inner',
 ) -> Tuple[Dict[str, torch.Tensor], Dict[str, Any]]:
     adapted_params = dict(loss_wrapper.named_parameters())
     buffers = dict(loss_wrapper.named_buffers())
@@ -1245,19 +1221,17 @@ def _adapt_fast_params_with_stats(
         query_losses.append(_eval_query_loss(adapted_params))
 
     pbar = None
-    if inner_steps > 0:
+    if len(support_batches) > 0:
         pbar = tqdm(
-            total=inner_steps,
+            total=len(support_batches),
             desc=progress_desc,
             leave=True,
             unit='step',
         )
 
     try:
-        if inner_steps > 0 and len(support_batches) < 1:
-            raise ValueError('inner_steps > 0 requires at least one prepared support batch.')
-        for step_idx in range(1, inner_steps + 1):
-            support_batch_cpu = support_batches[(step_idx - 1) % len(support_batches)]
+        iterator = enumerate(support_batches, start=1)
+        for step_idx, support_batch_cpu in iterator:
             support_batch = _to_device_batch(support_batch_cpu, device)
             support_loss = functional_call(loss_wrapper, (adapted_params, buffers), (support_batch,))
             fast_tensors = [adapted_params[name] for name in fast_names_wrapped]
@@ -1274,7 +1248,7 @@ def _adapt_fast_params_with_stats(
                 ]
                 if unused_fast_param_names:
                     logging.warning(
-                        'TTT selected %d fast params that were unused in the inner-loop forward. '
+                        'MAML eval selected %d fast params that were unused in the inner-loop forward. '
                         'They will be left unchanged. Examples: %s',
                         len(unused_fast_param_names),
                         unused_fast_param_names[:8],
@@ -1319,14 +1293,14 @@ def _adapt_fast_params_with_stats(
 
 
 
-def _apply_ttt_adaptation_in_place(
+def _apply_maml_adaptation_in_place(
     *,
     policy: Policy,
     base_state_dict: Dict[str, torch.Tensor],
     support_package: Dict[str, Any],
     fast_names: Sequence[str],
     device: torch.device,
-    ttt_cfg: ConfigDict,
+    maml_cfg: MAMLConfig,
 ) -> Dict[str, Any]:
     policy.load_state_dict(base_state_dict, strict=True)
     policy.to(device)
@@ -1341,10 +1315,9 @@ def _apply_ttt_adaptation_in_place(
             query_batch=support_package.get('query_batch', None),
             fast_names_wrapped=_prefix_param_names(fast_names),
             device=device,
-            inner_steps=int(ttt_cfg.inner_steps),
-            inner_lr=float(ttt_cfg.inner_lr),
-            max_grad_norm=float(ttt_cfg.max_grad_norm),
-            progress_desc='TTT Inner GD',
+            inner_lr=float(maml_cfg.inner_lr),
+            max_grad_norm=float(maml_cfg.max_grad_norm),
+            progress_desc='MAML Inner GD',
         )
     copy_fast_params_into_policy(
         policy,
@@ -1362,7 +1335,6 @@ def _apply_ttt_adaptation_in_place(
             'rollout_support_ids': list(support_package['rollout_support_ids']),
             'query_episode_id': support_package.get('query_episode_id', None),
             'holdout_indices': list(support_package['holdout_indices']),
-            'num_support_batches': int(support_package.get('num_support_batches', len(support_package['support_batches']))),
         }
     )
     return stats
@@ -1413,7 +1385,7 @@ def _save_inner_loss_artifacts(
         ax.set_xlabel('Inner Step')
         ax.set_ylabel('Diffusion Loss')
         ax.set_yscale('log')
-        ax.set_title('TTT Inner-Loop Loss')
+        ax.set_title('MAML Eval Inner-Loop Loss')
         ax.grid(True, which='both', alpha=0.3)
         max_x = int(max(len(inner_losses), len(query_losses) - 1 if has_query else 0))
         if max_x > 0:
@@ -1428,7 +1400,7 @@ def _save_inner_loss_artifacts(
         fig.savefig(plot_path, dpi=160)
         plt.close(fig)
     except Exception as exc:  # pragma: no cover - optional plotting dependency/runtime
-        logging.warning('Failed to save TTT inner-loss plot to %s: %s', plot_path, exc)
+        logging.warning('Failed to save MAML inner-loss plot to %s: %s', plot_path, exc)
         plot_path = None
 
     return {
@@ -1669,7 +1641,7 @@ def evaluate(cfg: ConfigDict) -> None:
     ckpt, state_dict = _load_checkpoint(checkpoint_path)
     model_cfg = _model_config_from_checkpoint_or_default(ckpt)
     dataset_cfg = _dataset_config_from_eval_and_checkpoint(cfg, ckpt)
-    resolved_outer_context_size = _resolve_outer_context_size(cfg, data_k=int(dataset_cfg.K), ckpt=ckpt)
+    maml_cfg = _resolve_maml_cfg_from_checkpoint(ckpt, data_k=int(dataset_cfg.K))
     use_mask_id = _conditioning_use_mask_id_from_eval_and_checkpoint(cfg, model_cfg)
     ignore_demos = _ignore_demos_from_model_cfg(model_cfg)
     query_stride_mode = _query_stride_mode_from_eval(cfg)
@@ -1677,7 +1649,9 @@ def evaluate(cfg: ConfigDict) -> None:
     state_dim, action_dim = _infer_state_action_dims_from_state_dict(state_dict)
 
     if ignore_demos:
-        raise ValueError('TTT eval requires a checkpoint whose model conditions on support demos (ignore_demos=False).')
+        raise ValueError(
+            'MAML eval requires a checkpoint whose model conditions on support demos (ignore_demos=False).'
+        )
 
     model = build_policy(
         model_cfg,
@@ -1687,7 +1661,7 @@ def evaluate(cfg: ConfigDict) -> None:
     model.load_state_dict(state_dict, strict=True)
     model.eval()
 
-    fast_names = _select_ttt_fast_param_names(model, cfg.ttt)
+    fast_names = _resolve_maml_fast_param_names(model, ckpt, maml_cfg)
     fast_param_count = _count_params_by_name(model, fast_names)
 
     if action_dim != 8:
@@ -1715,7 +1689,19 @@ def evaluate(cfg: ConfigDict) -> None:
     resolved_payload['dataset']['T_obs'] = int(dataset_cfg.T_obs)
     resolved_payload['dataset']['H'] = int(dataset_cfg.H)
     resolved_payload['dataset']['stride'] = int(dataset_cfg.stride)
-    resolved_payload['ttt']['outer_context_size'] = int(resolved_outer_context_size)
+    resolved_payload['checkpoint_maml'] = {
+        'inner_steps': int(maml_cfg.inner_steps),
+        'inner_lr': float(maml_cfg.inner_lr),
+        'outer_lr': float(maml_cfg.outer_lr),
+        'weight_decay': float(maml_cfg.weight_decay),
+        'max_grad_norm': float(maml_cfg.max_grad_norm),
+        'last_frac_fast': float(maml_cfg.last_frac_fast),
+        'include_ada_fast': bool(maml_cfg.include_ada_fast),
+        'include_final_norm_fast': bool(maml_cfg.include_final_norm_fast),
+        'num_loo_per_task': int(maml_cfg.num_loo_per_task),
+        'outer_context_size': int(maml_cfg.outer_context_size),
+        'reuse_diffusion_noise': bool(maml_cfg.reuse_diffusion_noise),
+    }
     resolved_payload['resolved'] = {
         'checkpoint_path': str(checkpoint_path),
         'run_name': run_name,
@@ -1746,21 +1732,19 @@ def evaluate(cfg: ConfigDict) -> None:
         dataset_cfg.stride,
     )
     logging.info(
-        'TTT cfg: inner_steps=%d | inner_lr=%.3e | max_grad_norm=%.3f | outer_context_size=%d | '
-        'num_loo_per_task=%d | num_support_batches_loo=%d | reuse_diffusion_noise=%s | '
-        'preload_support_batches_to_device=%s | log_query_loss=%s',
-        int(cfg.ttt.inner_steps),
-        float(cfg.ttt.inner_lr),
-        float(cfg.ttt.max_grad_norm),
-        int(resolved_outer_context_size),
-        int(cfg.ttt.num_loo_per_task),
-        int(_resolve_num_support_batches_loo(cfg.ttt)),
-        str(_as_bool(cfg.ttt.reuse_diffusion_noise)),
-        str(_as_bool(getattr(cfg.ttt, 'preload_support_batches_to_device', False))),
-        str(_as_bool(getattr(cfg.ttt, 'log_query_loss', False))),
+        'MAML cfg: inner_steps=%d | inner_lr=%.3e | max_grad_norm=%.3f | outer_context_size=%d | '
+        'num_loo_per_task=%d | reuse_diffusion_noise=%s | preload_support_batches_to_device=%s | log_query_loss=%s',
+        int(maml_cfg.inner_steps),
+        float(maml_cfg.inner_lr),
+        float(maml_cfg.max_grad_norm),
+        int(maml_cfg.outer_context_size),
+        int(maml_cfg.num_loo_per_task),
+        str(bool(maml_cfg.reuse_diffusion_noise)),
+        str(_as_bool(getattr(cfg.maml_eval, 'preload_support_batches_to_device', False))),
+        str(_as_bool(getattr(cfg.maml_eval, 'log_query_loss', False))),
     )
     logging.info(
-        'TTT fast params: tensors=%d | params=%s | examples=%s',
+        'MAML fast params: tensors=%d | params=%s | examples=%s',
         len(fast_names),
         f'{fast_param_count:,}',
         fast_names[:8],
@@ -1772,11 +1756,11 @@ def evaluate(cfg: ConfigDict) -> None:
     results: List[Dict[str, Any]] = []
     support_cache_root: Optional[Path] = None
     current_support_package: Optional[Dict[str, Any]] = None
-    current_ttt_stats: Optional[Dict[str, Any]] = None
+    current_maml_stats: Optional[Dict[str, Any]] = None
 
     try:
         if variation < 0:
-            raise ValueError('Cached TTT support conditioning requires cfg.task.variation >= 0.')
+            raise ValueError('Cached MAML support conditioning requires cfg.task.variation >= 0.')
         support_cache_root = _support_cache_root_from_eval_and_checkpoint(cfg, ckpt)
         task_keys = build_variation_keys(support_cache_root, task_name)
         if not task_keys:
@@ -1801,7 +1785,7 @@ def evaluate(cfg: ConfigDict) -> None:
             store=support_store,
             cfg=dataset_cfg,
             seed=seed + 23,
-            num_tries_per_item=int(getattr(cfg.ttt, 'num_tries_per_item', 100)),
+            num_tries_per_item=int(getattr(cfg.maml_eval, 'num_tries_per_item', 100)),
         )
 
         rng = np.random.default_rng(seed + 17)
@@ -1811,7 +1795,7 @@ def evaluate(cfg: ConfigDict) -> None:
                 torch_seed = seed + 100_003 + ep
                 torch_gen = torch.Generator(device=device) if device.type == 'cuda' else torch.Generator()
                 torch_gen.manual_seed(torch_seed)
-                current_support_package = _build_cached_ttt_package(
+                current_support_package = _build_cached_maml_package(
                     store=support_store,
                     task_builder=task_builder,
                     dataset_cfg=ICILConfig(
@@ -1829,63 +1813,60 @@ def evaluate(cfg: ConfigDict) -> None:
                     action_dim=int(action_dim),
                     use_rgb=_as_bool(cfg.conditioning.use_rgb),
                     use_mask_id=use_mask_id,
-                    ttt_cfg=ConfigDict(
+                    adapt_cfg=ConfigDict(
                         {
-                            'inner_steps': int(cfg.ttt.inner_steps),
-                            'num_loo_per_task': int(cfg.ttt.num_loo_per_task),
-                            'num_support_batches_loo': int(_resolve_num_support_batches_loo(cfg.ttt)),
-                            'outer_context_size': int(resolved_outer_context_size),
-                            'reuse_diffusion_noise': _as_bool(cfg.ttt.reuse_diffusion_noise),
+                            'inner_steps': int(maml_cfg.inner_steps),
+                            'num_loo_per_task': int(maml_cfg.num_loo_per_task),
+                            'outer_context_size': int(maml_cfg.outer_context_size),
+                            'reuse_diffusion_noise': bool(maml_cfg.reuse_diffusion_noise),
                             'preload_support_batches_to_device': _as_bool(
-                                getattr(cfg.ttt, 'preload_support_batches_to_device', False)
+                                getattr(cfg.maml_eval, 'preload_support_batches_to_device', False)
                             ),
-                            'log_query_loss': _as_bool(getattr(cfg.ttt, 'log_query_loss', False)),
+                            'log_query_loss': _as_bool(getattr(cfg.maml_eval, 'log_query_loss', False)),
                         }
                     ),
                 )
-                current_ttt_stats = _apply_ttt_adaptation_in_place(
+                current_maml_stats = _apply_maml_adaptation_in_place(
                     policy=model,
                     base_state_dict=state_dict,
                     support_package=current_support_package,
                     fast_names=fast_names,
                     device=device,
-                    ttt_cfg=cfg.ttt,
+                    maml_cfg=maml_cfg,
                 )
-                current_ttt_stats.update(
+                current_maml_stats.update(
                     _save_inner_loss_artifacts(
-                        inner_losses=current_ttt_stats.get('inner_losses', []),
-                        query_losses=current_ttt_stats.get('query_losses', None),
+                        inner_losses=current_maml_stats.get('inner_losses', []),
+                        query_losses=current_maml_stats.get('query_losses', None),
                         run_dir=run_dir,
-                        stem=f'ttt_episode_{ep:04d}',
+                        stem=f'maml_episode_{ep:04d}',
                     )
                 )
                 model.eval()
-                if current_ttt_stats.get('query_losses', None):
+                if current_maml_stats.get('query_losses', None):
                     logging.info(
-                        'TTT adaptation ready for episode %d | support_episodes=%s | rollout_context=%s | '
-                        'query_episode=%s | holdout_indices=%s | support_batches=%d | avg_inner_loss=%.6f | '
+                        'MAML adaptation ready for episode %d | support_episodes=%s | rollout_context=%s | '
+                        'query_episode=%s | holdout_indices=%s | avg_inner_loss=%.6f | '
                         'avg_query_loss=%.6f | avg_inner_grad_norm=%.6f',
                         ep,
-                        current_ttt_stats['support_ids'],
-                        current_ttt_stats['rollout_support_ids'],
-                        current_ttt_stats.get('query_episode_id', None),
-                        current_ttt_stats['holdout_indices'],
-                        int(current_ttt_stats.get('num_support_batches', 0)),
-                        float(current_ttt_stats['avg_inner_loss']),
-                        float(current_ttt_stats['avg_query_loss']),
-                        float(current_ttt_stats['avg_inner_grad_norm']),
+                        current_maml_stats['support_ids'],
+                        current_maml_stats['rollout_support_ids'],
+                        current_maml_stats.get('query_episode_id', None),
+                        current_maml_stats['holdout_indices'],
+                        float(current_maml_stats['avg_inner_loss']),
+                        float(current_maml_stats['avg_query_loss']),
+                        float(current_maml_stats['avg_inner_grad_norm']),
                     )
                 else:
                     logging.info(
-                        'TTT adaptation ready for episode %d | support_episodes=%s | rollout_context=%s | '
-                        'holdout_indices=%s | support_batches=%d | avg_inner_loss=%.6f | avg_inner_grad_norm=%.6f',
+                        'MAML adaptation ready for episode %d | support_episodes=%s | rollout_context=%s | '
+                        'holdout_indices=%s | avg_inner_loss=%.6f | avg_inner_grad_norm=%.6f',
                         ep,
-                        current_ttt_stats['support_ids'],
-                        current_ttt_stats['rollout_support_ids'],
-                        current_ttt_stats['holdout_indices'],
-                        int(current_ttt_stats.get('num_support_batches', 0)),
-                        float(current_ttt_stats['avg_inner_loss']),
-                        float(current_ttt_stats['avg_inner_grad_norm']),
+                        current_maml_stats['support_ids'],
+                        current_maml_stats['rollout_support_ids'],
+                        current_maml_stats['holdout_indices'],
+                        float(current_maml_stats['avg_inner_loss']),
+                        float(current_maml_stats['avg_inner_grad_norm']),
                     )
 
             res = _run_eval_episode(
@@ -1908,8 +1889,8 @@ def evaluate(cfg: ConfigDict) -> None:
                 cfg=cfg,
                 run_dir=run_dir,
             )
-            if current_ttt_stats is not None:
-                res['ttt'] = current_ttt_stats
+            if current_maml_stats is not None:
+                res['maml'] = current_maml_stats
             results.append(res)
             logging.info(
                 'Episode %d | success=%s | steps=%d%s',
@@ -1938,18 +1919,17 @@ def evaluate(cfg: ConfigDict) -> None:
                 'H': int(dataset_cfg.H),
                 'stride': int(dataset_cfg.stride),
             },
-            'resolved_ttt': {
-                'outer_context_size': int(resolved_outer_context_size),
-                'inner_steps': int(cfg.ttt.inner_steps),
-                'inner_lr': float(cfg.ttt.inner_lr),
-                'max_grad_norm': float(cfg.ttt.max_grad_norm),
-                'num_loo_per_task': int(cfg.ttt.num_loo_per_task),
-                'num_support_batches_loo': int(_resolve_num_support_batches_loo(cfg.ttt)),
-                'reuse_diffusion_noise': _as_bool(cfg.ttt.reuse_diffusion_noise),
+            'resolved_maml': {
+                'outer_context_size': int(maml_cfg.outer_context_size),
+                'inner_steps': int(maml_cfg.inner_steps),
+                'inner_lr': float(maml_cfg.inner_lr),
+                'max_grad_norm': float(maml_cfg.max_grad_norm),
+                'num_loo_per_task': int(maml_cfg.num_loo_per_task),
+                'reuse_diffusion_noise': bool(maml_cfg.reuse_diffusion_noise),
                 'preload_support_batches_to_device': _as_bool(
-                    getattr(cfg.ttt, 'preload_support_batches_to_device', False)
+                    getattr(cfg.maml_eval, 'preload_support_batches_to_device', False)
                 ),
-                'log_query_loss': _as_bool(getattr(cfg.ttt, 'log_query_loss', False)),
+                'log_query_loss': _as_bool(getattr(cfg.maml_eval, 'log_query_loss', False)),
             },
             'results': results,
         }
