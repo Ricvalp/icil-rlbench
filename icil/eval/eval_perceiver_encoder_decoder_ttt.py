@@ -1060,23 +1060,29 @@ def _build_cached_ttt_package(
         num_loo_per_task=int(ttt_cfg.num_loo_per_task),
         rng=rng,
     )
+    preload_support_batches = _as_bool(getattr(ttt_cfg, 'preload_support_batches_to_device', False))
+    support_batch_device = device if preload_support_batches else torch.device('cpu')
+    support_batch_generator = torch_generator
+    if support_batch_device.type == 'cpu' and torch_generator is not None:
+        support_batch_generator = torch.Generator()
+        support_batch_generator.manual_seed(int(torch_generator.initial_seed()))
 
     shared_noise = None
     shared_timesteps = None
     if _as_bool(ttt_cfg.reuse_diffusion_noise):
         shared_noise = torch.randn(
             (1, int(dataset_cfg.H), int(action_dim)),
-            device=device,
+            device=support_batch_device,
             dtype=torch.float32,
-            generator=torch_generator,
+            generator=support_batch_generator,
         )
         shared_timesteps = torch.randint(
             low=0,
             high=int(num_train_timesteps),
             size=(1,),
-            device=device,
+            device=support_batch_device,
             dtype=torch.long,
-            generator=torch_generator,
+            generator=support_batch_generator,
         )
 
     task_spec = MAMLTaskSpec(
@@ -1106,8 +1112,10 @@ def _build_cached_ttt_package(
                 load_rgb=use_rgb,
                 load_mask_id=use_mask_id,
             )
-            support_batch = _to_device_batch(support_batch, device)
-            support_batches.append(_drop_mask_ids_if_disabled(support_batch, use_mask_id))
+            support_batch = _drop_mask_ids_if_disabled(support_batch, use_mask_id)
+            if preload_support_batches:
+                support_batch = _to_device_batch(support_batch, device)
+            support_batches.append(support_batch)
             if prepare_pbar is not None:
                 prepare_pbar.update(1)
                 prepare_pbar.set_postfix(step=step_idx + 1)
@@ -1199,6 +1207,7 @@ def _adapt_fast_params_with_stats(
     *,
     support_batches: Sequence[Dict[str, Any]],
     fast_names_wrapped: Sequence[str],
+    device: torch.device,
     inner_lr: float,
     max_grad_norm: float,
     query_batch: Optional[Dict[str, Any]] = None,
@@ -1233,7 +1242,8 @@ def _adapt_fast_params_with_stats(
 
     try:
         iterator = enumerate(support_batches, start=1)
-        for step_idx, support_batch in iterator:
+        for step_idx, support_batch_cpu in iterator:
+            support_batch = _to_device_batch(support_batch_cpu, device)
             support_loss = functional_call(loss_wrapper, (adapted_params, buffers), (support_batch,))
             fast_tensors = [adapted_params[name] for name in fast_names_wrapped]
             grads = torch.autograd.grad(
@@ -1315,6 +1325,7 @@ def _apply_ttt_adaptation_in_place(
             support_batches=support_package['support_batches'],
             query_batch=support_package.get('query_batch', None),
             fast_names_wrapped=_prefix_param_names(fast_names),
+            device=device,
             inner_lr=float(ttt_cfg.inner_lr),
             max_grad_norm=float(ttt_cfg.max_grad_norm),
             progress_desc='TTT Inner GD',
@@ -1629,7 +1640,6 @@ def _run_eval_episode(
     }
 
 
-
 def evaluate(cfg: ConfigDict) -> None:
     seed = int(cfg.seed)
     _set_seed(seed)
@@ -1720,13 +1730,14 @@ def evaluate(cfg: ConfigDict) -> None:
     )
     logging.info(
         'TTT cfg: inner_steps=%d | inner_lr=%.3e | max_grad_norm=%.3f | outer_context_size=%d | '
-        'num_loo_per_task=%d | reuse_diffusion_noise=%s | log_query_loss=%s',
+        'num_loo_per_task=%d | reuse_diffusion_noise=%s | preload_support_batches_to_device=%s | log_query_loss=%s',
         int(cfg.ttt.inner_steps),
         float(cfg.ttt.inner_lr),
         float(cfg.ttt.max_grad_norm),
         int(resolved_outer_context_size),
         int(cfg.ttt.num_loo_per_task),
         str(_as_bool(cfg.ttt.reuse_diffusion_noise)),
+        str(_as_bool(getattr(cfg.ttt, 'preload_support_batches_to_device', False))),
         str(_as_bool(getattr(cfg.ttt, 'log_query_loss', False))),
     )
     logging.info(
@@ -1805,6 +1816,9 @@ def evaluate(cfg: ConfigDict) -> None:
                             'num_loo_per_task': int(cfg.ttt.num_loo_per_task),
                             'outer_context_size': int(resolved_outer_context_size),
                             'reuse_diffusion_noise': _as_bool(cfg.ttt.reuse_diffusion_noise),
+                            'preload_support_batches_to_device': _as_bool(
+                                getattr(cfg.ttt, 'preload_support_batches_to_device', False)
+                            ),
                             'log_query_loss': _as_bool(getattr(cfg.ttt, 'log_query_loss', False)),
                         }
                     ),
@@ -1909,6 +1923,9 @@ def evaluate(cfg: ConfigDict) -> None:
                 'max_grad_norm': float(cfg.ttt.max_grad_norm),
                 'num_loo_per_task': int(cfg.ttt.num_loo_per_task),
                 'reuse_diffusion_noise': _as_bool(cfg.ttt.reuse_diffusion_noise),
+                'preload_support_batches_to_device': _as_bool(
+                    getattr(cfg.ttt, 'preload_support_batches_to_device', False)
+                ),
                 'log_query_loss': _as_bool(getattr(cfg.ttt, 'log_query_loss', False)),
             },
             'results': results,
@@ -1939,7 +1956,6 @@ def evaluate(cfg: ConfigDict) -> None:
             support_store.close()
         if env is not None:
             env.shutdown()
-
 
 
 def main(argv: Sequence[str]) -> None:
