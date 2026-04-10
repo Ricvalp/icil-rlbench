@@ -653,7 +653,7 @@ def train(cfg: ConfigDict) -> None:
                     load_result.unexpected_keys,
                 )
 
-        use_mask_id = _resolve_use_mask_id(cfg.model)
+        use_mask_id = _resolve_use_mask_id(model_cfg)
         maml_cfg = MAMLConfig(
             inner_steps=int(cfg.maml.inner_steps),
             inner_lr=float(cfg.maml.inner_lr),
