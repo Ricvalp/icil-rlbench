@@ -54,7 +54,7 @@ def get_config():
     cfg.ttt.num_loo_per_task = 2
     cfg.ttt.outer_context_size = 0  # 0 => infer as K_pretrain from checkpoint['config']['dataset']['K']
     cfg.ttt.reuse_diffusion_noise = False
-    cfg.ttt.log_query_loss = False  # If True, evaluate loss on one extra episode not used for TTT updates.
+    cfg.ttt.log_query_loss = True  # If True, evaluate loss on one extra episode not used for TTT updates.
     cfg.ttt.num_tries_per_item = 100
 
     cfg.sim = ConfigDict()
