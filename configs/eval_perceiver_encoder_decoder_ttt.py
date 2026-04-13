@@ -51,8 +51,8 @@ def get_config():
     cfg.ttt.include_input_projections_fast = False
     cfg.ttt.include_output_head_fast = False
     cfg.ttt.include_diffusion_conditioning_fast = False
-    cfg.ttt.num_loo_per_task = 2
-    cfg.ttt.num_support_batches_loo = 0  # 0 => build inner_steps support batches, else reuse min(this, inner_steps).
+    cfg.ttt.num_loo_per_task = 32
+    cfg.ttt.num_support_batches_loo = 128  # 0 => build inner_steps support batches, else reuse min(this, inner_steps).
     cfg.ttt.outer_context_size = 0  # 0 => infer as K_pretrain from checkpoint['config']['dataset']['K']
     cfg.ttt.reuse_diffusion_noise = False
     cfg.ttt.preload_support_batches_to_device = False
