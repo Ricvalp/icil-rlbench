@@ -163,8 +163,12 @@ def get_config():
     cfg.maml.outer_lr = 1e-4
     cfg.maml.max_grad_norm = 1.0
     cfg.maml.last_frac_fast = 0.25
+    cfg.maml.include_decoder_mlp_fast = True
     cfg.maml.include_ada_fast = True
     cfg.maml.include_final_norm_fast = True
+    cfg.maml.include_input_projections_fast = False
+    cfg.maml.include_output_head_fast = False
+    cfg.maml.include_diffusion_conditioning_fast = False
     cfg.maml.num_loo_per_task = 3
     cfg.maml.outer_context_size = 0
     cfg.maml.reuse_diffusion_noise = False

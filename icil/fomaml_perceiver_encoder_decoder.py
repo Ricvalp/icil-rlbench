@@ -901,8 +901,14 @@ def train(cfg: ConfigDict) -> None:
             weight_decay=float(cfg.train.weight_decay),
             max_grad_norm=float(cfg.maml.max_grad_norm),
             last_frac_fast=float(cfg.maml.last_frac_fast),
+            include_decoder_mlp_fast=_as_bool(getattr(cfg.maml, 'include_decoder_mlp_fast', True)),
             include_ada_fast=_as_bool(cfg.maml.include_ada_fast),
             include_final_norm_fast=_as_bool(cfg.maml.include_final_norm_fast),
+            include_input_projections_fast=_as_bool(getattr(cfg.maml, 'include_input_projections_fast', False)),
+            include_output_head_fast=_as_bool(getattr(cfg.maml, 'include_output_head_fast', False)),
+            include_diffusion_conditioning_fast=_as_bool(
+                getattr(cfg.maml, 'include_diffusion_conditioning_fast', False)
+            ),
             num_loo_per_task=int(cfg.maml.num_loo_per_task),
             outer_context_size=int(resolved_outer_context_size),
             reuse_diffusion_noise=_as_bool(cfg.maml.reuse_diffusion_noise),
@@ -912,8 +918,12 @@ def train(cfg: ConfigDict) -> None:
         fast_names = get_fast_param_names(
             policy,
             last_frac=maml_cfg.last_frac_fast,
+            include_decoder_mlp=maml_cfg.include_decoder_mlp_fast,
             include_ada=maml_cfg.include_ada_fast,
             include_final_norm=maml_cfg.include_final_norm_fast,
+            include_input_projections=maml_cfg.include_input_projections_fast,
+            include_output_head=maml_cfg.include_output_head_fast,
+            include_diffusion_conditioning=maml_cfg.include_diffusion_conditioning_fast,
         )
         outer_names = get_outer_param_names(
             policy,

@@ -20,8 +20,12 @@ def _denoiser_ada_prefixes(block_idx: int) -> List[str]:
 def get_fast_param_names(
     model: Policy,
     last_frac: float = 0.25,
+    include_decoder_mlp: bool = True,
     include_ada: bool = True,
     include_final_norm: bool = True,
+    include_input_projections: bool = False,
+    include_output_head: bool = False,
+    include_diffusion_conditioning: bool = False,
 ) -> List[str]:
     del include_final_norm  # Current Policy has no final norm block.
 
@@ -41,9 +45,17 @@ def get_fast_param_names(
 
     prefixes: List[str] = []
     for block_idx in range(start_idx, n_blocks):
-        prefixes.append(f"denoiser.{block_idx}.mlp.")
+        if include_decoder_mlp:
+            prefixes.append(f"denoiser.{block_idx}.mlp.")
         if include_ada:
             prefixes.extend(_denoiser_ada_prefixes(block_idx))
+
+    if include_input_projections:
+        prefixes.append("action_in.")
+    if include_output_head:
+        prefixes.append("action_out.")
+    if include_diffusion_conditioning:
+        prefixes.append("t_mlp.")
 
     all_param_names = [name for name, _ in model.named_parameters()]
     fast_names = [name for name in all_param_names if any(name.startswith(prefix) for prefix in prefixes)]
@@ -54,9 +66,6 @@ def get_fast_param_names(
         ".cross_attn_q.",
         ".cross_attn_s.",
         "context_encoder.",
-        "action_in.",
-        "action_out.",
-        "t_mlp.",
     )
     bad_names = [name for name in fast_names if any(substr in name for substr in forbidden_substrings)]
     if bad_names:

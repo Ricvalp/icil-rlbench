@@ -26,5 +26,8 @@ def get_config():
         ),
     )
     cfg.wandb.project = os.environ.get('WANDB_PROJECT', 'icil-perceiver-fomaml')
+    cfg.maml.include_input_projections_fast = True
+    cfg.maml.include_output_head_fast = True
+    cfg.maml.include_diffusion_conditioning_fast = True
 
     return cfg

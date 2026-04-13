@@ -19,8 +19,12 @@ class MAMLConfig:
     weight_decay: float = 0.0
     max_grad_norm: float = 1.0
     last_frac_fast: float = 0.25
+    include_decoder_mlp_fast: bool = True
     include_ada_fast: bool = True
     include_final_norm_fast: bool = True
+    include_input_projections_fast: bool = False
+    include_output_head_fast: bool = False
+    include_diffusion_conditioning_fast: bool = False
     num_loo_per_task: int = 2
     outer_context_size: int = 0
     reuse_diffusion_noise: bool = True

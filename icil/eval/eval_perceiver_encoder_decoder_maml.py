@@ -770,8 +770,12 @@ def _resolve_maml_fast_param_names(
     return get_fast_param_names(
         model,
         last_frac=float(maml_cfg.last_frac_fast),
+        include_decoder_mlp=bool(getattr(maml_cfg, 'include_decoder_mlp_fast', True)),
         include_ada=bool(maml_cfg.include_ada_fast),
         include_final_norm=bool(maml_cfg.include_final_norm_fast),
+        include_input_projections=bool(getattr(maml_cfg, 'include_input_projections_fast', False)),
+        include_output_head=bool(getattr(maml_cfg, 'include_output_head_fast', False)),
+        include_diffusion_conditioning=bool(getattr(maml_cfg, 'include_diffusion_conditioning_fast', False)),
     )
 
 
@@ -1696,8 +1700,14 @@ def evaluate(cfg: ConfigDict) -> None:
         'weight_decay': float(maml_cfg.weight_decay),
         'max_grad_norm': float(maml_cfg.max_grad_norm),
         'last_frac_fast': float(maml_cfg.last_frac_fast),
+        'include_decoder_mlp_fast': bool(getattr(maml_cfg, 'include_decoder_mlp_fast', True)),
         'include_ada_fast': bool(maml_cfg.include_ada_fast),
         'include_final_norm_fast': bool(maml_cfg.include_final_norm_fast),
+        'include_input_projections_fast': bool(getattr(maml_cfg, 'include_input_projections_fast', False)),
+        'include_output_head_fast': bool(getattr(maml_cfg, 'include_output_head_fast', False)),
+        'include_diffusion_conditioning_fast': bool(
+            getattr(maml_cfg, 'include_diffusion_conditioning_fast', False)
+        ),
         'num_loo_per_task': int(maml_cfg.num_loo_per_task),
         'outer_context_size': int(maml_cfg.outer_context_size),
         'reuse_diffusion_noise': bool(maml_cfg.reuse_diffusion_noise),
@@ -1924,6 +1934,15 @@ def evaluate(cfg: ConfigDict) -> None:
                 'inner_steps': int(maml_cfg.inner_steps),
                 'inner_lr': float(maml_cfg.inner_lr),
                 'max_grad_norm': float(maml_cfg.max_grad_norm),
+                'last_frac_fast': float(maml_cfg.last_frac_fast),
+                'include_decoder_mlp_fast': bool(getattr(maml_cfg, 'include_decoder_mlp_fast', True)),
+                'include_ada_fast': bool(maml_cfg.include_ada_fast),
+                'include_final_norm_fast': bool(maml_cfg.include_final_norm_fast),
+                'include_input_projections_fast': bool(getattr(maml_cfg, 'include_input_projections_fast', False)),
+                'include_output_head_fast': bool(getattr(maml_cfg, 'include_output_head_fast', False)),
+                'include_diffusion_conditioning_fast': bool(
+                    getattr(maml_cfg, 'include_diffusion_conditioning_fast', False)
+                ),
                 'num_loo_per_task': int(maml_cfg.num_loo_per_task),
                 'reuse_diffusion_noise': bool(maml_cfg.reuse_diffusion_noise),
                 'preload_support_batches_to_device': _as_bool(
