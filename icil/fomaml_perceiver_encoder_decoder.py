@@ -33,7 +33,6 @@ from icil.models.maml import (
     get_fast_param_names,
     get_outer_param_names,
     prefix_param_names,
-    prepare_outer_batch_for_meta_step,
     set_outer_trainable_params,
 )
 from icil.models.maml.train_utils import (
@@ -348,6 +347,142 @@ def fomaml_backward_with_stats(
     return loss_sum / float(num_tasks), avg_inner_grad_norm
 
 
+def _to_device_batch(batch: Dict[str, Any], device: torch.device) -> Dict[str, Any]:
+    out: Dict[str, Any] = {}
+    for key, value in batch.items():
+        out[key] = value.to(device, non_blocking=True) if torch.is_tensor(value) else value
+    return out
+
+
+def _drop_mask_ids_if_disabled(batch: Dict[str, Any], use_mask_id: bool) -> Dict[str, Any]:
+    if use_mask_id:
+        return batch
+    out = dict(batch)
+    out.pop('cond_mask_id', None)
+    out.pop('query_mask_id', None)
+    return out
+
+
+def _sample_repeating_loo_indices(
+    K: int,
+    *,
+    num_loo_per_task: int,
+    rng: np.random.Generator,
+) -> List[int]:
+    if K < 1:
+        raise ValueError(f'K must be positive, got {K}.')
+    if num_loo_per_task < 1:
+        raise ValueError(f'num_loo_per_task must be positive, got {num_loo_per_task}.')
+
+    out: List[int] = []
+    while len(out) < int(num_loo_per_task):
+        perm = rng.permutation(K)
+        take = min(K, int(num_loo_per_task) - len(out))
+        out.extend(int(idx) for idx in perm[:take].tolist())
+    return out
+
+
+def _prepare_task_for_fomaml_step(
+    task: MAMLTaskSpec,
+    *,
+    task_builder: MAMLTaskBuilder,
+    cfg: MAMLConfig,
+    device: torch.device,
+    num_train_timesteps: int,
+    action_dim: int,
+    use_mask_id: bool,
+    rng: np.random.Generator,
+    torch_generator: Optional[torch.Generator] = None,
+) -> Dict[str, Any]:
+    support_count = len(task.support_episode_ids)
+    loo_indices = _sample_repeating_loo_indices(
+        support_count,
+        num_loo_per_task=int(cfg.num_loo_per_task),
+        rng=rng,
+    )
+
+    shared_noise = None
+    shared_timesteps = None
+    if bool(cfg.reuse_diffusion_noise):
+        H = int(task_builder.cfg.H)
+        shared_noise = torch.randn(
+            (1, H, int(action_dim)),
+            device=device,
+            dtype=torch.float32,
+            generator=torch_generator,
+        )
+        shared_timesteps = torch.randint(
+            low=0,
+            high=int(num_train_timesteps),
+            size=(1,),
+            device=device,
+            dtype=torch.long,
+            generator=torch_generator,
+        )
+
+    support_batches: List[Dict[str, Any]] = []
+    for _ in range(int(cfg.inner_steps)):
+        support_batch = task_builder.build_support_batch_loo(
+            task,
+            holdout_indices=loo_indices,
+            rng=rng,
+            noise=shared_noise if bool(cfg.reuse_diffusion_noise) else None,
+            timesteps=shared_timesteps if bool(cfg.reuse_diffusion_noise) else None,
+            load_mask_id=use_mask_id,
+        )
+        support_batch = _to_device_batch(support_batch, device)
+        support_batches.append(_drop_mask_ids_if_disabled(support_batch, use_mask_id))
+
+    num_context_episodes = int(cfg.outer_context_size) if int(cfg.outer_context_size) > 0 else None
+    query_batch = task_builder.build_query_batch(
+        task,
+        rng=rng,
+        num_context_episodes=num_context_episodes,
+        noise=shared_noise if bool(cfg.reuse_diffusion_noise) else None,
+        timesteps=shared_timesteps if bool(cfg.reuse_diffusion_noise) else None,
+        load_mask_id=use_mask_id,
+    )
+    query_batch = _to_device_batch(query_batch, device)
+    query_batch = _drop_mask_ids_if_disabled(query_batch, use_mask_id)
+
+    return {
+        'task': task,
+        'support_batches': support_batches,
+        'query_batch': query_batch,
+        'holdout_indices': loo_indices,
+    }
+
+
+def prepare_outer_batch_for_fomaml_step(
+    tasks: Sequence[MAMLTaskSpec],
+    *,
+    task_builder: MAMLTaskBuilder,
+    cfg: MAMLConfig,
+    device: torch.device,
+    num_train_timesteps: int,
+    action_dim: int,
+    use_mask_id: bool,
+    rng: np.random.Generator,
+    torch_generator: Optional[torch.Generator] = None,
+) -> List[Dict[str, Any]]:
+    prepared_tasks: List[Dict[str, Any]] = []
+    for task in tasks:
+        prepared_tasks.append(
+            _prepare_task_for_fomaml_step(
+                task,
+                task_builder=task_builder,
+                cfg=cfg,
+                device=device,
+                num_train_timesteps=num_train_timesteps,
+                action_dim=action_dim,
+                use_mask_id=use_mask_id,
+                rng=rng,
+                torch_generator=torch_generator,
+            )
+        )
+    return prepared_tasks
+
+
 def _build_logging_task_batch(
     *,
     store: Any,
@@ -419,7 +554,7 @@ def _sample_adapted_queries_for_tasks(
         torch_seed = int(seed) + 1_000_003 + task_idx
         torch_gen = torch.Generator(device=device) if device.type == 'cuda' else torch.Generator()
         torch_gen.manual_seed(torch_seed)
-        prepared_task = prepare_outer_batch_for_meta_step(
+        prepared_task = prepare_outer_batch_for_fomaml_step(
             [task],
             task_builder=task_builder,
             cfg=maml_cfg,
@@ -955,7 +1090,7 @@ def train(cfg: ConfigDict) -> None:
             torch_seed = data_seed + 2_000_003 + global_step
             torch_gen = torch.Generator(device=device) if device.type == 'cuda' else torch.Generator()
             torch_gen.manual_seed(torch_seed)
-            prepared_tasks = prepare_outer_batch_for_meta_step(
+            prepared_tasks = prepare_outer_batch_for_fomaml_step(
                 tasks_batch,
                 task_builder=task_builder,
                 cfg=maml_cfg,

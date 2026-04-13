@@ -165,9 +165,9 @@ def get_config():
     cfg.maml.last_frac_fast = 0.25
     cfg.maml.include_ada_fast = True
     cfg.maml.include_final_norm_fast = True
-    cfg.maml.num_loo_per_task = 2
+    cfg.maml.num_loo_per_task = 3
     cfg.maml.outer_context_size = 0
-    cfg.maml.reuse_diffusion_noise = True
+    cfg.maml.reuse_diffusion_noise = False
 
     cfg.outer = ConfigDict()
     cfg.outer.train_encoder = False
