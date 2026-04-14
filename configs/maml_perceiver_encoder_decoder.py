@@ -158,7 +158,7 @@ def get_config():
     cfg.finetune.strict_load = True
 
     cfg.maml = ConfigDict()
-    cfg.maml.inner_steps = 1
+    cfg.maml.inner_steps = 4
     cfg.maml.inner_lr = 1e-4
     cfg.maml.outer_lr = 1e-4
     cfg.maml.max_grad_norm = 1.0
@@ -169,7 +169,7 @@ def get_config():
     cfg.maml.include_input_projections_fast = False
     cfg.maml.include_output_head_fast = False
     cfg.maml.include_diffusion_conditioning_fast = False
-    cfg.maml.num_loo_per_task = 3
+    cfg.maml.num_loo_per_task = 8
     cfg.maml.outer_context_size = 0
     cfg.maml.reuse_diffusion_noise = False
 

@@ -441,7 +441,7 @@ def _prepare_task_for_fomaml_step(
 
     support_batches: List[Dict[str, Any]] = []
     for _ in range(int(cfg.inner_steps)):
-        support_batch = task_builder.build_support_batch_loo(
+        support_batch = task_builder.build_support_batch_loo_cached(
             task,
             holdout_indices=loo_indices,
             rng=rng,

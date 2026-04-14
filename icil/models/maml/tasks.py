@@ -116,59 +116,77 @@ class MAMLTaskBuilder(ICILSamplerCore):
         if len(support_ids) < 1:
             raise ValueError("support_ids must be non-empty.")
 
-        cond_xyz: List[torch.Tensor] = []
-        cond_state: List[torch.Tensor] = []
-        cond_valid: List[torch.Tensor] = []
-        cond_mask: List[torch.Tensor] = []
-        cond_rgb: List[torch.Tensor] = []
-        cond_traj: List[torch.Tensor] = []
-        cond_has_mask_for_all = bool(load_mask_id)
-        cond_has_rgb_for_all = bool(load_rgb)
-        cond_has_traj = bool(load_full_traj)
-
+        items: List[Dict[str, Any]] = []
         for eid in support_ids:
-            episode_id = int(eid)
-            T = self.store.episode_length(vidx, episode_id)
-            if T <= 0:
-                return None
-            keyframes = self._sample_keyframes(T, self.cfg.L, rng)
-            if keyframes.shape[0] != self.cfg.L:
-                return None
-            sample = self.store.load_episode_slices(
-                vidx,
-                episode_id,
-                keyframes,
+            item = self._build_single_support_conditioning(
+                rng,
+                vidx=vidx,
+                episode_id=int(eid),
                 load_rgb=load_rgb,
                 load_mask_id=load_mask_id,
                 load_full_traj=load_full_traj,
             )
-            cond_xyz.append(sample["xyz"])
-            cond_state.append(sample["state"])
-            cond_valid.append(sample["valid"])
-            if load_mask_id and "mask_id" in sample:
-                cond_mask.append(sample["mask_id"])
-            elif load_mask_id:
-                cond_has_mask_for_all = False
-            if load_rgb and "rgb" in sample:
-                cond_rgb.append(sample["rgb"])
-            elif load_rgb:
-                cond_has_rgb_for_all = False
-            if load_full_traj and "traj" in sample:
-                cond_traj.append(self._stride_traj(sample["traj"]))
-            elif load_full_traj:
-                cond_has_traj = False
+            if item is None:
+                return None
+            items.append(item)
+        return self._stack_support_conditioning_items(items)
 
+    def _build_single_support_conditioning(
+        self,
+        rng: np.random.Generator,
+        *,
+        vidx: int,
+        episode_id: int,
+        load_rgb: bool = True,
+        load_mask_id: bool = True,
+        load_full_traj: bool = True,
+    ) -> Optional[Dict[str, Any]]:
+        T = self.store.episode_length(vidx, int(episode_id))
+        if T <= 0:
+            return None
+        keyframes = self._sample_keyframes(T, self.cfg.L, rng)
+        if keyframes.shape[0] != self.cfg.L:
+            return None
+        sample = self.store.load_episode_slices(
+            vidx,
+            int(episode_id),
+            keyframes,
+            load_rgb=load_rgb,
+            load_mask_id=load_mask_id,
+            load_full_traj=load_full_traj,
+        )
         out: Dict[str, Any] = {
-            "cond_xyz": torch.stack(cond_xyz, 0),
-            "cond_state": torch.stack(cond_state, 0),
-            "cond_valid": torch.stack(cond_valid, 0),
+            "cond_xyz": sample["xyz"],
+            "cond_state": sample["state"],
+            "cond_valid": sample["valid"],
         }
-        if cond_has_mask_for_all and len(cond_mask) == len(support_ids):
-            out["cond_mask_id"] = torch.stack(cond_mask, 0)
-        if cond_has_rgb_for_all and len(cond_rgb) == len(support_ids):
-            out["cond_rgb"] = torch.stack(cond_rgb, 0)
-        if cond_has_traj and len(cond_traj) == len(support_ids):
-            out["cond_traj"], out["cond_traj_mask"] = self._pack_traj_list(cond_traj)
+        if load_mask_id and "mask_id" in sample:
+            out["cond_mask_id"] = sample["mask_id"]
+        if load_rgb and "rgb" in sample:
+            out["cond_rgb"] = sample["rgb"]
+        if load_full_traj and "traj" in sample:
+            out["cond_traj"] = self._stride_traj(sample["traj"])
+        return out
+
+    def _stack_support_conditioning_items(
+        self,
+        items: Sequence[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        if not items:
+            raise ValueError("items must be non-empty.")
+        out: Dict[str, Any] = {
+            "cond_xyz": torch.stack([item["cond_xyz"] for item in items], 0),
+            "cond_state": torch.stack([item["cond_state"] for item in items], 0),
+            "cond_valid": torch.stack([item["cond_valid"] for item in items], 0),
+        }
+        if all("cond_mask_id" in item for item in items):
+            out["cond_mask_id"] = torch.stack([item["cond_mask_id"] for item in items], 0)
+        if all("cond_rgb" in item for item in items):
+            out["cond_rgb"] = torch.stack([item["cond_rgb"] for item in items], 0)
+        if all("cond_traj" in item for item in items):
+            out["cond_traj"], out["cond_traj_mask"] = self._pack_traj_list(
+                [item["cond_traj"] for item in items]
+            )
         return out
 
     def _build_query_sample(
@@ -315,6 +333,73 @@ class MAMLTaskBuilder(ICILSamplerCore):
             )
             if support is None:
                 raise RuntimeError("Failed to build support conditioning for inner-loop adaptation.")
+            query = self._build_query_sample(
+                vidx=int(task.vidx),
+                episode_id=int(heldout_episode_id),
+                rng=rng,
+                load_rgb=load_rgb,
+                load_mask_id=load_mask_id,
+            )
+            if query is None:
+                raise RuntimeError("Failed to build held-out support query sample.")
+            query["meta"].update(
+                {
+                    "holdout_index": int(holdout_idx),
+                    "heldout_support_episode": int(heldout_episode_id),
+                    "support_episodes": kept_support_ids,
+                    "task_query_episode": int(task.query_episode_id),
+                }
+            )
+            sample = {**support, **query}
+            samples.append(sample)
+
+        batch = self._stack_samples(samples)
+        self.attach_diffusion_inputs(batch, noise=noise, timesteps=timesteps)
+        return batch
+
+    def build_support_batch_loo_cached(
+        self,
+        task: MAMLTaskSpec,
+        *,
+        holdout_indices: Sequence[int],
+        rng: np.random.Generator,
+        noise: Optional[torch.Tensor] = None,
+        timesteps: Optional[torch.Tensor] = None,
+        load_rgb: bool = True,
+        load_mask_id: bool = True,
+    ) -> Dict[str, Any]:
+        if len(holdout_indices) < 1:
+            raise ValueError("holdout_indices must be non-empty.")
+
+        support_ids = list(task.support_episode_ids)
+        support_items: List[Dict[str, Any]] = []
+        for episode_id in support_ids:
+            item = self._build_single_support_conditioning(
+                rng,
+                vidx=int(task.vidx),
+                episode_id=int(episode_id),
+                load_rgb=load_rgb,
+                load_mask_id=load_mask_id,
+                load_full_traj=True,
+            )
+            if item is None:
+                raise RuntimeError("Failed to build cached support conditioning for inner-loop adaptation.")
+            support_items.append(item)
+
+        samples: List[Dict[str, Any]] = []
+        for holdout_idx in holdout_indices:
+            holdout_idx = int(holdout_idx)
+            if holdout_idx < 0 or holdout_idx >= len(support_ids):
+                raise IndexError(
+                    f"holdout_idx={holdout_idx} out of range for K={len(support_ids)}"
+                )
+            heldout_episode_id = support_ids[holdout_idx]
+            kept_support_ids = [
+                int(ep_id) for idx, ep_id in enumerate(support_ids) if idx != holdout_idx
+            ]
+            support = self._stack_support_conditioning_items(
+                [item for idx, item in enumerate(support_items) if idx != holdout_idx]
+            )
             query = self._build_query_sample(
                 vidx=int(task.vidx),
                 episode_id=int(heldout_episode_id),
