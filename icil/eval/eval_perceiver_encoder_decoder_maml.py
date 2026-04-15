@@ -786,178 +786,18 @@ def _count_params_by_name(model: Policy, names: Sequence[str]) -> int:
 
 
 
-def _sample_balanced_indices(total: int, *, count: int, rng: np.random.Generator) -> List[int]:
-    if total < 1:
-        raise ValueError(f'total must be positive, got {total}.')
-    if count < 1:
-        raise ValueError(f'count must be positive, got {count}.')
+def _sample_loo_indices(K: int, *, num_loo_per_task: int, rng: np.random.Generator) -> List[int]:
+    if K < 1:
+        raise ValueError(f'K must be positive, got {K}.')
+    if num_loo_per_task < 1:
+        raise ValueError(f'num_loo_per_task must be positive, got {num_loo_per_task}.')
 
     out: List[int] = []
-    while len(out) < count:
-        perm = rng.permutation(total)
-        take = min(total, count - len(out))
+    while len(out) < int(num_loo_per_task):
+        perm = rng.permutation(K)
+        take = min(K, int(num_loo_per_task) - len(out))
         out.extend(int(idx) for idx in perm[:take].tolist())
     return out
-
-
-
-def _sample_loo_indices(K: int, *, num_loo_per_task: int, rng: np.random.Generator) -> List[int]:
-    if num_loo_per_task >= K:
-        return list(range(K))
-    perm = rng.permutation(K)
-    return [int(idx) for idx in perm[:num_loo_per_task].tolist()]
-
-
-
-def _num_valid_query_t0s(task_builder: MAMLTaskBuilder, *, vidx: int, episode_id: int) -> int:
-    T = int(task_builder.store.episode_length(int(vidx), int(episode_id)))
-    required = 1 + ((int(task_builder.cfg.T_obs) - 1) * int(task_builder.cfg.stride))
-    return max(0, T - required + 1)
-
-
-
-def _sample_query_t0s_for_episode(
-    task_builder: MAMLTaskBuilder,
-    *,
-    vidx: int,
-    episode_id: int,
-    count: int,
-    rng: np.random.Generator,
-) -> List[int]:
-    num_valid = _num_valid_query_t0s(task_builder, vidx=int(vidx), episode_id=int(episode_id))
-    if num_valid < 1:
-        raise RuntimeError(
-            f'No valid query windows for vidx={vidx}, episode_id={episode_id}. '
-            f'Need at least T_obs={int(task_builder.cfg.T_obs)} observed frames with stride={int(task_builder.cfg.stride)}.'
-        )
-    return _sample_balanced_indices(num_valid, count=count, rng=rng)
-
-
-
-def _build_query_sample_at_t0(
-    task_builder: MAMLTaskBuilder,
-    *,
-    vidx: int,
-    episode_id: int,
-    t0: int,
-    load_rgb: bool,
-    load_mask_id: bool,
-) -> Dict[str, Any]:
-    episode_length = int(task_builder.store.episode_length(int(vidx), int(episode_id)))
-    obs_idx, act_idx = task_builder._build_obs_act_indices(int(t0), episode_length=episode_length)
-    q_obs = task_builder.store.load_episode_slices(
-        int(vidx),
-        int(episode_id),
-        obs_idx,
-        load_rgb=load_rgb,
-        load_mask_id=load_mask_id,
-        load_full_traj=False,
-    )
-    q_act = task_builder.store.load_episode_slices(
-        int(vidx),
-        int(episode_id),
-        act_idx,
-        load_rgb=False,
-        load_mask_id=False,
-        load_full_traj=False,
-    )
-
-    sample: Dict[str, Any] = {
-        'query_xyz': q_obs['xyz'],
-        'query_state': q_obs['state'],
-        'query_valid': q_obs['valid'],
-        'target_action': q_act['action'],
-        'meta': {
-            'vidx': int(vidx),
-            'query_episode': int(episode_id),
-            't0': int(t0),
-        },
-    }
-    if load_mask_id and 'mask_id' in q_obs:
-        sample['query_mask_id'] = q_obs['mask_id']
-    if load_rgb and 'rgb' in q_obs:
-        sample['query_rgb'] = q_obs['rgb']
-    return sample
-
-
-
-def _build_support_batch_loo(
-    task_builder: MAMLTaskBuilder,
-    task: MAMLTaskSpec,
-    *,
-    holdout_indices: Sequence[int],
-    rng: np.random.Generator,
-    noise: Optional[torch.Tensor] = None,
-    timesteps: Optional[torch.Tensor] = None,
-    load_rgb: bool = True,
-    load_mask_id: bool = True,
-) -> Dict[str, Any]:
-    if not holdout_indices:
-        raise ValueError('holdout_indices must be non-empty.')
-
-    support_ids = list(task.support_episode_ids)
-    holdout_t0s: List[Optional[int]] = [None] * len(holdout_indices)
-    positions_by_holdout: Dict[int, List[int]] = {}
-    for pos, holdout_idx in enumerate(holdout_indices):
-        holdout_idx_i = int(holdout_idx)
-        if holdout_idx_i < 0 or holdout_idx_i >= len(support_ids):
-            raise IndexError(f'holdout_idx={holdout_idx_i} out of range for K={len(support_ids)}')
-        positions_by_holdout.setdefault(holdout_idx_i, []).append(pos)
-
-    for holdout_idx, positions in positions_by_holdout.items():
-        heldout_episode_id = int(support_ids[int(holdout_idx)])
-        sampled_t0s = _sample_query_t0s_for_episode(
-            task_builder,
-            vidx=int(task.vidx),
-            episode_id=heldout_episode_id,
-            count=len(positions),
-            rng=rng,
-        )
-        for pos, t0 in zip(positions, sampled_t0s):
-            holdout_t0s[pos] = int(t0)
-
-    samples: List[Dict[str, Any]] = []
-    for holdout_idx, t0 in zip(holdout_indices, holdout_t0s):
-        holdout_idx_i = int(holdout_idx)
-        heldout_episode_id = int(support_ids[holdout_idx_i])
-        kept_support_ids = [
-            int(ep_id) for idx, ep_id in enumerate(support_ids) if idx != holdout_idx_i
-        ]
-        support = task_builder.build_conditioning_from_support_ids(
-            rng,
-            vidx=int(task.vidx),
-            support_ids=kept_support_ids,
-            load_rgb=load_rgb,
-            load_mask_id=load_mask_id,
-            load_full_traj=True,
-        )
-        if support is None:
-            raise RuntimeError('Failed to build support conditioning for inner-loop adaptation.')
-        if t0 is None:
-            raise RuntimeError(
-                f'Internal error while sampling query window for heldout episode {heldout_episode_id}.'
-            )
-        query = _build_query_sample_at_t0(
-            task_builder,
-            vidx=int(task.vidx),
-            episode_id=heldout_episode_id,
-            t0=int(t0),
-            load_rgb=load_rgb,
-            load_mask_id=load_mask_id,
-        )
-        query['meta'].update(
-            {
-                'holdout_index': holdout_idx_i,
-                'heldout_support_episode': heldout_episode_id,
-                'support_episodes': kept_support_ids,
-                'task_query_episode': int(task.query_episode_id),
-            }
-        )
-        samples.append({**support, **query})
-
-    batch = task_builder._stack_samples(samples)
-    task_builder.attach_diffusion_inputs(batch, noise=noise, timesteps=timesteps)
-    return batch
 
 
 
@@ -1095,8 +935,7 @@ def _build_cached_maml_package(
         )
     try:
         for step_idx in range(int(adapt_cfg.inner_steps)):
-            support_batch = _build_support_batch_loo(
-                task_builder,
+            support_batch = task_builder.build_support_batch_loo_cached(
                 task_spec,
                 holdout_indices=holdout_indices,
                 rng=rng,
@@ -1244,7 +1083,7 @@ def _adapt_fast_params_with_stats(
                 fast_tensors,
                 create_graph=False,
                 retain_graph=False,
-                allow_unused=True,
+                allow_unused=False,
             )
             if not logged_unused_warning:
                 unused_fast_param_names = [
