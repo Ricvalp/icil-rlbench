@@ -57,6 +57,7 @@ def get_config():
     cfg.ttt.reuse_diffusion_noise = False
     cfg.ttt.preload_support_batches_to_device = False
     cfg.ttt.log_query_loss = True  # If True, evaluate loss on one extra episode not used for TTT updates.
+    cfg.ttt.num_query_loss_samples = 1  # Number of t0 windows averaged for the extra query/eval loss.
     cfg.ttt.num_tries_per_item = 100
 
     cfg.sim = ConfigDict()

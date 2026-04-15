@@ -978,6 +978,63 @@ def _build_support_batch_loo(
 
 
 
+def _build_query_batch_at_t0s(
+    task_builder: MAMLTaskBuilder,
+    task: MAMLTaskSpec,
+    *,
+    support_ids: Sequence[int],
+    count: int,
+    rng: np.random.Generator,
+    noise: Optional[torch.Tensor] = None,
+    timesteps: Optional[torch.Tensor] = None,
+    load_rgb: bool = True,
+    load_mask_id: bool = True,
+) -> Dict[str, Any]:
+    if count < 1:
+        raise ValueError(f'count must be >= 1, got {count}.')
+
+    support = task_builder.build_conditioning_from_support_ids(
+        rng,
+        vidx=int(task.vidx),
+        support_ids=[int(ep_id) for ep_id in support_ids],
+        load_rgb=load_rgb,
+        load_mask_id=load_mask_id,
+        load_full_traj=True,
+    )
+    if support is None:
+        raise RuntimeError('Failed to build extra-query support conditioning.')
+
+    sampled_t0s = _sample_query_t0s_for_episode(
+        task_builder,
+        vidx=int(task.vidx),
+        episode_id=int(task.query_episode_id),
+        count=int(count),
+        rng=rng,
+    )
+    samples: List[Dict[str, Any]] = []
+    for t0 in sampled_t0s:
+        query = _build_query_sample_at_t0(
+            task_builder,
+            vidx=int(task.vidx),
+            episode_id=int(task.query_episode_id),
+            t0=int(t0),
+            load_rgb=load_rgb,
+            load_mask_id=load_mask_id,
+        )
+        query['meta'].update(
+            {
+                'support_episodes': [int(ep_id) for ep_id in support_ids],
+                'task_query_episode': int(task.query_episode_id),
+            }
+        )
+        samples.append({**support, **query})
+
+    batch = task_builder._stack_samples(samples)
+    task_builder.attach_diffusion_inputs(batch, noise=noise, timesteps=timesteps)
+    return batch
+
+
+
 def _clip_grads_in_list(grads: List[torch.Tensor], max_norm: float) -> List[torch.Tensor]:
     if max_norm <= 0.0:
         return grads
@@ -1165,11 +1222,13 @@ def _build_cached_ttt_package(
 
     query_batch = None
     if log_query_loss:
+        query_loss_count = int(getattr(ttt_cfg, 'num_query_loss_samples', 1))
+        query_loss_count = max(1, query_loss_count)
         query_noise = shared_noise
         query_timesteps = shared_timesteps
         if query_noise is None:
             query_noise = torch.randn(
-                (1, int(dataset_cfg.H), int(action_dim)),
+                (query_loss_count, int(dataset_cfg.H), int(action_dim)),
                 device=device,
                 dtype=torch.float32,
                 generator=torch_generator,
@@ -1178,7 +1237,7 @@ def _build_cached_ttt_package(
             query_timesteps = torch.randint(
                 low=0,
                 high=int(num_train_timesteps),
-                size=(1,),
+                size=(query_loss_count,),
                 device=device,
                 dtype=torch.long,
                 generator=torch_generator,
@@ -1188,8 +1247,11 @@ def _build_cached_ttt_package(
             support_episode_ids=tuple(rollout_support_ids),
             query_episode_id=int(query_episode_id),
         )
-        query_batch = task_builder.build_query_batch(
+        query_batch = _build_query_batch_at_t0s(
+            task_builder,
             query_task,
+            support_ids=rollout_support_ids,
+            count=query_loss_count,
             rng=rng,
             noise=query_noise,
             timesteps=query_timesteps,
@@ -1748,7 +1810,7 @@ def evaluate(cfg: ConfigDict) -> None:
     logging.info(
         'TTT cfg: inner_steps=%d | inner_lr=%.3e | max_grad_norm=%.3f | outer_context_size=%d | '
         'num_loo_per_task=%d | num_support_batches_loo=%d | reuse_diffusion_noise=%s | '
-        'preload_support_batches_to_device=%s | log_query_loss=%s',
+        'preload_support_batches_to_device=%s | log_query_loss=%s | num_query_loss_samples=%d',
         int(cfg.ttt.inner_steps),
         float(cfg.ttt.inner_lr),
         float(cfg.ttt.max_grad_norm),
@@ -1758,6 +1820,7 @@ def evaluate(cfg: ConfigDict) -> None:
         str(_as_bool(cfg.ttt.reuse_diffusion_noise)),
         str(_as_bool(getattr(cfg.ttt, 'preload_support_batches_to_device', False))),
         str(_as_bool(getattr(cfg.ttt, 'log_query_loss', False))),
+        int(getattr(cfg.ttt, 'num_query_loss_samples', 1)),
     )
     logging.info(
         'TTT fast params: tensors=%d | params=%s | examples=%s',
@@ -1840,6 +1903,7 @@ def evaluate(cfg: ConfigDict) -> None:
                                 getattr(cfg.ttt, 'preload_support_batches_to_device', False)
                             ),
                             'log_query_loss': _as_bool(getattr(cfg.ttt, 'log_query_loss', False)),
+                            'num_query_loss_samples': int(getattr(cfg.ttt, 'num_query_loss_samples', 1)),
                         }
                     ),
                 )
@@ -1950,6 +2014,7 @@ def evaluate(cfg: ConfigDict) -> None:
                     getattr(cfg.ttt, 'preload_support_batches_to_device', False)
                 ),
                 'log_query_loss': _as_bool(getattr(cfg.ttt, 'log_query_loss', False)),
+                'num_query_loss_samples': int(getattr(cfg.ttt, 'num_query_loss_samples', 1)),
             },
             'results': results,
         }
