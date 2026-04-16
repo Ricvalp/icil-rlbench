@@ -801,6 +801,84 @@ def _sample_loo_indices(K: int, *, num_loo_per_task: int, rng: np.random.Generat
 
 
 
+def _num_valid_query_t0s(task_builder: MAMLTaskBuilder, *, vidx: int, episode_id: int) -> int:
+    T = int(task_builder.store.episode_length(int(vidx), int(episode_id)))
+    required = 1 + ((int(task_builder.cfg.T_obs) - 1) * int(task_builder.cfg.stride))
+    return max(0, T - required + 1)
+
+
+
+def _sample_query_t0s_for_episode(
+    task_builder: MAMLTaskBuilder,
+    *,
+    vidx: int,
+    episode_id: int,
+    count: int,
+    rng: np.random.Generator,
+) -> List[int]:
+    num_valid = _num_valid_query_t0s(task_builder, vidx=int(vidx), episode_id=int(episode_id))
+    if num_valid < 1:
+        raise RuntimeError(
+            f'No valid query windows for vidx={vidx}, episode_id={episode_id}. '
+            f'Need at least T_obs={int(task_builder.cfg.T_obs)} observed frames with stride={int(task_builder.cfg.stride)}.'
+        )
+
+    out: List[int] = []
+    while len(out) < int(count):
+        perm = rng.permutation(num_valid)
+        take = min(num_valid, int(count) - len(out))
+        out.extend(int(idx) for idx in perm[:take].tolist())
+    return out
+
+
+
+def _build_query_sample_at_t0(
+    task_builder: MAMLTaskBuilder,
+    *,
+    vidx: int,
+    episode_id: int,
+    t0: int,
+    load_rgb: bool,
+    load_mask_id: bool,
+) -> Dict[str, Any]:
+    episode_length = int(task_builder.store.episode_length(int(vidx), int(episode_id)))
+    obs_idx, act_idx = task_builder._build_obs_act_indices(int(t0), episode_length=episode_length)
+    q_obs = task_builder.store.load_episode_slices(
+        int(vidx),
+        int(episode_id),
+        obs_idx,
+        load_rgb=load_rgb,
+        load_mask_id=load_mask_id,
+        load_full_traj=False,
+    )
+    q_act = task_builder.store.load_episode_slices(
+        int(vidx),
+        int(episode_id),
+        act_idx,
+        load_rgb=False,
+        load_mask_id=False,
+        load_full_traj=False,
+    )
+
+    sample: Dict[str, Any] = {
+        'query_xyz': q_obs['xyz'],
+        'query_state': q_obs['state'],
+        'query_valid': q_obs['valid'],
+        'target_action': q_act['action'],
+        'meta': {
+            'vidx': int(vidx),
+            'query_episode': int(episode_id),
+            't0': int(t0),
+        },
+    }
+    if load_mask_id and 'mask_id' in q_obs:
+        sample['query_mask_id'] = q_obs['mask_id']
+    if load_rgb and 'rgb' in q_obs:
+        sample['query_rgb'] = q_obs['rgb']
+    return sample
+
+
+
 def _clip_grads_in_list(grads: List[torch.Tensor], max_norm: float) -> List[torch.Tensor]:
     if max_norm <= 0.0:
         return grads
@@ -855,6 +933,63 @@ def _unsqueeze_support_batch_dim(support: Dict[str, Any]) -> Dict[str, Any]:
     for k, v in support.items():
         out[k] = v.unsqueeze(0) if torch.is_tensor(v) else v
     return out
+
+
+
+def _build_query_batch_at_t0s(
+    task_builder: MAMLTaskBuilder,
+    task: MAMLTaskSpec,
+    *,
+    support_ids: Sequence[int],
+    count: int,
+    rng: np.random.Generator,
+    noise: Optional[torch.Tensor] = None,
+    timesteps: Optional[torch.Tensor] = None,
+    load_rgb: bool = True,
+    load_mask_id: bool = True,
+) -> Dict[str, Any]:
+    if count < 1:
+        raise ValueError(f'count must be >= 1, got {count}.')
+
+    support = task_builder.build_conditioning_from_support_ids(
+        rng,
+        vidx=int(task.vidx),
+        support_ids=[int(ep_id) for ep_id in support_ids],
+        load_rgb=load_rgb,
+        load_mask_id=load_mask_id,
+        load_full_traj=True,
+    )
+    if support is None:
+        raise RuntimeError('Failed to build extra-query support conditioning.')
+
+    sampled_t0s = _sample_query_t0s_for_episode(
+        task_builder,
+        vidx=int(task.vidx),
+        episode_id=int(task.query_episode_id),
+        count=int(count),
+        rng=rng,
+    )
+    samples: List[Dict[str, Any]] = []
+    for t0 in sampled_t0s:
+        query = _build_query_sample_at_t0(
+            task_builder,
+            vidx=int(task.vidx),
+            episode_id=int(task.query_episode_id),
+            t0=int(t0),
+            load_rgb=load_rgb,
+            load_mask_id=load_mask_id,
+        )
+        query['meta'].update(
+            {
+                'support_episodes': [int(ep_id) for ep_id in support_ids],
+                'task_query_episode': int(task.query_episode_id),
+            }
+        )
+        samples.append({**support, **query})
+
+    batch = task_builder._stack_samples(samples)
+    task_builder.attach_diffusion_inputs(batch, noise=noise, timesteps=timesteps)
+    return batch
 
 
 
@@ -986,11 +1121,13 @@ def _build_cached_maml_package(
 
     query_batch = None
     if log_query_loss:
+        query_loss_count = int(getattr(adapt_cfg, 'num_query_loss_samples', 1))
+        query_loss_count = max(1, query_loss_count)
         query_noise = shared_noise
         query_timesteps = shared_timesteps
         if query_noise is None:
             query_noise = torch.randn(
-                (1, int(dataset_cfg.H), int(action_dim)),
+                (query_loss_count, int(dataset_cfg.H), int(action_dim)),
                 device=device,
                 dtype=torch.float32,
                 generator=torch_generator,
@@ -999,7 +1136,7 @@ def _build_cached_maml_package(
             query_timesteps = torch.randint(
                 low=0,
                 high=int(num_train_timesteps),
-                size=(1,),
+                size=(query_loss_count,),
                 device=device,
                 dtype=torch.long,
                 generator=torch_generator,
@@ -1009,8 +1146,11 @@ def _build_cached_maml_package(
             support_episode_ids=tuple(rollout_support_ids),
             query_episode_id=int(query_episode_id),
         )
-        query_batch = task_builder.build_query_batch(
+        query_batch = _build_query_batch_at_t0s(
+            task_builder,
             query_task,
+            support_ids=rollout_support_ids,
+            count=query_loss_count,
             rng=rng,
             noise=query_noise,
             timesteps=query_timesteps,
@@ -1582,7 +1722,8 @@ def evaluate(cfg: ConfigDict) -> None:
     )
     logging.info(
         'MAML cfg: inner_steps=%d | inner_lr=%.3e | max_grad_norm=%.3f | outer_context_size=%d | '
-        'num_loo_per_task=%d | reuse_diffusion_noise=%s | preload_support_batches_to_device=%s | log_query_loss=%s',
+        'num_loo_per_task=%d | reuse_diffusion_noise=%s | preload_support_batches_to_device=%s | '
+        'log_query_loss=%s | num_query_loss_samples=%d',
         int(maml_cfg.inner_steps),
         float(maml_cfg.inner_lr),
         float(maml_cfg.max_grad_norm),
@@ -1591,6 +1732,7 @@ def evaluate(cfg: ConfigDict) -> None:
         str(bool(maml_cfg.reuse_diffusion_noise)),
         str(_as_bool(getattr(cfg.maml_eval, 'preload_support_batches_to_device', False))),
         str(_as_bool(getattr(cfg.maml_eval, 'log_query_loss', False))),
+        int(getattr(cfg.maml_eval, 'num_query_loss_samples', 1)),
     )
     logging.info(
         'MAML fast params: tensors=%d | params=%s | examples=%s',
@@ -1672,6 +1814,7 @@ def evaluate(cfg: ConfigDict) -> None:
                                 getattr(cfg.maml_eval, 'preload_support_batches_to_device', False)
                             ),
                             'log_query_loss': _as_bool(getattr(cfg.maml_eval, 'log_query_loss', False)),
+                            'num_query_loss_samples': int(getattr(cfg.maml_eval, 'num_query_loss_samples', 1)),
                         }
                     ),
                 )
@@ -1788,6 +1931,7 @@ def evaluate(cfg: ConfigDict) -> None:
                     getattr(cfg.maml_eval, 'preload_support_batches_to_device', False)
                 ),
                 'log_query_loss': _as_bool(getattr(cfg.maml_eval, 'log_query_loss', False)),
+                'num_query_loss_samples': int(getattr(cfg.maml_eval, 'num_query_loss_samples', 1)),
             },
             'results': results,
         }

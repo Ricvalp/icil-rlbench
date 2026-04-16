@@ -40,6 +40,7 @@ def get_config():
     cfg.maml_eval = ConfigDict()
     cfg.maml_eval.preload_support_batches_to_device = False
     cfg.maml_eval.log_query_loss = False  # If True, evaluate loss on one extra episode not used for MAML adaptation.
+    cfg.maml_eval.num_query_loss_samples = 1  # Number of t0 windows averaged for the extra query/eval loss.
     cfg.maml_eval.num_tries_per_item = 100
 
     cfg.sim = ConfigDict()
