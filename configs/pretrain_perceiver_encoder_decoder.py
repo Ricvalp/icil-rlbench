@@ -24,9 +24,9 @@ def get_config():
         os.path.join("output_data_playground_v3", ".rlbench_cache_dense"),
     )
     cfg.data.tasks = ()  # () => use all tasks in cache_root
-    cfg.data.exclude_tasks = ("put_item_in_drawer", "lamp_on")
+    cfg.data.exclude_tasks = ("put_item_in_drawer", "take_item_out_of_drawer", "open_drawer", "close_drawer", "basketball_in_hoop", "lamp_on", "lamp_off")  # tasks to exclude from training, useful for zero-shot eval on these tasks.
     cfg.data.keep_open_per_worker = True
-    cfg.data.num_workers = 8
+    cfg.data.num_workers = 16
     cfg.data.pin_memory = True
     cfg.data.persistent_workers = True
 
@@ -150,14 +150,14 @@ def get_config():
     # Opt in with --config.model.encoder_name=traj_perceiver_v2.
     cfg.model.traj_perceiver_v2 = ConfigDict()
     cfg.model.traj_perceiver_v2.d_model = 512
-    cfg.model.traj_perceiver_v2.n_heads = 8
+    cfg.model.traj_perceiver_v2.n_heads = 4
     cfg.model.traj_perceiver_v2.dropout = 0.0
     cfg.model.traj_perceiver_v2.demo_m_frame_tokens = 128
     cfg.model.traj_perceiver_v2.demo_frame_tokenizer_layers = 2
-    cfg.model.traj_perceiver_v2.demo_n_heads = 8
-    cfg.model.traj_perceiver_v2.query_m_frame_tokens = 64
+    cfg.model.traj_perceiver_v2.demo_n_heads = 4
+    cfg.model.traj_perceiver_v2.query_m_frame_tokens = 128
     cfg.model.traj_perceiver_v2.query_frame_tokenizer_layers = 2
-    cfg.model.traj_perceiver_v2.query_n_heads = 8
+    cfg.model.traj_perceiver_v2.query_n_heads = 4
     cfg.model.traj_perceiver_v2.M_demo_latents = 256
     cfg.model.traj_perceiver_v2.demo_perceiver_layers = 3
     cfg.model.traj_perceiver_v2.mask_hash_buckets = 1
@@ -173,14 +173,14 @@ def get_config():
     cfg.model.traj_perceiver_v2.gripper_xyz_state_start = 0
     cfg.model.traj_perceiver_v2.gripper_alpha_init = 1.0
     cfg.model.traj_perceiver_v2.demo_post_self_attn_layers = 1
-    cfg.model.traj_perceiver_v2.query_post_self_attn_layers = 1
+    cfg.model.traj_perceiver_v2.query_post_self_attn_layers = 2
     cfg.model.traj_perceiver_v2.post_self_attn_mlp_mult = 4
     cfg.model.traj_perceiver_v2.checkpoint_demo_memory = False
     cfg.model.traj_perceiver_v2.checkpoint_build_demo_memory = False
     cfg.model.traj_perceiver_v2.checkpoint_frame_tokenizer = False
-    cfg.model.traj_perceiver_v2.tokenize_frames_chunked = False
-    cfg.model.traj_perceiver_v2.chunk_frames = 8
-    cfg.model.traj_perceiver_v2.m_traj_tokens = 16
+    cfg.model.traj_perceiver_v2.tokenize_frames_chunked = True
+    cfg.model.traj_perceiver_v2.chunk_frames = 128
+    cfg.model.traj_perceiver_v2.m_traj_tokens = 32
     cfg.model.traj_perceiver_v2.traj_perceiver_layers = 2
     cfg.model.traj_perceiver_v2.traj_dim = 8
     cfg.model.traj_perceiver_v2.use_demo_id_embed = True
@@ -214,7 +214,7 @@ def get_config():
     cfg.model.traj_conv3d.use_cond_state_as_traj_fallback = False
 
     cfg.train = ConfigDict()
-    cfg.train.num_steps = 100000
+    cfg.train.num_steps = 1000000
     cfg.train.batch_size = 2
     cfg.train.grad_accum_steps = 1
     cfg.train.lr = 1e-4
