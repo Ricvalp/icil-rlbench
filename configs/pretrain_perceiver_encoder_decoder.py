@@ -29,6 +29,10 @@ def get_config():
     cfg.data.num_workers = 16
     cfg.data.pin_memory = True
     cfg.data.persistent_workers = True
+    # Sample tasks with probability proportional to num_variations ** alpha.
+    # alpha=1.0 is the old variation-uniform behavior; alpha=0.0 is task-uniform.
+    cfg.data.task_sampling = "variation_power"
+    cfg.data.task_sampling_alpha = 0.5
 
     cfg.dataset = ConfigDict()
     cfg.dataset.K = 4

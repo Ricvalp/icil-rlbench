@@ -30,6 +30,10 @@ def get_config():
     cfg.data.num_workers = 8
     cfg.data.pin_memory = True
     cfg.data.persistent_workers = True
+    # Sample tasks with probability proportional to num_variations ** alpha.
+    # alpha=1.0 is variation-uniform; alpha=0.0 is task-uniform.
+    cfg.data.task_sampling = 'variation_power'
+    cfg.data.task_sampling_alpha = 0.5
 
     cfg.dataset = ConfigDict()
     cfg.dataset.K = 0  # 0 => infer from pretrained checkpoint as K_pretrain + 1

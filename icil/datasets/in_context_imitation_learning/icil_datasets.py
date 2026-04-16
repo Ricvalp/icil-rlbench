@@ -34,6 +34,8 @@ class ICILConfig:
     T_obs: int
     H: int
     stride: int = 1
+    task_sampling: str = "variation_power"
+    task_sampling_alpha: float = 1.0
 
     def __post_init__(self) -> None:
         for name in ("K", "L", "T_obs", "H", "stride"):
@@ -50,6 +52,12 @@ class ICILConfig:
             raise ValueError("H must be >= 1.")
         if self.stride < 1:
             raise ValueError("stride must be >= 1.")
+        if str(self.task_sampling) not in ("variation_power", "variation_uniform", "task_uniform"):
+            raise ValueError(
+                "task_sampling must be one of: variation_power, variation_uniform, task_uniform."
+            )
+        if float(self.task_sampling_alpha) < 0.0:
+            raise ValueError("task_sampling_alpha must be >= 0.")
 
 
 class ICILSamplerCore:
@@ -74,6 +82,9 @@ class ICILSamplerCore:
         self.seed = seed
         self.num_tries_per_item = num_tries_per_item
         self._iter_counter = 0
+        self._task_sampling_task_names: Optional[List[str]] = None
+        self._task_sampling_vidx_by_task: Optional[List[np.ndarray]] = None
+        self._task_sampling_probs: Optional[np.ndarray] = None
         if self.num_tries_per_item < 1:
             raise ValueError("num_tries_per_item must be >= 1.")
 
@@ -97,12 +108,80 @@ class ICILSamplerCore:
         end = min(start + per_worker, total_batches)
         return start, end
 
+    def _build_task_sampling_index(self) -> bool:
+        if self._task_sampling_probs is not None:
+            return True
+        keys = getattr(self.store, "keys", None)
+        if keys is None:
+            return False
+
+        task_to_vidx: Dict[str, List[int]] = {}
+        for vidx, key in enumerate(keys):
+            task = str(getattr(key, "task", ""))
+            if not task:
+                task = f"vidx:{vidx}"
+            task_to_vidx.setdefault(task, []).append(int(vidx))
+        if not task_to_vidx:
+            return False
+
+        task_names = sorted(task_to_vidx)
+        vidx_by_task = [
+            np.asarray(task_to_vidx[task], dtype=np.int64)
+            for task in task_names
+        ]
+
+        mode = str(self.cfg.task_sampling)
+        alpha = 0.0 if mode == "task_uniform" else float(self.cfg.task_sampling_alpha)
+        counts = np.asarray([len(vidxs) for vidxs in vidx_by_task], dtype=np.float64)
+        weights = np.power(counts, alpha)
+        weight_sum = float(weights.sum())
+        if not np.isfinite(weight_sum) or weight_sum <= 0.0:
+            weights = np.ones_like(counts)
+            weight_sum = float(weights.sum())
+
+        self._task_sampling_task_names = task_names
+        self._task_sampling_vidx_by_task = vidx_by_task
+        self._task_sampling_probs = weights / weight_sum
+        return True
+
+    def task_sampling_probabilities(self) -> Dict[str, float]:
+        if str(self.cfg.task_sampling) == "variation_uniform":
+            keys = getattr(self.store, "keys", None)
+            if keys is None:
+                return {}
+            counts: Dict[str, int] = {}
+            for key in keys:
+                task = str(getattr(key, "task", ""))
+                counts[task] = counts.get(task, 0) + 1
+            total = float(sum(counts.values()))
+            return {task: count / total for task, count in sorted(counts.items()) if total > 0.0}
+
+        if not self._build_task_sampling_index():
+            return {}
+        assert self._task_sampling_task_names is not None
+        assert self._task_sampling_probs is not None
+        return {
+            task: float(prob)
+            for task, prob in zip(self._task_sampling_task_names, self._task_sampling_probs)
+        }
+
     def _sample_vidx(self, rng: np.random.Generator) -> Optional[int]:
         V = len(self.store)
         if V <= 0:
             return None
+        use_task_sampling = (
+            str(self.cfg.task_sampling) != "variation_uniform"
+            and self._build_task_sampling_index()
+        )
         for _ in range(self.num_tries_per_item):
-            vidx = int(rng.integers(0, V))
+            if use_task_sampling:
+                assert self._task_sampling_probs is not None
+                assert self._task_sampling_vidx_by_task is not None
+                task_idx = int(rng.choice(len(self._task_sampling_probs), p=self._task_sampling_probs))
+                task_vidxs = self._task_sampling_vidx_by_task[task_idx]
+                vidx = int(task_vidxs[int(rng.integers(0, len(task_vidxs)))])
+            else:
+                vidx = int(rng.integers(0, V))
             # need at least K+1 episodes available
             eids = self.store.list_episode_ids(vidx)
             if eids.shape[0] >= self.cfg.K + 1:

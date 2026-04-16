@@ -51,7 +51,7 @@ def continuous_sinusoidal_embedding(x: torch.Tensor, dim: int) -> torch.Tensor:
         * torch.arange(0, half, device=x.device, dtype=torch.float32)
         / max(1, half - 1)
     )  # [half]
-    args = x.unsqueeze(-1) * freqs.unsqueeze(0).unsqueeze(0)  # [B,T,half]
+    args = 2.0 * math.pi * x.unsqueeze(-1) * freqs.unsqueeze(0).unsqueeze(0)  # [B,T,half]
     emb = torch.cat([torch.cos(args), torch.sin(args)], dim=-1)  # [B,T,2*half]
     if dim % 2 == 1:
         emb = F.pad(emb, (0, 1))
@@ -69,4 +69,3 @@ class TimeMLP(nn.Module):
 
     def forward(self, t_emb: torch.Tensor) -> torch.Tensor:
         return self.net(t_emb)
-

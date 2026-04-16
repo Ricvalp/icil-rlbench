@@ -108,6 +108,8 @@ def profile_train_ddp(train_cfg: ConfigDict, profile_cfg: ConfigDict) -> Path:
                 T_obs=int(train_cfg.dataset.T_obs),
                 H=int(train_cfg.dataset.H),
                 stride=int(train_cfg.dataset.stride),
+                task_sampling=str(getattr(train_cfg.data, "task_sampling", "variation_power")),
+                task_sampling_alpha=float(getattr(train_cfg.data, "task_sampling_alpha", 1.0)),
             )
 
             train_steps = int(train_cfg.train.num_steps)

@@ -302,6 +302,8 @@ def _resolve_dataset_cfg(
             pretrained_config=pretrained_config,
             transform=int,
         ),
+        task_sampling=str(getattr(cfg.data, 'task_sampling', 'variation_power')),
+        task_sampling_alpha=float(getattr(cfg.data, 'task_sampling_alpha', 1.0)),
     )
 
 

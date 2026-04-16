@@ -692,6 +692,8 @@ def train(cfg: ConfigDict) -> None:
             T_obs=int(cfg.dataset.T_obs),
             H=int(cfg.dataset.H),
             stride=int(cfg.dataset.stride),
+            task_sampling=str(getattr(cfg.data, "task_sampling", "variation_power")),
+            task_sampling_alpha=float(getattr(cfg.data, "task_sampling_alpha", 1.0)),
         )
 
         train_steps = int(cfg.train.num_steps)
