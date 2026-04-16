@@ -35,11 +35,13 @@ from icil.models import (
     Conv3dDemoQueryEncoder,
     ContextEncoderOutput,
     PerceiverDemoQueryEncoder,
+    PerceiverDemoQueryEncoderV2,
     Policy,
     PolicyBuilderConfig,
     PolicyConfig,
     TrajectoryConv3DEncoder,
     TrajectoryPerceiverEncoder,
+    TrajectoryPerceiverEncoderV2,
     build_policy,
 )
 
@@ -108,6 +110,8 @@ def _infer_state_action_dims_from_state_dict(state_dict: Dict[str, torch.Tensor]
     state_dim_key_candidates = (
         "context_encoder.state_proj.0.weight",
         "context_encoder.demo_query_encoder.state_proj.0.weight",
+        "context_encoder.demo_frame_stack.state_proj.0.weight",
+        "context_encoder.demo_query_encoder.demo_frame_stack.state_proj.0.weight",
     )
     state_dim = None
     for key in state_dim_key_candidates:
@@ -154,10 +158,21 @@ def _legacy_flat_model_cfg_to_nested(model_from_ckpt: Dict[str, Any]) -> Dict[st
         "encoder_name": "perceiver_demo_query",
         "policy": {},
         "perceiver_demo_query": {},
+        "perceiver_demo_query_v2": {},
         "traj_perceiver": {},
+        "traj_perceiver_v2": {},
     }
     for k, v in model_from_ckpt.items():
-        if k in ("policy", "perceiver_demo_query", "traj_perceiver", "encoder_name"):
+        if k in (
+            "policy",
+            "conv3d_demo_query",
+            "perceiver_demo_query",
+            "perceiver_demo_query_v2",
+            "traj_conv3d",
+            "traj_perceiver",
+            "traj_perceiver_v2",
+            "encoder_name",
+        ):
             out[k] = v
             continue
         if k in policy_field_names:
@@ -190,10 +205,14 @@ def _conditioning_use_mask_id_from_eval_and_checkpoint(
         return bool(model_cfg.conv3d_demo_query.use_mask_id)
     if str(model_cfg.encoder_name) == "perceiver_demo_query":
         return bool(model_cfg.perceiver_demo_query.use_mask_id)
+    if str(model_cfg.encoder_name) == "perceiver_demo_query_v2":
+        return bool(model_cfg.perceiver_demo_query_v2.use_mask_id)
     if str(model_cfg.encoder_name) == "traj_conv3d":
         return bool(model_cfg.traj_conv3d.use_mask_id)
     if str(model_cfg.encoder_name) == "traj_perceiver":
         return bool(model_cfg.traj_perceiver.use_mask_id)
+    if str(model_cfg.encoder_name) == "traj_perceiver_v2":
+        return bool(model_cfg.traj_perceiver_v2.use_mask_id)
     return _as_bool(getattr(cfg.conditioning, "use_mask_id", True))
 
 
@@ -202,10 +221,14 @@ def _ignore_demos_from_model_cfg(model_cfg: PolicyBuilderConfig) -> bool:
         return bool(model_cfg.conv3d_demo_query.ignore_demos)
     if str(model_cfg.encoder_name) == "perceiver_demo_query":
         return bool(model_cfg.perceiver_demo_query.ignore_demos)
+    if str(model_cfg.encoder_name) == "perceiver_demo_query_v2":
+        return bool(model_cfg.perceiver_demo_query_v2.ignore_demos)
     if str(model_cfg.encoder_name) == "traj_conv3d":
         return bool(model_cfg.traj_conv3d.ignore_demos)
     if str(model_cfg.encoder_name) == "traj_perceiver":
         return bool(model_cfg.traj_perceiver.ignore_demos)
+    if str(model_cfg.encoder_name) == "traj_perceiver_v2":
+        return bool(model_cfg.traj_perceiver_v2.ignore_demos)
     return False
 
 
@@ -780,7 +803,7 @@ class _CachedSupportContextEncoder(nn.Module):
         support = _move_tensor_dict_to_device(support_cond, device)
         enc = self.base_encoder
 
-        if isinstance(enc, (PerceiverDemoQueryEncoder, Conv3dDemoQueryEncoder)):
+        if isinstance(enc, (PerceiverDemoQueryEncoder, PerceiverDemoQueryEncoderV2, Conv3dDemoQueryEncoder)):
             if bool(getattr(enc.cfg, "ignore_demos", False)):
                 self._cached_demo_tokens = None
             else:
@@ -795,7 +818,7 @@ class _CachedSupportContextEncoder(nn.Module):
             self._cache_enabled = True
             return
 
-        if isinstance(enc, (TrajectoryPerceiverEncoder, TrajectoryConv3DEncoder)):
+        if isinstance(enc, (TrajectoryPerceiverEncoder, TrajectoryPerceiverEncoderV2, TrajectoryConv3DEncoder)):
             demo_enc = enc.demo_query_encoder
             if bool(getattr(demo_enc.cfg, "ignore_demos", False)):
                 self._cached_demo_tokens = None
@@ -873,7 +896,7 @@ class _CachedSupportContextEncoder(nn.Module):
         self._check_batch_size(query_xyz)
         enc = self.base_encoder
 
-        if isinstance(enc, (PerceiverDemoQueryEncoder, Conv3dDemoQueryEncoder)):
+        if isinstance(enc, (PerceiverDemoQueryEncoder, PerceiverDemoQueryEncoderV2, Conv3dDemoQueryEncoder)):
             z_query = enc._build_query_tokens(
                 query_xyz,
                 query_state,
@@ -898,7 +921,7 @@ class _CachedSupportContextEncoder(nn.Module):
                 query_token_mask=None,
             )
 
-        if isinstance(enc, (TrajectoryPerceiverEncoder, TrajectoryConv3DEncoder)):
+        if isinstance(enc, (TrajectoryPerceiverEncoder, TrajectoryPerceiverEncoderV2, TrajectoryConv3DEncoder)):
             demo_enc = enc.demo_query_encoder
             z_query = demo_enc._build_query_tokens(
                 query_xyz,
