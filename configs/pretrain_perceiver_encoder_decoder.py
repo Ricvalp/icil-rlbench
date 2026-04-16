@@ -179,7 +179,7 @@ def get_config():
     cfg.model.traj_perceiver_v2.checkpoint_build_demo_memory = False
     cfg.model.traj_perceiver_v2.checkpoint_frame_tokenizer = False
     cfg.model.traj_perceiver_v2.tokenize_frames_chunked = True
-    cfg.model.traj_perceiver_v2.chunk_frames = 128
+    cfg.model.traj_perceiver_v2.chunk_frames = 256
     cfg.model.traj_perceiver_v2.m_traj_tokens = 32
     cfg.model.traj_perceiver_v2.traj_perceiver_layers = 2
     cfg.model.traj_perceiver_v2.traj_dim = 8
