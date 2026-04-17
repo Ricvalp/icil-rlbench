@@ -40,7 +40,7 @@ def sinusoidal_position_embedding(length: int, dim: int, device: torch.device) -
     return emb
 
 
-def continuous_sinusoidal_embedding(x: torch.Tensor, dim: int) -> torch.Tensor:
+def two_pi_continuous_sinusoidal_embedding(x: torch.Tensor, dim: int) -> torch.Tensor:
     """
     x: [B, T] float in [0,1] (or any continuous)
     returns: [B, T, dim]
@@ -58,7 +58,7 @@ def continuous_sinusoidal_embedding(x: torch.Tensor, dim: int) -> torch.Tensor:
     return emb
 
 
-def old_continuous_sinusoidal_embedding(x: torch.Tensor, dim: int) -> torch.Tensor:
+def continuous_sinusoidal_embedding(x: torch.Tensor, dim: int) -> torch.Tensor:
     """
     x: [B, T] float in [0,1] (or any continuous)
     returns: [B, T, dim]
@@ -74,7 +74,6 @@ def old_continuous_sinusoidal_embedding(x: torch.Tensor, dim: int) -> torch.Tens
     if dim % 2 == 1:
         emb = F.pad(emb, (0, 1))
     return emb
-
 
 
 class TimeMLP(nn.Module):
