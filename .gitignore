@@ -7,6 +7,11 @@ inspect_*
 legacy/
 eval_checkpoints/
 
+*.mp4
+raw_episodes_videos/*
+
+get_ckpt
+
 .smanager/
 
 TODO.md

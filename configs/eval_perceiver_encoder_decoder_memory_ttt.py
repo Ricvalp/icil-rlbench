@@ -14,8 +14,8 @@ def get_config():
     cfg.task = ConfigDict()
     cfg.task.name = 'close_drawer'
     cfg.task.variation = 0
-    cfg.task.num_eval_episodes = 50
-    cfg.task.max_env_steps = 220
+    cfg.task.num_eval_episodes = 10
+    cfg.task.max_env_steps = 80
 
     cfg.dataset = ConfigDict()
     cfg.dataset.use_checkpoint_dataset_config = True
@@ -44,12 +44,14 @@ def get_config():
     cfg.memory_ttt.sgd_momentum = 0.0
     cfg.memory_ttt.max_grad_norm = 1.0
     cfg.memory_ttt.num_queries_per_step = 32
+    cfg.memory_ttt.grad_accum_steps = 1  # Split each inner-loop query batch into this many microbatches.
     cfg.memory_ttt.num_inner_batches = 128  # 0 => build inner_steps batches, else reuse min(this, inner_steps).
     cfg.memory_ttt.reuse_diffusion_noise = False
     cfg.memory_ttt.preload_support_batches_to_device = False
     cfg.memory_ttt.holdout_index = -1  # -1 => random support episode holdout.
     cfg.memory_ttt.log_query_loss = True
     cfg.memory_ttt.num_query_loss_samples = 16
+    cfg.memory_ttt.log_query_sample_mse = True  # If True, sample actions on the extra query episode and log MSE to GT.
     cfg.memory_ttt.num_tries_per_item = 100
 
     # Optional: also adapt decoder params. Off by default so the experiment is memory-token-only.

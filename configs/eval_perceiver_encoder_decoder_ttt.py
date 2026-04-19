@@ -52,12 +52,14 @@ def get_config():
     cfg.ttt.include_output_head_fast = False
     cfg.ttt.include_diffusion_conditioning_fast = False
     cfg.ttt.num_loo_per_task = 32
+    cfg.ttt.grad_accum_steps = 1  # Split each inner-loop LOO batch into this many microbatches.
     cfg.ttt.num_support_batches_loo = 128  # 0 => build inner_steps support batches, else reuse min(this, inner_steps).
     cfg.ttt.outer_context_size = 0  # 0 => infer as K_pretrain from checkpoint['config']['dataset']['K']
     cfg.ttt.reuse_diffusion_noise = False
     cfg.ttt.preload_support_batches_to_device = False
     cfg.ttt.log_query_loss = True  # If True, evaluate loss on one extra episode not used for TTT updates.
     cfg.ttt.num_query_loss_samples = 1  # Number of t0 windows averaged for the extra query/eval loss.
+    cfg.ttt.log_query_sample_mse = True  # If True, sample actions on the extra query episode and log MSE to GT.
     cfg.ttt.num_tries_per_item = 100
 
     cfg.sim = ConfigDict()
@@ -74,7 +76,7 @@ def get_config():
     cfg.control.discretize_gripper = True
 
     cfg.inference = ConfigDict()
-    cfg.inference.inference_steps = 100
+    cfg.inference.inference_steps = 10
     cfg.inference.eta = 0.0
 
     cfg.video = ConfigDict()

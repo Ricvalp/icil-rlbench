@@ -11,10 +11,10 @@ def get_config():
     cfg.checkpoint_path = ""
 
     cfg.task = ConfigDict()
-    cfg.task.name = "put_item_in_drawer"
+    cfg.task.name = "open_drawer"
     cfg.task.variation = 0
     cfg.task.num_eval_episodes = 10
-    cfg.task.max_env_steps = 220
+    cfg.task.max_env_steps = 80
 
     cfg.dataset = ConfigDict()
     # If True, these values are read from checkpoint["config"]["dataset"].
@@ -44,7 +44,7 @@ def get_config():
     cfg.sim = ConfigDict()
     cfg.sim.headless = True
     cfg.sim.renderer = "opengl"  # "opengl" | "opengl3"
-    cfg.sim.image_size = (128, 128)
+    cfg.sim.image_size = (256, 256)
     cfg.sim.arm_max_velocity = 1.0
     cfg.sim.arm_max_acceleration = 4.0
     cfg.sim.collision_checking = False

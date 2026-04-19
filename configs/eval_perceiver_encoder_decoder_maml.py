@@ -38,9 +38,13 @@ def get_config():
     cfg.conditioning.num_points = 1024
 
     cfg.maml_eval = ConfigDict()
+    cfg.maml_eval.inner_steps_override = -1  # -1 => use checkpoint; 0 => no fast-param updates.
+    cfg.maml_eval.grad_accum_steps = 1  # Split each inner-loop LOO batch into this many microbatches.
+    cfg.maml_eval.num_support_batches_loo = 128  # 0 => build inner_steps support batches, else reuse min(this, inner_steps).
     cfg.maml_eval.preload_support_batches_to_device = False
-    cfg.maml_eval.log_query_loss = False  # If True, evaluate loss on one extra episode not used for MAML adaptation.
+    cfg.maml_eval.log_query_loss = True  # If True, evaluate loss on one extra episode not used for MAML adaptation.
     cfg.maml_eval.num_query_loss_samples = 1  # Number of t0 windows averaged for the extra query/eval loss.
+    cfg.maml_eval.log_query_sample_mse = True  # If True, sample actions on the extra query episode and log MSE to GT.
     cfg.maml_eval.num_tries_per_item = 100
 
     cfg.sim = ConfigDict()

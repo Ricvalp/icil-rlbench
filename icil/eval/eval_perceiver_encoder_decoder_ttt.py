@@ -11,6 +11,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 import h5py
 import numpy as np
 import torch
+import torch.nn.functional as F
 from absl import app, logging
 from ml_collections import ConfigDict
 from ml_collections.config_flags import config_flags
@@ -689,6 +690,50 @@ def _to_device_batch(batch: Dict[str, Any], device: torch.device) -> Dict[str, A
 
 
 
+def _batch_size_from_target(batch: Dict[str, Any]) -> int:
+    target = batch.get('target_action', None)
+    if not torch.is_tensor(target) or target.ndim < 1:
+        raise ValueError("Batch must contain tensor key 'target_action' with a batch dimension.")
+    return int(target.shape[0])
+
+
+
+def _slice_batch_dim0(batch: Dict[str, Any], start: int, end: int) -> Dict[str, Any]:
+    batch_size = _batch_size_from_target(batch)
+    out: Dict[str, Any] = {}
+    for key, value in batch.items():
+        if torch.is_tensor(value) and value.ndim > 0 and int(value.shape[0]) == batch_size:
+            out[key] = value[start:end]
+        elif isinstance(value, list) and len(value) == batch_size:
+            out[key] = value[start:end]
+        else:
+            out[key] = value
+    return out
+
+
+
+def _iter_microbatches(batch: Dict[str, Any], grad_accum_steps: int) -> Sequence[Tuple[Dict[str, Any], float]]:
+    batch_size = _batch_size_from_target(batch)
+    if batch_size < 1:
+        raise ValueError('Inner-loop support batches must be non-empty.')
+
+    num_chunks = min(max(1, int(grad_accum_steps)), batch_size)
+    if num_chunks == 1:
+        return [(batch, 1.0)]
+
+    microbatches: List[Tuple[Dict[str, Any], float]] = []
+    boundaries = np.linspace(0, batch_size, num_chunks + 1, dtype=np.int64)
+    for chunk_idx in range(num_chunks):
+        start = int(boundaries[chunk_idx])
+        end = int(boundaries[chunk_idx + 1])
+        if start >= end:
+            continue
+        weight = float(end - start) / float(batch_size)
+        microbatches.append((_slice_batch_dim0(batch, start, end), weight))
+    return microbatches
+
+
+
 def _drop_mask_ids_if_disabled(batch: Dict[str, Any], use_mask_id: bool) -> Dict[str, Any]:
     if use_mask_id:
         return batch
@@ -1055,6 +1100,63 @@ def _build_query_batch_at_t0s(
     return batch
 
 
+@torch.no_grad()
+def _sample_actions_from_batch(
+    policy: Policy,
+    batch: Dict[str, Any],
+    *,
+    use_mask_id: bool,
+    inference_steps: int,
+    eta: float,
+) -> torch.Tensor:
+    was_training = policy.training
+    policy.eval()
+    try:
+        return policy.sample_actions(
+            cond_xyz=batch.get('cond_xyz', None),
+            cond_state=batch.get('cond_state', None),
+            cond_traj=batch.get('cond_traj', None),
+            cond_traj_mask=batch.get('cond_traj_mask', None),
+            query_xyz=batch['query_xyz'],
+            query_state=batch['query_state'],
+            action_horizon=int(batch['target_action'].shape[1]),
+            cond_rgb=batch.get('cond_rgb', None),
+            query_rgb=batch.get('query_rgb', None),
+            cond_mask_id=(batch.get('cond_mask_id', None) if use_mask_id else None),
+            query_mask_id=(batch.get('query_mask_id', None) if use_mask_id else None),
+            cond_valid=batch.get('cond_valid', None),
+            query_valid=batch.get('query_valid', None),
+            inference_steps=(int(inference_steps) if int(inference_steps) > 0 else None),
+            eta=float(eta),
+        )
+    finally:
+        if was_training:
+            policy.train()
+
+
+def _query_sample_mse_from_batch(
+    policy: Policy,
+    batch: Dict[str, Any],
+    *,
+    use_mask_id: bool,
+    inference_steps: int,
+    eta: float,
+) -> float:
+    pred = _sample_actions_from_batch(
+        policy,
+        batch,
+        use_mask_id=use_mask_id,
+        inference_steps=int(inference_steps),
+        eta=float(eta),
+    )
+    return float(
+        F.mse_loss(
+            pred.detach().float(),
+            batch['target_action'].detach().float(),
+        ).detach().cpu().item()
+    )
+
+
 
 def _clip_grads_in_list(grads: List[torch.Tensor], max_norm: float) -> List[torch.Tensor]:
     if max_norm <= 0.0:
@@ -1131,18 +1233,21 @@ def _build_cached_ttt_package(
     vidx = _select_support_vidx(store, variation=variation, rng=rng)
     episode_ids = store.list_episode_ids(vidx)
     log_query_loss = _as_bool(getattr(ttt_cfg, 'log_query_loss', False))
-    required_episodes = int(dataset_cfg.K) + (1 if log_query_loss else 0)
+    log_query_sample_mse = _as_bool(getattr(ttt_cfg, 'log_query_sample_mse', False))
+    needs_query_batch = log_query_loss or log_query_sample_mse
+    required_episodes = int(dataset_cfg.K) + (1 if needs_query_batch else 0)
     if episode_ids.shape[0] < required_episodes:
         raise RuntimeError(
             f'Need at least {required_episodes} cached episodes, got {episode_ids.shape[0]} '
             f'for task={store.keys[vidx].task} variation={store.keys[vidx].variation}. '
-            f'TTT support K={dataset_cfg.K}, log_query_loss={log_query_loss}.'
+            f'TTT support K={dataset_cfg.K}, log_query_loss={log_query_loss}, '
+            f'log_query_sample_mse={log_query_sample_mse}.'
         )
 
     chosen_ids_np = rng.choice(episode_ids, size=required_episodes, replace=False)
     chosen_ids = [int(eid) for eid in np.asarray(chosen_ids_np).tolist()]
     support_ids = chosen_ids[: int(dataset_cfg.K)]
-    query_episode_id = int(chosen_ids[int(dataset_cfg.K)]) if log_query_loss else None
+    query_episode_id = int(chosen_ids[int(dataset_cfg.K)]) if needs_query_batch else None
     holdout_indices = _sample_loo_indices(
         len(support_ids),
         num_loo_per_task=int(ttt_cfg.num_loo_per_task),
@@ -1242,7 +1347,7 @@ def _build_cached_ttt_package(
     }
 
     query_batch = None
-    if log_query_loss:
+    if needs_query_batch:
         query_loss_count = int(getattr(ttt_cfg, 'num_query_loss_samples', 1))
         query_loss_count = max(1, query_loss_count)
         query_noise = shared_noise
@@ -1306,14 +1411,26 @@ def _adapt_fast_params_with_stats(
     inner_steps: int,
     inner_lr: float,
     max_grad_norm: float,
+    grad_accum_steps: int = 1,
     query_batch: Optional[Dict[str, Any]] = None,
+    log_query_loss: bool = False,
+    log_query_sample_mse: bool = False,
+    use_mask_id: bool = False,
+    sample_mse_inference_steps: int = 0,
+    sample_mse_eta: float = 0.0,
     progress_desc: str = 'TTT Inner',
 ) -> Tuple[Dict[str, torch.Tensor], Dict[str, Any]]:
+    if int(grad_accum_steps) < 1:
+        raise ValueError(f'grad_accum_steps must be >= 1, got {grad_accum_steps}.')
+    if int(inner_steps) < 0:
+        raise ValueError(f'inner_steps must be >= 0, got {inner_steps}.')
+
     adapted_params = dict(loss_wrapper.named_parameters())
     buffers = dict(loss_wrapper.named_buffers())
     inner_losses: List[float] = []
     inner_grad_norms: List[float] = []
     query_losses: List[float] = []
+    query_sample_mses: List[float] = []
     unused_fast_param_names: List[str] = []
     logged_unused_warning = False
 
@@ -1324,33 +1441,78 @@ def _adapt_fast_params_with_stats(
             loss = functional_call(loss_wrapper, (params, buffers), (query_batch,))
         return float(loss.detach().cpu().item())
 
-    if query_batch is not None:
+    def _eval_query_sample_mse(params: Dict[str, torch.Tensor]) -> float:
+        if query_batch is None:
+            return 0.0
+        copy_fast_params_into_policy(
+            loss_wrapper.policy,
+            adapted_params=params,
+            fast_names=fast_names_wrapped,
+        )
+        return _query_sample_mse_from_batch(
+            loss_wrapper.policy,
+            query_batch,
+            use_mask_id=use_mask_id,
+            inference_steps=int(sample_mse_inference_steps),
+            eta=float(sample_mse_eta),
+        )
+
+    if query_batch is not None and log_query_loss:
         query_losses.append(_eval_query_loss(adapted_params))
+    if query_batch is not None and log_query_sample_mse:
+        query_sample_mses.append(_eval_query_sample_mse(adapted_params))
 
     pbar = None
-    if inner_steps > 0:
+    if int(inner_steps) > 0:
         pbar = tqdm(
-            total=inner_steps,
+            total=int(inner_steps),
             desc=progress_desc,
             leave=True,
             unit='step',
         )
 
     try:
-        if inner_steps > 0 and len(support_batches) < 1:
+        if int(inner_steps) > 0 and len(support_batches) < 1:
             raise ValueError('inner_steps > 0 requires at least one prepared support batch.')
-        for step_idx in range(1, inner_steps + 1):
+        for step_idx in range(1, int(inner_steps) + 1):
             support_batch_cpu = support_batches[(step_idx - 1) % len(support_batches)]
-            support_batch = _to_device_batch(support_batch_cpu, device)
-            support_loss = functional_call(loss_wrapper, (adapted_params, buffers), (support_batch,))
             fast_tensors = [adapted_params[name] for name in fast_names_wrapped]
-            grads = torch.autograd.grad(
-                support_loss,
-                fast_tensors,
-                create_graph=False,
-                retain_graph=False,
-                allow_unused=True,
-            )
+            if int(grad_accum_steps) == 1:
+                support_batch = _to_device_batch(support_batch_cpu, device)
+                support_loss = functional_call(loss_wrapper, (adapted_params, buffers), (support_batch,))
+                grads = torch.autograd.grad(
+                    support_loss,
+                    fast_tensors,
+                    create_graph=False,
+                    retain_graph=False,
+                    allow_unused=True,
+                )
+                loss_value = float(support_loss.detach().cpu().item())
+            else:
+                grads_accum: List[Optional[torch.Tensor]] = [None for _ in fast_tensors]
+                loss_value = 0.0
+                for micro_batch_cpu, weight in _iter_microbatches(
+                    support_batch_cpu,
+                    int(grad_accum_steps),
+                ):
+                    micro_batch = _to_device_batch(micro_batch_cpu, device)
+                    micro_loss = functional_call(loss_wrapper, (adapted_params, buffers), (micro_batch,))
+                    micro_grads = torch.autograd.grad(
+                        micro_loss * float(weight),
+                        fast_tensors,
+                        create_graph=False,
+                        retain_graph=False,
+                        allow_unused=True,
+                    )
+                    loss_value += float(micro_loss.detach().cpu().item()) * float(weight)
+                    for grad_idx, grad in enumerate(micro_grads):
+                        if grad is None:
+                            continue
+                        if grads_accum[grad_idx] is None:
+                            grads_accum[grad_idx] = grad
+                        else:
+                            grads_accum[grad_idx] = grads_accum[grad_idx] + grad
+                grads = tuple(grads_accum)
             if not logged_unused_warning:
                 unused_fast_param_names = [
                     name for name, grad in zip(fast_names_wrapped, grads) if grad is None
@@ -1363,7 +1525,6 @@ def _adapt_fast_params_with_stats(
                         unused_fast_param_names[:8],
                     )
                 logged_unused_warning = True
-            loss_value = float(support_loss.detach().cpu().item())
             inner_losses.append(loss_value)
             inner_grad_norms.append(_grad_list_global_norm(grads))
             grads = _clip_grads_in_list(list(grads), float(max_grad_norm))
@@ -1374,8 +1535,10 @@ def _adapt_fast_params_with_stats(
                     continue
                 new_params[name] = param - float(inner_lr) * grad
             adapted_params = new_params
-            if query_batch is not None:
+            if query_batch is not None and log_query_loss:
                 query_losses.append(_eval_query_loss(adapted_params))
+            if query_batch is not None and log_query_sample_mse:
+                query_sample_mses.append(_eval_query_sample_mse(adapted_params))
 
             if pbar is not None:
                 pbar.update(1)
@@ -1397,6 +1560,11 @@ def _adapt_fast_params_with_stats(
         'query_losses': query_losses,
         'avg_query_loss': float(sum(query_losses) / max(1, len(query_losses))) if query_losses else 0.0,
         'unused_fast_params': unused_fast_param_names,
+        'query_sample_mses': query_sample_mses,
+        'avg_query_sample_mse': float(sum(query_sample_mses) / max(1, len(query_sample_mses)))
+        if query_sample_mses
+        else 0.0,
+        'grad_accum_steps': int(grad_accum_steps),
     }
     return adapted_params, stats
 
@@ -1410,6 +1578,9 @@ def _apply_ttt_adaptation_in_place(
     fast_names: Sequence[str],
     device: torch.device,
     ttt_cfg: ConfigDict,
+    use_mask_id: bool,
+    sample_mse_inference_steps: int,
+    sample_mse_eta: float,
 ) -> Dict[str, Any]:
     policy.load_state_dict(base_state_dict, strict=True)
     policy.to(device)
@@ -1427,6 +1598,12 @@ def _apply_ttt_adaptation_in_place(
             inner_steps=int(ttt_cfg.inner_steps),
             inner_lr=float(ttt_cfg.inner_lr),
             max_grad_norm=float(ttt_cfg.max_grad_norm),
+            grad_accum_steps=int(getattr(ttt_cfg, 'grad_accum_steps', 1)),
+            log_query_loss=_as_bool(getattr(ttt_cfg, 'log_query_loss', False)),
+            log_query_sample_mse=_as_bool(getattr(ttt_cfg, 'log_query_sample_mse', False)),
+            use_mask_id=use_mask_id,
+            sample_mse_inference_steps=int(sample_mse_inference_steps),
+            sample_mse_eta=float(sample_mse_eta),
             progress_desc='TTT Inner GD',
         )
     copy_fast_params_into_policy(
@@ -1455,6 +1632,7 @@ def _save_inner_loss_artifacts(
     *,
     inner_losses: Sequence[float],
     query_losses: Optional[Sequence[float]] = None,
+    query_sample_mses: Optional[Sequence[float]] = None,
     run_dir: Path,
     stem: str,
 ) -> Dict[str, str]:
@@ -1470,6 +1648,9 @@ def _save_inner_loss_artifacts(
     if query_losses is not None and len(query_losses) > 0:
         payload['query_inner_step'] = list(range(0, len(query_losses)))
         payload['query_loss'] = [float(v) for v in query_losses]
+    if query_sample_mses is not None and len(query_sample_mses) > 0:
+        payload['query_sample_mse_inner_step'] = list(range(0, len(query_sample_mses)))
+        payload['query_sample_mse'] = [float(v) for v in query_sample_mses]
 
     with losses_path.open('w', encoding='utf-8') as f:
         json.dump(payload, f, indent=2)
@@ -1514,9 +1695,40 @@ def _save_inner_loss_artifacts(
         logging.warning('Failed to save TTT inner-loss plot to %s: %s', plot_path, exc)
         plot_path = None
 
+    sample_mse_plot_path = None
+    if query_sample_mses is not None and len(query_sample_mses) > 0:
+        sample_mse_plot_path = run_dir / f'{stem}.query_sample_mse.png'
+        try:
+            import matplotlib.pyplot as plt
+
+            xs_mse = np.arange(0, len(query_sample_mses), dtype=np.int64)
+            ys_mse = np.asarray(query_sample_mses, dtype=np.float64)
+            fig, ax = plt.subplots(figsize=(6.0, 4.0))
+            ax.plot(xs_mse, ys_mse, marker='o', linewidth=1.5, label='held-out query sample MSE')
+            ax.set_xlabel('Inner Step')
+            ax.set_ylabel('Sampled Action MSE')
+            ax.set_yscale('log')
+            ax.set_title('TTT Held-Out Query Sample MSE')
+            ax.grid(True, which='both', alpha=0.3)
+            max_x = int(len(query_sample_mses) - 1)
+            if max_x > 0:
+                max_xticks = min(8, max_x + 1)
+                xticks = np.unique(np.linspace(0, max_x, num=max_xticks, dtype=np.int64))
+                ax.set_xticks(xticks.tolist())
+            else:
+                ax.set_xticks([0])
+            ax.legend()
+            fig.tight_layout()
+            fig.savefig(sample_mse_plot_path, dpi=160)
+            plt.close(fig)
+        except Exception as exc:  # pragma: no cover - optional plotting dependency/runtime
+            logging.warning('Failed to save TTT query sample-MSE plot to %s: %s', sample_mse_plot_path, exc)
+            sample_mse_plot_path = None
+
     return {
         'inner_loss_json_path': str(losses_path),
         'inner_loss_plot_path': str(plot_path) if plot_path is not None else '',
+        'query_sample_mse_plot_path': str(sample_mse_plot_path) if sample_mse_plot_path is not None else '',
     }
 
 
@@ -1772,6 +1984,9 @@ def evaluate(cfg: ConfigDict) -> None:
 
     fast_names = _select_ttt_fast_param_names(model, cfg.ttt)
     fast_param_count = _count_params_by_name(model, fast_names)
+    grad_accum_steps = int(getattr(cfg.ttt, 'grad_accum_steps', 1))
+    if grad_accum_steps < 1:
+        raise ValueError(f'cfg.ttt.grad_accum_steps must be >= 1, got {grad_accum_steps}.')
 
     if action_dim != 8:
         raise ValueError(
@@ -1799,6 +2014,7 @@ def evaluate(cfg: ConfigDict) -> None:
     resolved_payload['dataset']['H'] = int(dataset_cfg.H)
     resolved_payload['dataset']['stride'] = int(dataset_cfg.stride)
     resolved_payload['ttt']['outer_context_size'] = int(resolved_outer_context_size)
+    resolved_payload['ttt']['grad_accum_steps'] = int(grad_accum_steps)
     resolved_payload['resolved'] = {
         'checkpoint_path': str(checkpoint_path),
         'run_name': run_name,
@@ -1830,18 +2046,21 @@ def evaluate(cfg: ConfigDict) -> None:
     )
     logging.info(
         'TTT cfg: inner_steps=%d | inner_lr=%.3e | max_grad_norm=%.3f | outer_context_size=%d | '
-        'num_loo_per_task=%d | num_support_batches_loo=%d | reuse_diffusion_noise=%s | '
-        'preload_support_batches_to_device=%s | log_query_loss=%s | num_query_loss_samples=%d',
+        'num_loo_per_task=%d | grad_accum_steps=%d | num_support_batches_loo=%d | reuse_diffusion_noise=%s | '
+        'preload_support_batches_to_device=%s | log_query_loss=%s | num_query_loss_samples=%d | '
+        'log_query_sample_mse=%s',
         int(cfg.ttt.inner_steps),
         float(cfg.ttt.inner_lr),
         float(cfg.ttt.max_grad_norm),
         int(resolved_outer_context_size),
         int(cfg.ttt.num_loo_per_task),
+        int(grad_accum_steps),
         int(_resolve_num_support_batches_loo(cfg.ttt)),
         str(_as_bool(cfg.ttt.reuse_diffusion_noise)),
         str(_as_bool(getattr(cfg.ttt, 'preload_support_batches_to_device', False))),
         str(_as_bool(getattr(cfg.ttt, 'log_query_loss', False))),
         int(getattr(cfg.ttt, 'num_query_loss_samples', 1)),
+        str(_as_bool(getattr(cfg.ttt, 'log_query_sample_mse', False))),
     )
     logging.info(
         'TTT fast params: tensors=%d | params=%s | examples=%s',
@@ -1917,6 +2136,7 @@ def evaluate(cfg: ConfigDict) -> None:
                         {
                             'inner_steps': int(cfg.ttt.inner_steps),
                             'num_loo_per_task': int(cfg.ttt.num_loo_per_task),
+                            'grad_accum_steps': int(grad_accum_steps),
                             'num_support_batches_loo': int(_resolve_num_support_batches_loo(cfg.ttt)),
                             'outer_context_size': int(resolved_outer_context_size),
                             'reuse_diffusion_noise': _as_bool(cfg.ttt.reuse_diffusion_noise),
@@ -1925,6 +2145,7 @@ def evaluate(cfg: ConfigDict) -> None:
                             ),
                             'log_query_loss': _as_bool(getattr(cfg.ttt, 'log_query_loss', False)),
                             'num_query_loss_samples': int(getattr(cfg.ttt, 'num_query_loss_samples', 1)),
+                            'log_query_sample_mse': _as_bool(getattr(cfg.ttt, 'log_query_sample_mse', False)),
                         }
                     ),
                 )
@@ -1935,21 +2156,25 @@ def evaluate(cfg: ConfigDict) -> None:
                     fast_names=fast_names,
                     device=device,
                     ttt_cfg=cfg.ttt,
+                    use_mask_id=use_mask_id,
+                    sample_mse_inference_steps=int(cfg.inference.inference_steps),
+                    sample_mse_eta=float(cfg.inference.eta),
                 )
                 current_ttt_stats.update(
                     _save_inner_loss_artifacts(
                         inner_losses=current_ttt_stats.get('inner_losses', []),
                         query_losses=current_ttt_stats.get('query_losses', None),
+                        query_sample_mses=current_ttt_stats.get('query_sample_mses', None),
                         run_dir=run_dir,
                         stem=f'ttt_episode_{ep:04d}',
                     )
                 )
                 model.eval()
-                if current_ttt_stats.get('query_losses', None):
+                if current_ttt_stats.get('query_losses', None) or current_ttt_stats.get('query_sample_mses', None):
                     logging.info(
                         'TTT adaptation ready for episode %d | support_episodes=%s | rollout_context=%s | '
                         'query_episode=%s | holdout_indices=%s | support_batches=%d | avg_inner_loss=%.6f | '
-                        'avg_query_loss=%.6f | avg_inner_grad_norm=%.6f',
+                        'avg_query_loss=%.6f | avg_query_sample_mse=%.6f | avg_inner_grad_norm=%.6f',
                         ep,
                         current_ttt_stats['support_ids'],
                         current_ttt_stats['rollout_support_ids'],
@@ -1958,6 +2183,7 @@ def evaluate(cfg: ConfigDict) -> None:
                         int(current_ttt_stats.get('num_support_batches', 0)),
                         float(current_ttt_stats['avg_inner_loss']),
                         float(current_ttt_stats['avg_query_loss']),
+                        float(current_ttt_stats.get('avg_query_sample_mse', 0.0)),
                         float(current_ttt_stats['avg_inner_grad_norm']),
                     )
                 else:
@@ -2029,6 +2255,7 @@ def evaluate(cfg: ConfigDict) -> None:
                 'inner_lr': float(cfg.ttt.inner_lr),
                 'max_grad_norm': float(cfg.ttt.max_grad_norm),
                 'num_loo_per_task': int(cfg.ttt.num_loo_per_task),
+                'grad_accum_steps': int(grad_accum_steps),
                 'num_support_batches_loo': int(_resolve_num_support_batches_loo(cfg.ttt)),
                 'reuse_diffusion_noise': _as_bool(cfg.ttt.reuse_diffusion_noise),
                 'preload_support_batches_to_device': _as_bool(
@@ -2036,6 +2263,7 @@ def evaluate(cfg: ConfigDict) -> None:
                 ),
                 'log_query_loss': _as_bool(getattr(cfg.ttt, 'log_query_loss', False)),
                 'num_query_loss_samples': int(getattr(cfg.ttt, 'num_query_loss_samples', 1)),
+                'log_query_sample_mse': _as_bool(getattr(cfg.ttt, 'log_query_sample_mse', False)),
             },
             'results': results,
         }

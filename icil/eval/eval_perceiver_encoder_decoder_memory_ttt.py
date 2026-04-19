@@ -676,6 +676,50 @@ def _to_device_batch(batch: Dict[str, Any], device: torch.device) -> Dict[str, A
 
 
 
+def _batch_size_from_target(batch: Dict[str, Any]) -> int:
+    target = batch.get('target_action', None)
+    if not torch.is_tensor(target) or target.ndim < 1:
+        raise ValueError("Batch must contain tensor key 'target_action' with a batch dimension.")
+    return int(target.shape[0])
+
+
+
+def _slice_batch_dim0(batch: Dict[str, Any], start: int, end: int) -> Dict[str, Any]:
+    batch_size = _batch_size_from_target(batch)
+    out: Dict[str, Any] = {}
+    for key, value in batch.items():
+        if torch.is_tensor(value) and value.ndim > 0 and int(value.shape[0]) == batch_size:
+            out[key] = value[start:end]
+        elif isinstance(value, list) and len(value) == batch_size:
+            out[key] = value[start:end]
+        else:
+            out[key] = value
+    return out
+
+
+
+def _iter_microbatches(batch: Dict[str, Any], grad_accum_steps: int) -> Sequence[Tuple[Dict[str, Any], float]]:
+    batch_size = _batch_size_from_target(batch)
+    if batch_size < 1:
+        raise ValueError('Memory TTT inner-loop batches must be non-empty.')
+
+    num_chunks = min(max(1, int(grad_accum_steps)), batch_size)
+    if num_chunks == 1:
+        return [(batch, 1.0)]
+
+    microbatches: List[Tuple[Dict[str, Any], float]] = []
+    boundaries = np.linspace(0, batch_size, num_chunks + 1, dtype=np.int64)
+    for chunk_idx in range(num_chunks):
+        start = int(boundaries[chunk_idx])
+        end = int(boundaries[chunk_idx + 1])
+        if start >= end:
+            continue
+        weight = float(end - start) / float(batch_size)
+        microbatches.append((_slice_batch_dim0(batch, start, end), weight))
+    return microbatches
+
+
+
 def _drop_mask_ids_if_disabled(batch: Dict[str, Any], use_mask_id: bool) -> Dict[str, Any]:
     if use_mask_id:
         return batch
@@ -825,6 +869,85 @@ def _detach_optional_tensor(x: Optional[torch.Tensor]) -> Optional[torch.Tensor]
     return x.detach() if torch.is_tensor(x) else None
 
 
+def _infer_num_support_demos_from_batch(batch: Dict[str, Any]) -> Optional[int]:
+    for key in ('cond_xyz', 'cond_state', 'cond_traj'):
+        value = batch.get(key, None)
+        if torch.is_tensor(value) and value.ndim >= 2:
+            return int(value.shape[1])
+    return None
+
+
+def _traj_support_token_count(
+    policy: Policy,
+    support_tokens: Optional[torch.Tensor],
+    *,
+    num_support_demos: Optional[int],
+) -> int:
+    if support_tokens is None or num_support_demos is None or int(num_support_demos) <= 0:
+        return 0
+
+    context_encoder = getattr(policy.context_encoder, 'base_encoder', policy.context_encoder)
+    cfg = getattr(context_encoder, 'cfg', None)
+    if cfg is None or not hasattr(cfg, 'm_traj_tokens'):
+        return 0
+    if not _as_bool(getattr(cfg, 'include_traj_tokens', True)):
+        return 0
+
+    count = int(num_support_demos) * int(getattr(cfg, 'm_traj_tokens'))
+    if count <= 0 or count > int(support_tokens.shape[1]):
+        return 0
+    return count
+
+
+def _single_context_from_memory_tokens(
+    policy: Policy,
+    *,
+    support_tokens: Optional[torch.Tensor],
+    support_mask: Optional[torch.Tensor],
+    query_tokens: torch.Tensor,
+    query_mask: Optional[torch.Tensor],
+    num_support_demos: Optional[int],
+) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+    traj_count = _traj_support_token_count(
+        policy,
+        support_tokens,
+        num_support_demos=num_support_demos,
+    )
+    if traj_count <= 0 or support_tokens is None:
+        return policy._concat_token_groups(
+            support_tokens,
+            support_mask,
+            query_tokens,
+            query_mask,
+        )
+
+    # Trajectory encoders produce full single-context tokens as [demo, query, traj].
+    # Memory-TTT optimizes support_tokens=[demo, traj], so split the trajectory suffix
+    # and reinsert query tokens before it.
+    demo_count = int(support_tokens.shape[1]) - int(traj_count)
+    demo_tokens = support_tokens[:, :demo_count] if demo_count > 0 else None
+    traj_tokens = support_tokens[:, demo_count:]
+
+    demo_mask = None
+    traj_mask = None
+    if support_mask is not None:
+        demo_mask = support_mask[:, :demo_count] if demo_count > 0 else None
+        traj_mask = support_mask[:, demo_count:]
+
+    ctx_tokens, ctx_mask = policy._concat_token_groups(
+        demo_tokens,
+        demo_mask,
+        query_tokens,
+        query_mask,
+    )
+    return policy._concat_token_groups(
+        ctx_tokens,
+        ctx_mask,
+        traj_tokens,
+        traj_mask,
+    )
+
+
 def _encode_context_no_grad(policy: Policy, batch: Dict[str, torch.Tensor]) -> Any:
     with torch.no_grad():
         ctx_out = policy.context_encoder(
@@ -943,6 +1066,7 @@ def _predict_model_output_from_tokens(
     query_mask: Optional[torch.Tensor],
     support_tokens: Optional[torch.Tensor],
     support_mask: Optional[torch.Tensor],
+    num_support_demos: Optional[int] = None,
 ) -> torch.Tensor:
     B, H, _ = x_t.shape
     d = int(policy.cfg.d_model)
@@ -967,11 +1091,13 @@ def _predict_model_output_from_tokens(
     use_dit_ckpt = bool(policy.training and policy.cfg.grad_checkpoint_dit and torch.is_grad_enabled())
 
     if str(policy.context_attention_mode) == 'single':
-        ctx_tokens, ctx_mask = policy._concat_token_groups(
-            support_tokens,
-            support_mask,
-            query_tokens,
-            query_mask,
+        ctx_tokens, ctx_mask = _single_context_from_memory_tokens(
+            policy,
+            support_tokens=support_tokens,
+            support_mask=support_mask,
+            query_tokens=query_tokens,
+            query_mask=query_mask,
+            num_support_demos=num_support_demos,
         )
         if ctx_tokens is None:
             raise RuntimeError('Memory TTT single-context decoder received no context tokens.')
@@ -1021,9 +1147,51 @@ def _memory_diffusion_loss(
         query_mask=query_mask,
         support_tokens=memory_tokens,
         support_mask=memory_token_mask,
+        num_support_demos=_infer_num_support_demos_from_batch(batch_dev),
     )
     target = _diffusion_training_target(policy, x0=x0, noise=noise, t=t)
     return F.mse_loss(model_out, target)
+
+
+def _query_sample_mse_with_memory_tokens(
+    policy: Policy,
+    batch: Dict[str, Any],
+    *,
+    memory_tokens: torch.Tensor,
+    memory_token_mask: Optional[torch.Tensor],
+    device: torch.device,
+    use_mask_id: bool,
+    inference_steps: int,
+    eta: float,
+) -> float:
+    batch_dev = _to_device_batch(batch, device)
+    with torch.no_grad():
+        pred = _sample_actions_with_memory_tokens(
+            policy,
+            adapted_support_tokens=memory_tokens,
+            adapted_support_token_mask=memory_token_mask,
+            cond_xyz=batch_dev.get('cond_xyz', None),
+            cond_state=batch_dev.get('cond_state', None),
+            cond_traj=batch_dev.get('cond_traj', None),
+            cond_traj_mask=batch_dev.get('cond_traj_mask', None),
+            query_xyz=batch_dev['query_xyz'],
+            query_state=batch_dev['query_state'],
+            action_horizon=int(batch_dev['target_action'].shape[1]),
+            cond_rgb=batch_dev.get('cond_rgb', None),
+            query_rgb=batch_dev.get('query_rgb', None),
+            cond_mask_id=(batch_dev.get('cond_mask_id', None) if use_mask_id else None),
+            query_mask_id=(batch_dev.get('query_mask_id', None) if use_mask_id else None),
+            cond_valid=batch_dev.get('cond_valid', None),
+            query_valid=batch_dev.get('query_valid', None),
+            inference_steps=(int(inference_steps) if int(inference_steps) > 0 else None),
+            eta=float(eta),
+        )
+    return float(
+        F.mse_loss(
+            pred.detach().float(),
+            batch_dev['target_action'].detach().float(),
+        ).detach().cpu().item()
+    )
 
 
 def _grad_global_norm(params: Sequence[torch.Tensor]) -> float:
@@ -1216,18 +1384,21 @@ def _build_cached_memory_ttt_package(
     vidx = _select_support_vidx(store, variation=variation, rng=rng)
     episode_ids = store.list_episode_ids(vidx)
     log_query_loss = _as_bool(getattr(memory_cfg, 'log_query_loss', False))
-    required_episodes = int(dataset_cfg.K) + (1 if log_query_loss else 0)
+    log_query_sample_mse = _as_bool(getattr(memory_cfg, 'log_query_sample_mse', False))
+    needs_query_batch = log_query_loss or log_query_sample_mse
+    required_episodes = int(dataset_cfg.K) + (1 if needs_query_batch else 0)
     if episode_ids.shape[0] < required_episodes:
         raise RuntimeError(
             f'Need at least {required_episodes} cached episodes, got {episode_ids.shape[0]} '
             f'for task={store.keys[vidx].task} variation={store.keys[vidx].variation}. '
-            f'Memory TTT support K={dataset_cfg.K}, log_query_loss={log_query_loss}.'
+            f'Memory TTT support K={dataset_cfg.K}, log_query_loss={log_query_loss}, '
+            f'log_query_sample_mse={log_query_sample_mse}.'
         )
 
     chosen_ids_np = rng.choice(episode_ids, size=required_episodes, replace=False)
     chosen_ids = [int(eid) for eid in np.asarray(chosen_ids_np).tolist()]
     support_ids = chosen_ids[: int(dataset_cfg.K)]
-    extra_query_episode_id = int(chosen_ids[int(dataset_cfg.K)]) if log_query_loss else None
+    extra_query_episode_id = int(chosen_ids[int(dataset_cfg.K)]) if needs_query_batch else None
 
     holdout_index = _select_memory_holdout_index(len(support_ids), memory_cfg, rng)
     heldout_episode_id = int(support_ids[holdout_index])
@@ -1331,7 +1502,7 @@ def _build_cached_memory_ttt_package(
             prepare_pbar.close()
 
     query_batch = None
-    if log_query_loss and extra_query_episode_id is not None:
+    if needs_query_batch and extra_query_episode_id is not None:
         query_loss_count = int(getattr(memory_cfg, 'num_query_loss_samples', num_queries_per_step))
         query_loss_count = max(1, query_loss_count)
         query_batch = _build_memory_query_batch(
@@ -1388,6 +1559,9 @@ def _apply_memory_ttt_adaptation_in_place(
     decoder_param_names: Sequence[str],
     device: torch.device,
     memory_cfg: ConfigDict,
+    use_mask_id: bool,
+    sample_mse_inference_steps: int,
+    sample_mse_eta: float,
 ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
     policy.load_state_dict(base_state_dict, strict=True)
     policy.to(device)
@@ -1433,8 +1607,14 @@ def _apply_memory_ttt_adaptation_in_place(
         inner_losses: List[float] = []
         inner_grad_norms: List[float] = []
         query_losses: List[float] = []
+        query_sample_mses: List[float] = []
         memory_norms: List[float] = []
         memory_delta_norms: List[float] = []
+        log_query_loss = _as_bool(getattr(memory_cfg, 'log_query_loss', False))
+        log_query_sample_mse = _as_bool(getattr(memory_cfg, 'log_query_sample_mse', False))
+        grad_accum_steps = int(getattr(memory_cfg, 'grad_accum_steps', 1))
+        if grad_accum_steps < 1:
+            raise ValueError(f'cfg.memory_ttt.grad_accum_steps must be >= 1, got {grad_accum_steps}.')
 
         def _append_memory_stats() -> None:
             memory_detached = memory_tokens.detach()
@@ -1455,9 +1635,26 @@ def _apply_memory_ttt_adaptation_in_place(
                 )
             return float(loss.detach().cpu().item())
 
+        def _eval_query_sample_mse() -> float:
+            query_batch = support_package.get('query_batch', None)
+            if query_batch is None:
+                return 0.0
+            return _query_sample_mse_with_memory_tokens(
+                policy,
+                query_batch,
+                memory_tokens=memory_tokens,
+                memory_token_mask=memory_token_mask,
+                device=device,
+                use_mask_id=use_mask_id,
+                inference_steps=int(sample_mse_inference_steps),
+                eta=float(sample_mse_eta),
+            )
+
         _append_memory_stats()
-        if support_package.get('query_batch', None) is not None:
+        if support_package.get('query_batch', None) is not None and log_query_loss:
             query_losses.append(_eval_query_loss())
+        if support_package.get('query_batch', None) is not None and log_query_sample_mse:
+            query_sample_mses.append(_eval_query_sample_mse())
 
         inner_batches = list(support_package.get('inner_batches', []))
         if inner_steps > 0 and len(inner_batches) < 1:
@@ -1475,26 +1672,41 @@ def _apply_memory_ttt_adaptation_in_place(
             for step_idx in range(1, inner_steps + 1):
                 inner_batch = inner_batches[(step_idx - 1) % len(inner_batches)]
                 optimizer.zero_grad(set_to_none=True)
-                loss = _memory_diffusion_loss(
-                    policy,
-                    inner_batch,
-                    memory_tokens=memory_tokens,
-                    memory_token_mask=memory_token_mask,
-                    device=device,
-                )
-                loss.backward()
+                if grad_accum_steps == 1:
+                    loss = _memory_diffusion_loss(
+                        policy,
+                        inner_batch,
+                        memory_tokens=memory_tokens,
+                        memory_token_mask=memory_token_mask,
+                        device=device,
+                    )
+                    loss.backward()
+                    loss_value = float(loss.detach().cpu().item())
+                else:
+                    loss_value = 0.0
+                    for micro_batch, weight in _iter_microbatches(inner_batch, grad_accum_steps):
+                        micro_loss = _memory_diffusion_loss(
+                            policy,
+                            micro_batch,
+                            memory_tokens=memory_tokens,
+                            memory_token_mask=memory_token_mask,
+                            device=device,
+                        )
+                        (micro_loss * float(weight)).backward()
+                        loss_value += float(micro_loss.detach().cpu().item()) * float(weight)
                 grad_norm = _grad_global_norm(optim_params)
                 max_grad_norm = float(getattr(memory_cfg, 'max_grad_norm', 0.0))
                 if max_grad_norm > 0.0:
                     torch.nn.utils.clip_grad_norm_(optim_params, max_grad_norm)
                 optimizer.step()
 
-                loss_value = float(loss.detach().cpu().item())
                 inner_losses.append(loss_value)
                 inner_grad_norms.append(float(grad_norm))
                 _append_memory_stats()
-                if support_package.get('query_batch', None) is not None:
+                if support_package.get('query_batch', None) is not None and log_query_loss:
                     query_losses.append(_eval_query_loss())
+                if support_package.get('query_batch', None) is not None and log_query_sample_mse:
+                    query_sample_mses.append(_eval_query_sample_mse())
 
                 if pbar is not None:
                     pbar.update(1)
@@ -1517,6 +1729,10 @@ def _apply_memory_ttt_adaptation_in_place(
             else 0.0,
             'query_losses': query_losses,
             'avg_query_loss': float(sum(query_losses) / max(1, len(query_losses))) if query_losses else 0.0,
+            'query_sample_mses': query_sample_mses,
+            'avg_query_sample_mse': float(sum(query_sample_mses) / max(1, len(query_sample_mses)))
+            if query_sample_mses
+            else 0.0,
             'memory_norms': memory_norms,
             'memory_delta_norms': memory_delta_norms,
             'memory_token_shape': list(final_memory.shape),
@@ -1526,6 +1742,7 @@ def _apply_memory_ttt_adaptation_in_place(
             'final_memory_delta_norm': float((final_memory - initial_memory).norm().cpu().item()),
             'decoder_param_tensors': int(len(decoder_param_names)),
             'decoder_param_count': int(sum(int(param.numel()) for param in decoder_params)),
+            'grad_accum_steps': int(grad_accum_steps),
             'support_ids': list(support_package['support_ids']),
             'memory_support_ids': list(support_package['memory_support_ids']),
             'heldout_episode_id': int(support_package['heldout_episode_id']),
@@ -1544,6 +1761,7 @@ def _save_inner_loss_artifacts(
     *,
     inner_losses: Sequence[float],
     query_losses: Optional[Sequence[float]] = None,
+    query_sample_mses: Optional[Sequence[float]] = None,
     run_dir: Path,
     stem: str,
 ) -> Dict[str, str]:
@@ -1559,6 +1777,9 @@ def _save_inner_loss_artifacts(
     if query_losses is not None and len(query_losses) > 0:
         payload['query_inner_step'] = list(range(0, len(query_losses)))
         payload['query_loss'] = [float(v) for v in query_losses]
+    if query_sample_mses is not None and len(query_sample_mses) > 0:
+        payload['query_sample_mse_inner_step'] = list(range(0, len(query_sample_mses)))
+        payload['query_sample_mse'] = [float(v) for v in query_sample_mses]
 
     with losses_path.open('w', encoding='utf-8') as f:
         json.dump(payload, f, indent=2)
@@ -1603,9 +1824,40 @@ def _save_inner_loss_artifacts(
         logging.warning('Failed to save memory TTT inner-loss plot to %s: %s', plot_path, exc)
         plot_path = None
 
+    sample_mse_plot_path = None
+    if query_sample_mses is not None and len(query_sample_mses) > 0:
+        sample_mse_plot_path = run_dir / f'{stem}.query_sample_mse.png'
+        try:
+            import matplotlib.pyplot as plt
+
+            xs_mse = np.arange(0, len(query_sample_mses), dtype=np.int64)
+            ys_mse = np.asarray(query_sample_mses, dtype=np.float64)
+            fig, ax = plt.subplots(figsize=(6.0, 4.0))
+            ax.plot(xs_mse, ys_mse, marker='o', linewidth=1.5, label='extra query sample MSE')
+            ax.set_xlabel('Inner Step')
+            ax.set_ylabel('Sampled Action MSE')
+            ax.set_yscale('log')
+            ax.set_title('Memory TTT Extra Query Sample MSE')
+            ax.grid(True, which='both', alpha=0.3)
+            max_x = int(len(query_sample_mses) - 1)
+            if max_x > 0:
+                max_xticks = min(8, max_x + 1)
+                xticks = np.unique(np.linspace(0, max_x, num=max_xticks, dtype=np.int64))
+                ax.set_xticks(xticks.tolist())
+            else:
+                ax.set_xticks([0])
+            ax.legend()
+            fig.tight_layout()
+            fig.savefig(sample_mse_plot_path, dpi=160)
+            plt.close(fig)
+        except Exception as exc:  # pragma: no cover - optional plotting dependency/runtime
+            logging.warning('Failed to save memory TTT query sample-MSE plot to %s: %s', sample_mse_plot_path, exc)
+            sample_mse_plot_path = None
+
     return {
         'inner_loss_json_path': str(losses_path),
         'inner_loss_plot_path': str(plot_path) if plot_path is not None else '',
+        'query_sample_mse_plot_path': str(sample_mse_plot_path) if sample_mse_plot_path is not None else '',
     }
 
 
@@ -1760,6 +2012,7 @@ def _sample_actions_with_memory_tokens(
             query_mask=query_mask,
             support_tokens=support_tokens,
             support_mask=support_mask,
+            num_support_demos=_infer_num_support_demos_from_batch(query_batch),
         )
         step_kwargs: Dict[str, Any] = {}
         if 'eta' in step_sig:
@@ -1987,6 +2240,9 @@ def evaluate(cfg: ConfigDict) -> None:
 
     decoder_param_names = _select_memory_decoder_param_names(model, memory_cfg)
     decoder_param_count = _param_count_by_names(model, decoder_param_names)
+    grad_accum_steps = int(getattr(memory_cfg, 'grad_accum_steps', 1))
+    if grad_accum_steps < 1:
+        raise ValueError(f'cfg.memory_ttt.grad_accum_steps must be >= 1, got {grad_accum_steps}.')
 
     if action_dim != 8:
         raise ValueError(
@@ -2013,6 +2269,7 @@ def evaluate(cfg: ConfigDict) -> None:
     resolved_payload['dataset']['T_obs'] = int(dataset_cfg.T_obs)
     resolved_payload['dataset']['H'] = int(dataset_cfg.H)
     resolved_payload['dataset']['stride'] = int(dataset_cfg.stride)
+    resolved_payload['memory_ttt']['grad_accum_steps'] = int(grad_accum_steps)
     resolved_payload['resolved'] = {
         'checkpoint_path': str(checkpoint_path),
         'run_name': run_name,
@@ -2044,19 +2301,23 @@ def evaluate(cfg: ConfigDict) -> None:
     )
     logging.info(
         'Memory TTT cfg: inner_steps=%d | inner_lr=%.3e | optimizer=%s | max_grad_norm=%.3f | '
-        'num_queries_per_step=%d | num_inner_batches=%d | reuse_diffusion_noise=%s | '
-        'optimize_decoder=%s | decoder_params=%d | preload_batches=%s | log_query_loss=%s',
+        'num_queries_per_step=%d | grad_accum_steps=%d | num_inner_batches=%d | reuse_diffusion_noise=%s | '
+        'optimize_decoder=%s | decoder_params=%d | preload_batches=%s | log_query_loss=%s | '
+        'num_query_loss_samples=%d | log_query_sample_mse=%s',
         int(memory_cfg.inner_steps),
         float(memory_cfg.inner_lr),
         _memory_optimizer_name(memory_cfg),
         float(memory_cfg.max_grad_norm),
         int(memory_cfg.num_queries_per_step),
+        int(grad_accum_steps),
         int(_resolve_num_memory_inner_batches(memory_cfg)),
         str(_as_bool(memory_cfg.reuse_diffusion_noise)),
         str(_as_bool(memory_cfg.optimize_decoder)),
         len(decoder_param_names),
         str(_as_bool(getattr(memory_cfg, 'preload_support_batches_to_device', False))),
         str(_as_bool(getattr(memory_cfg, 'log_query_loss', False))),
+        int(getattr(memory_cfg, 'num_query_loss_samples', memory_cfg.num_queries_per_step)),
+        str(_as_bool(getattr(memory_cfg, 'log_query_sample_mse', False))),
     )
     logging.info(
         'Memory TTT decoder params: tensors=%d | params=%s | examples=%s',
@@ -2138,21 +2399,26 @@ def evaluate(cfg: ConfigDict) -> None:
                     decoder_param_names=decoder_param_names,
                     device=device,
                     memory_cfg=memory_cfg,
+                    use_mask_id=use_mask_id,
+                    sample_mse_inference_steps=int(cfg.inference.inference_steps),
+                    sample_mse_eta=float(cfg.inference.eta),
                 )
                 current_memory_stats.update(
                     _save_inner_loss_artifacts(
                         inner_losses=current_memory_stats.get('inner_losses', []),
                         query_losses=current_memory_stats.get('query_losses', None),
+                        query_sample_mses=current_memory_stats.get('query_sample_mses', None),
                         run_dir=run_dir,
                         stem=f'memory_ttt_episode_{ep:04d}',
                     )
                 )
                 model.eval()
-                if current_memory_stats.get('query_losses', None):
+                if current_memory_stats.get('query_losses', None) or current_memory_stats.get('query_sample_mses', None):
                     logging.info(
                         'Memory TTT adaptation ready for episode %d | support_episodes=%s | memory_support=%s | '
                         'heldout_episode=%s | query_episode=%s | inner_batches=%d | avg_inner_loss=%.6f | '
-                        'avg_query_loss=%.6f | avg_inner_grad_norm=%.6f | final_memory_delta_norm=%.6f',
+                        'avg_query_loss=%.6f | avg_query_sample_mse=%.6f | avg_inner_grad_norm=%.6f | '
+                        'final_memory_delta_norm=%.6f',
                         ep,
                         current_memory_stats['support_ids'],
                         current_memory_stats['memory_support_ids'],
@@ -2161,6 +2427,7 @@ def evaluate(cfg: ConfigDict) -> None:
                         int(current_memory_stats.get('num_inner_batches', 0)),
                         float(current_memory_stats['avg_inner_loss']),
                         float(current_memory_stats['avg_query_loss']),
+                        float(current_memory_stats.get('avg_query_sample_mse', 0.0)),
                         float(current_memory_stats['avg_inner_grad_norm']),
                         float(current_memory_stats['final_memory_delta_norm']),
                     )
@@ -2241,6 +2508,7 @@ def evaluate(cfg: ConfigDict) -> None:
                 'optimizer': _memory_optimizer_name(memory_cfg),
                 'max_grad_norm': float(memory_cfg.max_grad_norm),
                 'num_queries_per_step': int(memory_cfg.num_queries_per_step),
+                'grad_accum_steps': int(grad_accum_steps),
                 'num_inner_batches': int(_resolve_num_memory_inner_batches(memory_cfg)),
                 'reuse_diffusion_noise': _as_bool(memory_cfg.reuse_diffusion_noise),
                 'preload_support_batches_to_device': _as_bool(
@@ -2252,6 +2520,7 @@ def evaluate(cfg: ConfigDict) -> None:
                 'holdout_index': int(getattr(memory_cfg, 'holdout_index', -1)),
                 'log_query_loss': _as_bool(getattr(memory_cfg, 'log_query_loss', False)),
                 'num_query_loss_samples': int(getattr(memory_cfg, 'num_query_loss_samples', memory_cfg.num_queries_per_step)),
+                'log_query_sample_mse': _as_bool(getattr(memory_cfg, 'log_query_sample_mse', False)),
             },
             'results': results,
         }
