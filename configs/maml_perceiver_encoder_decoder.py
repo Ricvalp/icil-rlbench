@@ -283,6 +283,7 @@ def get_config():
     cfg.wandb.tags = ()
     cfg.wandb.n_loss_steps = 20
     cfg.wandb.n_sample_steps = 1000
+    cfg.wandb.n_inner_loss_steps = 1000
     cfg.wandb.sample_batch_items = 8
     cfg.wandb.sample_mse_items = 32
     cfg.wandb.sample_inference_steps = 100

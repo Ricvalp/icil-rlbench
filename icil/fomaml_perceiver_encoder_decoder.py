@@ -35,6 +35,10 @@ from icil.models.maml import (
     prefix_param_names,
     set_outer_trainable_params,
 )
+from icil.models.maml.diagnostics import (
+    parameter_inner_loop_query_curves,
+    plot_scalar_curve,
+)
 from icil.models.maml.train_utils import (
     build_model_cfg as _build_model_cfg,
     build_optional_store as _build_optional_store,
@@ -1065,6 +1069,7 @@ def train(cfg: ConfigDict) -> None:
         ckpt_every = int(cfg.train.ckpt_every)
         wandb_loss_every = int(getattr(cfg.wandb, 'n_loss_steps', 0)) if wandb_run is not None else 0
         wandb_sample_every = int(getattr(cfg.wandb, 'n_sample_steps', 0)) if wandb_run is not None else 0
+        wandb_inner_loss_every = int(getattr(cfg.wandb, 'n_inner_loss_steps', 0)) if wandb_run is not None else 0
         wandb_sample_batch = int(getattr(cfg.wandb, 'sample_batch_items', 4)) if wandb_run is not None else 0
         wandb_sample_mse_items = (
             int(getattr(cfg.wandb, 'sample_mse_items', wandb_sample_batch)) if wandb_run is not None else 0
@@ -1165,6 +1170,55 @@ def train(cfg: ConfigDict) -> None:
                 wb_loss_sum = 0.0
                 wb_inner_fast_grad_norm_sum = 0.0
                 wb_count = 0
+
+            if (
+                is_main
+                and wandb_run is not None
+                and wandb_inner_loss_every > 0
+                and (global_step % wandb_inner_loss_every == 0 or global_step == 1)
+            ):
+                max_diag_tasks = max(1, min(len(prepared_tasks), max(1, wandb_sample_batch)))
+                query_diffusion_curve, query_sample_mse_curve = parameter_inner_loop_query_curves(
+                    policy=policy,
+                    loss_wrapper=loss_wrapper,
+                    prepared_tasks=prepared_tasks,
+                    fast_names=fast_names_wrapped,
+                    cfg=maml_cfg,
+                    inference_steps=wandb_sample_inference_steps,
+                    eta=wandb_sample_eta,
+                    use_mask_id=use_mask_id,
+                    max_tasks=max_diag_tasks,
+                )
+                fig_diff = plot_scalar_curve(
+                    query_diffusion_curve,
+                    ylabel='query diffusion loss',
+                    title='Query diffusion loss vs inner step',
+                    log_y=True,
+                )
+                fig_mse = plot_scalar_curve(
+                    query_sample_mse_curve,
+                    ylabel='query sampled action MSE',
+                    title='Query sampled action MSE vs inner step',
+                    log_y=True,
+                )
+                log_dict: Dict[str, Any] = {'train/step': global_step}
+                import wandb
+
+                if fig_diff is not None:
+                    log_dict['inner_loop/query_diffusion_loss'] = wandb.Image(fig_diff)
+                if fig_mse is not None:
+                    log_dict['inner_loop/query_sample_mse'] = wandb.Image(fig_mse)
+                wandb_run.log(log_dict, step=global_step)
+                if fig_diff is not None or fig_mse is not None:
+                    try:
+                        import matplotlib.pyplot as plt
+
+                        if fig_diff is not None:
+                            plt.close(fig_diff)
+                        if fig_mse is not None:
+                            plt.close(fig_mse)
+                    except Exception:
+                        pass
 
             if wandb_run is not None and wandb_sample_every > 0 and (global_step % wandb_sample_every == 0):
                 sample_tasks = list(tasks_batch[: max(0, min(len(tasks_batch), wandb_sample_batch))])
