@@ -24,14 +24,14 @@ def get_config():
         os.path.join("output_data_playground_v3", ".rlbench_cache_dense"),
     )
     cfg.data.tasks = ()  # () => use all tasks in cache_root
-    cfg.data.exclude_tasks = ("put_item_in_drawer", "take_item_out_of_drawer", "open_drawer", "close_drawer", "basketball_in_hoop", "lamp_on", "lamp_off")  # tasks to exclude from training, useful for zero-shot eval on these tasks.
+    cfg.data.exclude_tasks = ("slide_buzzer", "plate_out", "close_laptop", "close_box", "open_jar", "toilet_seat_up", "slide_block", "push_button", "basketball_in_hoop", "meat_on_grill", "put_umbrella", "lamp_on") # ("put_item_in_drawer", "take_item_out_of_drawer", "open_drawer", "close_drawer", "basketball_in_hoop", "lamp_on", "lamp_off")  # tasks to exclude from training, useful for zero-shot eval on these tasks.
     cfg.data.keep_open_per_worker = True
     cfg.data.num_workers = 16
     cfg.data.pin_memory = True
     cfg.data.persistent_workers = True
     # Sample tasks with probability proportional to num_variations ** alpha.
     # alpha=1.0 is the old variation-uniform behavior; alpha=0.0 is task-uniform.
-    cfg.data.task_sampling = "variation_power"
+    cfg.data.task_sampling = "variation_uniform" # "variation_power"
     cfg.data.task_sampling_alpha = 0.5
 
     cfg.dataset = ConfigDict()

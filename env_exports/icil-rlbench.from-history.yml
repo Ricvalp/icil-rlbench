@@ -1,0 +1,6 @@
+name: icil-rlbench
+channels:
+  - conda-forge
+dependencies:
+  - python=3.11
+prefix: /gpfs/home1/rvalperga/miniforge3/envs/icil-rlbench
