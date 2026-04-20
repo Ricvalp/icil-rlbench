@@ -1,0 +1,436 @@
+UPT-inspired supernode frame tokenizer: implementation instructions
+============================================================
+
+Goal
+----
+Implement a new frame tokenizer for point-cloud inputs inspired by the Universal Physics Transformer (UPT) supernode idea.
+
+This is a replacement for the current direct FramePerceiverTokenizer path at the frame level.
+
+The purpose is to preserve local geometry before global compression, so that small but important structures
+(e.g. gripper, handles, balls, object edges) are less likely to be lost during tokenization.
+
+Do not change the overall policy structure.
+Keep:
+- separate demo/query branches
+- trajectory tokens
+- two-context decoder
+- diffusion policy / decoder
+- demo/query higher-level aggregation logic
+
+Only replace the frame tokenization stage with a supernode-based tokenizer.
+
+
+High-level design
+-----------------
+For each point-cloud frame, replace:
+
+    points -> FramePerceiverTokenizer -> frame tokens
+
+with:
+
+    points
+      -> supernode sampling
+      -> point-to-supernode message passing
+      -> supernode refinement
+      -> optional Perceiver compression
+      -> frame tokens
+
+This should be implemented as a reusable module, e.g.
+
+    SupernodeFrameTokenizer(nn.Module)
+
+and then instantiated separately for:
+- demo frames
+- query frames
+
+These two branches should have separate parameters and can use different token budgets.
+
+
+What to implement
+-----------------
+
+1. New module: SupernodeFrameTokenizer
+--------------------------------------
+Create a new module that takes one frame worth of points and returns a fixed number of frame tokens.
+
+Suggested signature:
+
+    def forward(
+        self,
+        xyz: torch.Tensor,                # [Bf, N, 3]
+        valid: torch.Tensor,              # [Bf, N] bool
+        state: torch.Tensor,              # [Bf, state_dim]
+        rgb: Optional[torch.Tensor] = None,       # [Bf, N, 3]
+        mask_id: Optional[torch.Tensor] = None,   # [Bf, N] int64
+    ) -> torch.Tensor:
+        ...
+        return frame_tokens               # [Bf, M_frame_tokens + 1, d_model]
+
+The returned token count should be:
+- M_frame_tokens learned visual tokens
+- plus one appended projected state token
+
+The module should expose branch-specific hyperparameters such as:
+- number of supernodes
+- number of neighbors
+- number of refinement blocks
+- number of output frame tokens after compression
+
+
+2. Point feature encoding
+-------------------------
+Reuse the existing low-level point feature encoding style as much as possible.
+
+Per point, build features from:
+- xyz
+- optional rgb
+- optional relative-to-gripper features
+- optional target/object mask features
+
+Minimum required features:
+- xyz
+
+Recommended additional features:
+- rgb if available
+- rel_to_gripper = xyz - gripper_xyz
+- dist_to_gripper = ||xyz - gripper_xyz||
+- optional target-object indicator if mask supervision is available
+
+Implementation detail:
+- use separate linear projections for xyz and rgb as in the current code
+- for relative-to-gripper features, use a dedicated projection MLP
+- sum projected components into a point embedding h_points: [Bf, N, d_model]
+
+Suggested structure:
+
+    h = xyz_proj(xyz)
+    if rgb is not None:
+        h = h + rgb_alpha * rgb_proj(rgb)
+    if use_gripper_point_features:
+        rel = xyz - gripper_xyz.unsqueeze(1)
+        dist = torch.norm(rel, dim=-1, keepdim=True)
+        grip_feat = torch.cat([rel, dist], dim=-1)
+        h = h + gripper_alpha * gripper_proj(grip_feat)
+    if use_mask_id:
+        h = h + mask_embed(mask_id)
+
+Important:
+- keep valid-point masking throughout
+- do not allow invalid/padded points to participate in sampling or message passing
+
+
+3. Supernode sampling
+---------------------
+For each frame, sample M supernodes from the valid point cloud.
+
+Do not use purely unconstrained random sampling.
+Use quota-based sampling to guarantee coverage of important regions.
+
+Target behavior:
+- ensure at least one or more supernodes near the gripper
+- ensure at least one or more supernodes on the target object if mask info is available
+- fill remaining supernodes with global coverage
+
+Recommended implementation:
+- reserve a fixed quota for gripper-region points
+- reserve a fixed quota for target-object points if mask_id or target mask is available
+- fill the rest with FPS or random+FPS on all valid points
+
+Sampling outputs:
+- supernode_xyz: [Bf, M, 3]
+- supernode_init_feat: [Bf, M, d_model]
+
+Where supernode_init_feat can be initialized by gathering the point feature from the sampled point,
+or by a small learned transform of sampled xyz.
+
+Suggested helper functions:
+- sample_supernodes_single_frame(...)
+- batched_fps(...)
+- quota_based_supernode_sampling(...)
+
+Hyperparameters to expose:
+- M_supernodes
+- min_gripper_supernodes
+- min_target_supernodes
+- gripper_radius
+- whether to use FPS or random+FPS
+
+
+4. Point -> supernode neighborhood construction
+-----------------------------------------------
+Construct a bipartite graph from points to supernodes.
+
+For each supernode:
+- select nearby points either with KNN or radius graph
+- cap the number of neighbors to K_neighbors
+
+Suggested output:
+- neighbor_idx: [Bf, M, K]
+- neighbor_mask: [Bf, M, K] bool
+
+If implementing radius search is cumbersome, KNN is acceptable for the first version.
+
+Important:
+- only valid points can be neighbors
+- do not connect padded points
+- if a supernode has fewer than K neighbors, use neighbor_mask
+
+
+5. Point -> supernode message passing
+-------------------------------------
+Aggregate local point neighborhoods into supernode features.
+
+For each edge point i -> supernode j, build an edge message from:
+- point embedding h_points[i]
+- relative position xyz_i - supernode_xyz_j
+- scalar distance ||xyz_i - supernode_xyz_j||
+
+Recommended message:
+
+    rel = point_xyz - supernode_xyz
+    dist = ||rel||
+    edge_feat = concat(point_feat, rel, dist)
+    msg = edge_mlp(edge_feat)
+
+Aggregate messages per supernode with:
+- masked mean by default
+or
+- masked sum / attention-weighted sum if needed later
+
+Output:
+- h_super: [Bf, M, d_model]
+
+Recommended module:
+- edge_mlp = Linear -> SiLU/GELU -> Linear
+
+This is one-way message passing only:
+- points send information to supernodes
+- do not implement point updates in version 1
+
+
+6. Supernode refinement
+-----------------------
+After local aggregation, refine the supernodes with a small global module.
+
+Recommended first version:
+- 1 or 2 Transformer-style self-attention blocks over the M supernodes
+
+Each block can be:
+- LayerNorm
+- self-attention
+- residual
+- LayerNorm
+- MLP
+- residual
+
+This is the stage where supernodes exchange information globally after local geometry has been preserved.
+
+Output remains:
+- h_super_refined: [Bf, M, d_model]
+
+
+7. Optional Perceiver compression
+---------------------------------
+After refinement, optionally compress the M supernodes to a smaller number of frame tokens.
+
+Reason:
+- keep downstream token counts manageable
+- support/query branches can use different token budgets
+
+Recommended design:
+- use a learned latent Perceiver pooling block
+- input: refined supernodes [Bf, M, d_model]
+- output: [Bf, M_frame_tokens, d_model]
+
+Expose a flag:
+- compress_supernodes: bool
+
+If compress_supernodes=False:
+- use refined supernodes directly as frame tokens
+
+If compress_supernodes=True:
+- compress to a fixed output token count
+
+Recommended defaults:
+- demo branch: stronger compression
+- query branch: weaker compression
+
+Example:
+- demo: 128 supernodes -> 64 frame tokens
+- query: 128 supernodes -> 96 or 128 frame tokens
+
+
+8. Append state token
+---------------------
+Project the low-dimensional robot state as before and append it as one extra token.
+
+    state_token = state_mlp(state).unsqueeze(1)
+
+Final frame tokens:
+    frame_tokens = concat(visual_tokens, state_token)
+
+Output shape:
+    [Bf, M_frame_tokens + 1, d_model]
+
+
+9. Separate demo/query tokenizer instances
+------------------------------------------
+Do not share parameters between demo and query frame tokenizers.
+
+Create separate modules:
+- demo_supernode_tokenizer
+- query_supernode_tokenizer
+
+These can have different:
+- supernode counts
+- compression ratios
+- refinement depth
+
+Rationale:
+- demo branch should summarize support memory efficiently
+- query branch should preserve higher-fidelity current-scene geometry
+
+
+10. Integration into the current encoder
+----------------------------------------
+Replace only the frame tokenization step in the current support/query branches.
+
+Support/demo branch:
+- for each demo frame:
+    point cloud -> demo_supernode_tokenizer -> frame tokens
+- then continue with:
+    demo-id embeddings
+    keyframe embeddings
+    demo-memory aggregation
+    trajectory token fusion
+    existing support token pipeline
+
+Query branch:
+- for each query frame:
+    point cloud -> query_supernode_tokenizer -> frame tokens
+- then continue with:
+    query-time embeddings
+    existing query token pipeline
+
+Do not change:
+- trajectory token path
+- support/query split interface
+- two-context decoder interface
+
+
+11. Recommended default hyperparameters
+---------------------------------------
+Start with the following defaults:
+
+General:
+- d_model = existing model width
+- K_neighbors = 16 or 32
+- supernode_refine_layers = 1 for demo, 1 or 2 for query
+
+Demo branch:
+- M_supernodes = 128
+- M_frame_tokens = 64
+- compress_supernodes = True
+
+Query branch:
+- M_supernodes = 128 or 192
+- M_frame_tokens = 96 or 128
+- compress_supernodes = True or False depending on memory budget
+
+Sampling quotas:
+- min_gripper_supernodes = 2
+- min_target_supernodes = 4
+- remaining via global FPS
+
+If no target-mask supervision is available:
+- fall back to gripper-aware + global coverage only
+
+
+12. Efficiency requirements
+---------------------------
+Keep implementation efficient enough for existing training runs.
+
+Recommendations:
+- batch frame tokenization over flattened frames as done now
+- avoid Python loops over points
+- loops over frames are acceptable only if frame batch is already flattened and operations remain vectorized
+- cap neighborhood size
+- use gather/scatter operations rather than dense adjacency matrices
+- keep message passing point->supernode only in version 1
+- avoid full point-point attention
+
+If needed, add a chunked/tokenize_frames path analogous to the current chunked frame tokenization.
+
+
+13. Required config additions
+-----------------------------
+Add config options for the new tokenizer, e.g.
+
+    use_supernode_frame_tokenizer: bool
+    demo_supernodes: int
+    query_supernodes: int
+    demo_frame_tokens_out: int
+    query_frame_tokens_out: int
+    neighbors_per_supernode: int
+    supernode_refine_layers_demo: int
+    supernode_refine_layers_query: int
+    compress_supernodes_demo: bool
+    compress_supernodes_query: bool
+    min_gripper_supernodes: int
+    min_target_supernodes: int
+    gripper_sampling_radius: float
+    use_target_supernode_quota: bool
+
+Do not remove old options yet; keep backward compatibility.
+
+
+14. Suggested module breakdown
+------------------------------
+Implement the new functionality with small reusable modules.
+
+Suggested classes:
+- SupernodeFrameTokenizer
+- SupernodeSampler
+- PointToSupernodeMessagePassing
+- SupernodeRefiner
+- Optional: SupernodePerceiverPool
+
+Suggested helper functions:
+- build_point_features(...)
+- quota_based_supernode_sampling(...)
+- knn_or_radius_neighbors(...)
+- masked_neighbor_aggregate(...)
+
+
+15. First implementation target
+-------------------------------
+Version 1 should be minimal but complete.
+
+Required for v1:
+- xyz (+ optional rgb)
+- quota-based supernode sampling
+- point->supernode message passing
+- 1 self-attention refinement block
+- optional Perceiver compression
+- state token append
+- separate demo/query tokenizer instances
+- integration into existing support/query branches
+
+Optional for later:
+- learned attention aggregation instead of mean
+- more sophisticated target-aware supernode placement
+- separate local/global supernode types
+- point updates or iterative message passing
+- explicit object-level supernode buckets beyond target/gripper/global
+
+
+16. Expected benefit
+--------------------
+The intended benefit is:
+- preserve local geometry before compression
+- improve target/gripper localization
+- reduce failures where the policy performs the right action but at the wrong spatial location
+
+This should be treated as a tokenizer/front-end change only.
+Do not alter the downstream two-context decoder in this implementation pass.

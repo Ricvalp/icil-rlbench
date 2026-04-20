@@ -1,0 +1,349 @@
+Architecture description: trajectory Perceiver V2 encoder + two-context diffusion policy
+====================================================================================
+
+Assumed active architecture
+---------------------------
+This description assumes the latest architecture is selected with these config overrides:
+
+  cfg.model.encoder_name = "traj_perceiver_v2"
+  cfg.model.policy.context_attention_mode = "two_ctx"
+
+The base config still defines other encoders for backward compatibility, but the architecture
+below is the TrajectoryPerceiverEncoderV2 paired with a DiT decoder whose blocks use two
+separate cross-attention operations: one to query/current-observation tokens and one to
+support/demo tokens.
+
+Inputs and notation
+-------------------
+For each training item:
+
+  B      = batch size
+  K      = number of in-context support demonstrations
+  L      = number of keyframes per support demonstration
+  T_obs  = number of observed query frames
+  H      = action chunk horizon
+  N      = number of points in each point cloud frame, determined by the cached data / sampler
+  d      = model width, 512
+
+Support/demo inputs:
+
+  cond_xyz    : [B, K, L, N, 3]
+  cond_rgb    : [B, K, L, N, 3], optional if RGB is loaded
+  cond_state  : [B, K, L, state_dim]
+  cond_valid  : [B, K, L, N]
+  cond_traj   : [B, K, T_traj, 8], when trajectory tokens are enabled
+
+Query/current-history inputs:
+
+  query_xyz    : [B, T_obs, N, 3]
+  query_rgb    : [B, T_obs, N, 3], optional if RGB is loaded
+  query_state  : [B, T_obs, state_dim]
+  query_valid  : [B, T_obs, N]
+
+Diffusion target:
+
+  target_action : [B, H, action_dim]
+
+The action dimension is inferred from the dataset. For the RLBench setup here this is
+normally the end-effector action representation used by the cache, e.g. 8 values when using
+3D position, rotation representation, and gripper state.
+
+Context encoder: TrajectoryPerceiverEncoderV2
+---------------------------------------------
+TrajectoryPerceiverEncoderV2 wraps PerceiverDemoQueryEncoderV2 and appends trajectory tokens
+to the support/demo context.
+
+The encoder returns a ContextEncoderOutput with split token groups:
+
+  query_tokens        : tokens for the current query observation/history
+  support_tokens      : demo memory tokens plus trajectory tokens
+  tokens              : combined legacy context tokens
+  query_token_mask    : optional mask, currently usually None
+  support_token_mask  : optional mask, currently usually None
+  token_mask          : optional combined mask, currently usually None
+
+With the two-context policy, the decoder consumes query_tokens and support_tokens separately.
+The combined tokens field is kept for compatibility with single-context decoders and older code.
+
+Frame tokenization stacks
+-------------------------
+V2 uses separate frame tokenizers for demo frames and query frames. These are distinct modules
+with separate parameters and potentially different hyperparameters.
+
+For each frame:
+
+  1. xyz points are projected with a linear layer: R^3 -> R^512.
+  2. RGB, if present, is projected with a separate linear layer R^3 -> R^512 and scaled by a
+     learned scalar alpha. Demo and query branches have separate RGB alpha parameters.
+  3. Mask-id embeddings are available but disabled in the current config.
+  4. Relative-to-gripper point features are available but disabled in the current config.
+  5. A FramePerceiverTokenizer converts point tokens into learned frame latent tokens.
+  6. The low-dimensional robot state is projected by an MLP and appended as one extra frame token.
+
+Important detail: if m_frame_tokens = 128, the actual number of tokens emitted per frame is
+129 because the projected state token is appended after the Perceiver frame tokens.
+
+Demo branch
+-----------
+The demo branch processes all support keyframes independently before aggregating them.
+
+  Input shape: [B, K, L, N, 3]
+  Flattened frame batch: [B * K * L, N, 3]
+
+Per demo frame:
+
+  - demo FramePerceiverTokenizer produces 128 learned frame tokens.
+  - one projected state token is appended.
+  - total per demo frame: 129 tokens.
+
+After tokenizing all demo frames:
+
+  - tokens are reshaped to [B, K, L, 129, 512]
+  - a learned demo-id embedding is added across K
+  - a learned keyframe embedding is added across L
+  - tokens are flattened to [B, K * L * 129, 512]
+
+The flattened demo tokens are compressed by DemoMemoryPerceiver when compress_demo_latents=True.
+In the current config this produces:
+
+  z_demo : [B, 256, 512]
+
+A post-demo self-attention refiner is then applied. In the current config this is 1 Transformer-style
+self-attention block with LayerNorm, self-attention, MLP, residual connections, and MLP multiplier 4.
+
+Query branch
+------------
+The query branch processes the current observation/history frames separately from the demo branch.
+
+  Input shape: [B, T_obs, N, 3]
+  Flattened frame batch: [B * T_obs, N, 3]
+
+Per query frame:
+
+  - query FramePerceiverTokenizer produces 128 learned frame tokens.
+  - one projected state token is appended.
+  - total per query frame: 129 tokens.
+
+After tokenizing all query frames:
+
+  - tokens are reshaped to [B, T_obs, 129, 512]
+  - a learned query-time embedding is added across T_obs
+  - tokens are flattened to [B, T_obs * 129, 512]
+
+With T_obs=2, this gives:
+
+  z_query : [B, 258, 512]
+
+A post-query self-attention refiner is then applied. In the current config this is 2
+Transformer-style self-attention blocks with LayerNorm, self-attention, MLP, residual connections,
+and MLP multiplier 4.
+
+Trajectory branch
+-----------------
+TrajectoryPerceiverEncoderV2 also builds trajectory tokens from support trajectories.
+
+The trajectory source is cond_traj if provided. The fallback to cond_state is disabled in the
+current config, so cond_traj is expected when trajectory tokens are used.
+
+For each support demo trajectory:
+
+  cond_traj : [B, K, T_traj, 8]
+
+Processing:
+
+  1. Each trajectory step is projected by an MLP: R^8 -> R^512.
+  2. Continuous sinusoidal time embeddings over normalized time tau in [0, 1] are projected by
+     a time MLP and added to the step tokens.
+  3. A learned demo-id embedding is added if use_demo_id_embed=True.
+  4. A TimeLatentPerceiver compresses each demo trajectory into m_traj_tokens latent tokens.
+
+Current trajectory output:
+
+  m_traj_tokens = 32 per support demo
+  z_traj        = [B, K * 32, 512]
+
+With K=4, this gives 128 trajectory tokens.
+
+Final encoder token groups
+--------------------------
+For the active pretraining setup with K=4, L=16, T_obs=2:
+
+  demo frame tokens before compression : K * L * 129 = 4 * 16 * 129 = 8256 tokens
+  compressed demo memory tokens        : 256 tokens
+  trajectory tokens                    : K * 32 = 128 tokens
+  support_tokens                       : 256 + 128 = 384 tokens
+  query_tokens                         : T_obs * 129 = 258 tokens
+
+For the two-context decoder:
+
+  ctx_query   = query_tokens   = [B, 258, 512]
+  ctx_support = support_tokens = [B, 384, 512]
+
+The combined legacy tokens are also produced, but the two-context policy uses the split query/support
+token groups directly.
+
+Diffusion policy / decoder
+--------------------------
+The policy is a diffusion model over action chunks.
+
+Action input:
+
+  x_t : [B, H, action_dim]
+
+Processing:
+
+  1. x_t is projected with action_in: R^action_dim -> R^512.
+  2. A sinusoidal action-position embedding over the H action slots is added.
+  3. The diffusion timestep t is encoded with a sinusoidal time embedding and passed through TimeMLP
+     to produce the conditioning vector t_cond in R^512.
+  4. The action tokens are processed by 10 DiTBlock2Ctx blocks.
+  5. The final action tokens are projected with action_out: R^512 -> R^action_dim.
+
+Two-context DiT block
+---------------------
+Each DiTBlock2Ctx contains:
+
+  1. AdaLN-conditioned self-attention over action tokens.
+  2. AdaLN-conditioned cross-attention from action tokens to query/current-observation tokens.
+  3. AdaLN-conditioned cross-attention from action tokens to support/demo tokens.
+  4. AdaLN-conditioned MLP with multiplier 4.
+
+The order is important:
+
+  action self-attention -> query cross-attention -> support cross-attention -> MLP
+
+So each denoising block first grounds the action chunk in the current query observation/history,
+and then attends to support demonstrations and support trajectory tokens.
+
+Diffusion setup
+---------------
+Scheduler:
+
+  DDIMScheduler
+  num_train_timesteps = 1000
+  beta_start = 1e-4
+  beta_end = 2e-2
+  beta_schedule = squaredcos_cap_v2
+  prediction_type = v_prediction
+  set_alpha_to_one = True
+  steps_offset = 0
+
+Training loss:
+
+  MSE between the model output and the diffusion target. With prediction_type="v_prediction",
+  the target is the velocity target from the scheduler.
+
+Sampling:
+
+  The policy default num_inference_steps is None, which resolves to the scheduler's number of
+  training timesteps unless an eval/logging config overrides it. The current wandb sampling config
+  uses 100 inference steps.
+
+Current hyperparameters
+-----------------------
+Dataset / sequence hyperparameters:
+
+  K = 4 support demonstrations during pretraining
+  L = 16 keyframes per support demonstration
+  T_obs = 2 query observation frames
+  H = 16 action steps per predicted chunk
+  stride = 2 between query observation frames
+  num_tries_per_item = 100
+
+Task sampling:
+
+  task_sampling = variation_power
+  task_sampling_alpha = 0.5
+  excluded training tasks = (
+    put_item_in_drawer,
+    take_item_out_of_drawer,
+    open_drawer,
+    close_drawer,
+    basketball_in_hoop,
+    lamp_on,
+    lamp_off
+  )
+
+Policy hyperparameters:
+
+  d_model = 512
+  policy.n_heads = 8
+  denoiser_layers = 10
+  denoiser_mlp_mult = 4
+  dropout = 0.0
+  grad_checkpoint_dit = False
+  context_attention_mode = two_ctx
+
+Trajectory Perceiver V2 hyperparameters:
+
+  d_model = 512
+  n_heads = 4
+  dropout = 0.0
+
+  demo_m_frame_tokens = 128
+  demo_frame_tokenizer_layers = 2
+  demo_n_heads = 4
+
+  query_m_frame_tokens = 128
+  query_frame_tokenizer_layers = 2
+  query_n_heads = 4
+
+  M_demo_latents = 256
+  demo_perceiver_layers = 3
+  compress_demo_latents = True
+
+  mask_hash_buckets = 1
+  use_mask_id = False
+  role_embed_max_K = 4
+  role_embed_max_L = 16
+  role_embed_max_Tobs = 2
+
+  demo_rgb_alpha_init = 1.0
+  query_rgb_alpha_init = 1.0
+
+  use_gripper_point_features = False
+  gripper_xyz_state_start = 0
+  gripper_alpha_init = 1.0
+
+  demo_post_self_attn_layers = 1
+  query_post_self_attn_layers = 2
+  post_self_attn_mlp_mult = 4
+
+  checkpoint_demo_memory = False
+  checkpoint_build_demo_memory = False
+  checkpoint_frame_tokenizer = False
+  tokenize_frames_chunked = True
+  chunk_frames = 256
+
+  m_traj_tokens = 32
+  traj_perceiver_layers = 2
+  traj_dim = 8
+  use_demo_id_embed = True
+  include_traj_tokens = True
+  use_cond_state_as_traj_fallback = False
+
+Training hyperparameters from the current pretrain config:
+
+  num_steps = 1,000,000
+  batch_size = 2 per process/GPU
+  grad_accum_steps = 1
+  lr = 1e-4
+  Adam beta1 = 0.9
+  Adam beta2 = 0.95
+  weight_decay = 1e-4
+  grad_clip_norm = 1.0
+  use_amp = True
+  log_every = 20
+  ckpt_every = 500
+
+Wandb/logging defaults:
+
+  wandb.enable = False
+  n_loss_steps = 20
+  n_sample_steps = 1000
+  sample_batch_items = 16
+  sample_mse_items = 64
+  sample_inference_steps = 100
+  sample_trace_frames = 8
+  sample_eta = 0.0
+  query_pointcloud_max_points = 4096
