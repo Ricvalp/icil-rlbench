@@ -43,7 +43,7 @@ def get_config():
     cfg.dataset.num_tries_per_item = 100
 
     cfg.model = ConfigDict()
-    cfg.model.encoder_name = "traj_perceiver"  # "perceiver_demo_query" | "conv3d_demo_query" | "traj_perceiver" | "traj_conv3d"
+    cfg.model.encoder_name = "traj_perceiver"  # also supports "*_v2" and "*_supernode_v2" encoders
 
     # Core policy/denoiser config.
     cfg.model.policy = ConfigDict()
@@ -54,6 +54,7 @@ def get_config():
     cfg.model.policy.dropout = 0.0
     cfg.model.policy.grad_checkpoint_dit = False
     cfg.model.policy.context_attention_mode = "single"  # "single" | "two_ctx"
+    cfg.model.policy.attention_backend = "manual"  # "manual" | "sdpa" ("flash" alias)
     cfg.model.policy.num_train_timesteps = 1000
     cfg.model.policy.beta_start = 1e-4
     cfg.model.policy.beta_end = 2e-2
@@ -190,6 +191,107 @@ def get_config():
     cfg.model.traj_perceiver_v2.use_demo_id_embed = True
     cfg.model.traj_perceiver_v2.include_traj_tokens = True
     cfg.model.traj_perceiver_v2.use_cond_state_as_traj_fallback = False
+
+
+    # Supernode Perceiver V2 demo/query encoder.
+    # Opt in with --config.model.encoder_name=perceiver_demo_query_supernode_v2.
+    cfg.model.perceiver_demo_query_supernode_v2 = ConfigDict()
+    cfg.model.perceiver_demo_query_supernode_v2.d_model = 512
+    cfg.model.perceiver_demo_query_supernode_v2.n_heads = 4
+    cfg.model.perceiver_demo_query_supernode_v2.dropout = 0.0
+    cfg.model.perceiver_demo_query_supernode_v2.demo_n_heads = 4
+    cfg.model.perceiver_demo_query_supernode_v2.query_n_heads = 4
+    cfg.model.perceiver_demo_query_supernode_v2.M_demo_latents = 256
+    cfg.model.perceiver_demo_query_supernode_v2.demo_perceiver_layers = 3
+    cfg.model.perceiver_demo_query_supernode_v2.mask_hash_buckets = 1
+    cfg.model.perceiver_demo_query_supernode_v2.use_mask_id = True
+    cfg.model.perceiver_demo_query_supernode_v2.use_mask_embedding = False
+    cfg.model.perceiver_demo_query_supernode_v2.use_mask_instance_quota = True
+    cfg.model.perceiver_demo_query_supernode_v2.supernode_sampling_mode = "fps"  # "fps" | "fast_random"
+    cfg.model.perceiver_demo_query_supernode_v2.role_embed_max_K = 4
+    cfg.model.perceiver_demo_query_supernode_v2.role_embed_max_L = 16
+    cfg.model.perceiver_demo_query_supernode_v2.role_embed_max_Tobs = 2
+    cfg.model.perceiver_demo_query_supernode_v2.ignore_demos = False
+    cfg.model.perceiver_demo_query_supernode_v2.compress_demo_latents = True
+    cfg.model.perceiver_demo_query_supernode_v2.demo_rgb_alpha_init = 1.0
+    cfg.model.perceiver_demo_query_supernode_v2.query_rgb_alpha_init = 1.0
+    cfg.model.perceiver_demo_query_supernode_v2.use_gripper_point_features = True
+    cfg.model.perceiver_demo_query_supernode_v2.gripper_xyz_state_start = 0
+    cfg.model.perceiver_demo_query_supernode_v2.gripper_alpha_init = 1.0
+    cfg.model.perceiver_demo_query_supernode_v2.demo_post_self_attn_layers = 1
+    cfg.model.perceiver_demo_query_supernode_v2.query_post_self_attn_layers = 2
+    cfg.model.perceiver_demo_query_supernode_v2.post_self_attn_mlp_mult = 4
+    cfg.model.perceiver_demo_query_supernode_v2.demo_supernodes = 128
+    cfg.model.perceiver_demo_query_supernode_v2.query_supernodes = 128
+    cfg.model.perceiver_demo_query_supernode_v2.demo_frame_tokens_out = 64
+    cfg.model.perceiver_demo_query_supernode_v2.query_frame_tokens_out = 128
+    cfg.model.perceiver_demo_query_supernode_v2.neighbors_per_supernode = 32
+    cfg.model.perceiver_demo_query_supernode_v2.demo_supernode_refine_layers = 1
+    cfg.model.perceiver_demo_query_supernode_v2.query_supernode_refine_layers = 2
+    cfg.model.perceiver_demo_query_supernode_v2.compress_supernodes_demo = True
+    cfg.model.perceiver_demo_query_supernode_v2.compress_supernodes_query = True
+    cfg.model.perceiver_demo_query_supernode_v2.supernode_pool_layers = 1
+    cfg.model.perceiver_demo_query_supernode_v2.min_gripper_supernodes = 2
+    cfg.model.perceiver_demo_query_supernode_v2.min_mask_supernodes = 4
+    cfg.model.perceiver_demo_query_supernode_v2.gripper_sampling_radius = 0.10
+    cfg.model.perceiver_demo_query_supernode_v2.checkpoint_demo_memory = False
+    cfg.model.perceiver_demo_query_supernode_v2.checkpoint_build_demo_memory = False
+    cfg.model.perceiver_demo_query_supernode_v2.checkpoint_frame_tokenizer = False
+    cfg.model.perceiver_demo_query_supernode_v2.tokenize_frames_chunked = True
+    cfg.model.perceiver_demo_query_supernode_v2.chunk_frames = 256
+
+    # Trajectory Supernode Perceiver V2 encoder.
+    # Opt in with --config.model.encoder_name=traj_supernode_perceiver_v2.
+    cfg.model.traj_supernode_perceiver_v2 = ConfigDict()
+    cfg.model.traj_supernode_perceiver_v2.d_model = 512
+    cfg.model.traj_supernode_perceiver_v2.n_heads = 4
+    cfg.model.traj_supernode_perceiver_v2.dropout = 0.0
+    cfg.model.traj_supernode_perceiver_v2.demo_n_heads = 4
+    cfg.model.traj_supernode_perceiver_v2.query_n_heads = 4
+    cfg.model.traj_supernode_perceiver_v2.M_demo_latents = 256
+    cfg.model.traj_supernode_perceiver_v2.demo_perceiver_layers = 3
+    cfg.model.traj_supernode_perceiver_v2.mask_hash_buckets = 1
+    cfg.model.traj_supernode_perceiver_v2.use_mask_id = True
+    cfg.model.traj_supernode_perceiver_v2.use_mask_embedding = False
+    cfg.model.traj_supernode_perceiver_v2.use_mask_instance_quota = True
+    cfg.model.traj_supernode_perceiver_v2.supernode_sampling_mode = "fps"  # "fps" | "fast_random"
+    cfg.model.traj_supernode_perceiver_v2.role_embed_max_K = 4
+    cfg.model.traj_supernode_perceiver_v2.role_embed_max_L = 16
+    cfg.model.traj_supernode_perceiver_v2.role_embed_max_Tobs = 2
+    cfg.model.traj_supernode_perceiver_v2.ignore_demos = False
+    cfg.model.traj_supernode_perceiver_v2.compress_demo_latents = True
+    cfg.model.traj_supernode_perceiver_v2.demo_rgb_alpha_init = 1.0
+    cfg.model.traj_supernode_perceiver_v2.query_rgb_alpha_init = 1.0
+    cfg.model.traj_supernode_perceiver_v2.use_gripper_point_features = True
+    cfg.model.traj_supernode_perceiver_v2.gripper_xyz_state_start = 0
+    cfg.model.traj_supernode_perceiver_v2.gripper_alpha_init = 1.0
+    cfg.model.traj_supernode_perceiver_v2.demo_post_self_attn_layers = 1
+    cfg.model.traj_supernode_perceiver_v2.query_post_self_attn_layers = 2
+    cfg.model.traj_supernode_perceiver_v2.post_self_attn_mlp_mult = 4
+    cfg.model.traj_supernode_perceiver_v2.demo_supernodes = 128
+    cfg.model.traj_supernode_perceiver_v2.query_supernodes = 128
+    cfg.model.traj_supernode_perceiver_v2.demo_frame_tokens_out = 64
+    cfg.model.traj_supernode_perceiver_v2.query_frame_tokens_out = 128
+    cfg.model.traj_supernode_perceiver_v2.neighbors_per_supernode = 32
+    cfg.model.traj_supernode_perceiver_v2.demo_supernode_refine_layers = 1
+    cfg.model.traj_supernode_perceiver_v2.query_supernode_refine_layers = 2
+    cfg.model.traj_supernode_perceiver_v2.compress_supernodes_demo = True
+    cfg.model.traj_supernode_perceiver_v2.compress_supernodes_query = True
+    cfg.model.traj_supernode_perceiver_v2.supernode_pool_layers = 1
+    cfg.model.traj_supernode_perceiver_v2.min_gripper_supernodes = 2
+    cfg.model.traj_supernode_perceiver_v2.min_mask_supernodes = 4
+    cfg.model.traj_supernode_perceiver_v2.gripper_sampling_radius = 0.10
+    cfg.model.traj_supernode_perceiver_v2.checkpoint_demo_memory = False
+    cfg.model.traj_supernode_perceiver_v2.checkpoint_build_demo_memory = False
+    cfg.model.traj_supernode_perceiver_v2.checkpoint_frame_tokenizer = False
+    cfg.model.traj_supernode_perceiver_v2.tokenize_frames_chunked = False
+    cfg.model.traj_supernode_perceiver_v2.chunk_frames = 256
+    cfg.model.traj_supernode_perceiver_v2.m_traj_tokens = 32
+    cfg.model.traj_supernode_perceiver_v2.traj_perceiver_layers = 2
+    cfg.model.traj_supernode_perceiver_v2.traj_dim = 8
+    cfg.model.traj_supernode_perceiver_v2.use_demo_id_embed = True
+    cfg.model.traj_supernode_perceiver_v2.include_traj_tokens = True
+    cfg.model.traj_supernode_perceiver_v2.use_cond_state_as_traj_fallback = False
 
     # Trajectory Conv3D context encoder (unused unless encoder_name=traj_conv3d).
     cfg.model.traj_conv3d = ConfigDict()

@@ -7,6 +7,12 @@ from icil.models.common.embeddings import (
 from icil.models.common.attention import DiTBlock, DiTBlock2Ctx
 from icil.models.common.perceiver import FramePerceiverTokenizer, DemoMemoryPerceiver, TimeLatentPerceiver
 from icil.models.common.conv3d import SparseVoxelConvTokenizer
+from icil.models.common.supernode_tokenizer import (
+    SupernodeFrameTokenizer,
+    SupernodeFrameTokenizerConfig,
+    fast_quota_based_supernode_sampling,
+    quota_based_supernode_sampling,
+)
 
 __all__ = [
     "TimeMLP",
@@ -19,4 +25,8 @@ __all__ = [
     "DemoMemoryPerceiver",
     "TimeLatentPerceiver",
     "SparseVoxelConvTokenizer",
+    "SupernodeFrameTokenizer",
+    "SupernodeFrameTokenizerConfig",
+    "fast_quota_based_supernode_sampling",
+    "quota_based_supernode_sampling",
 ]

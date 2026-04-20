@@ -147,6 +147,10 @@ def build_model_cfg(cfg: ConfigDict) -> PolicyBuilderConfig:
 
 def resolve_use_mask_id(model_cfg: ConfigDict) -> bool:
     encoder_name = str(getattr(model_cfg, 'encoder_name', 'perceiver_demo_query'))
+    if encoder_name == 'traj_supernode_perceiver_v2':
+        return as_bool(getattr(getattr(model_cfg, 'traj_supernode_perceiver_v2', ConfigDict()), 'use_mask_id', True))
+    if encoder_name == 'perceiver_demo_query_supernode_v2':
+        return as_bool(getattr(getattr(model_cfg, 'perceiver_demo_query_supernode_v2', ConfigDict()), 'use_mask_id', True))
     if encoder_name == 'traj_perceiver_v2':
         return as_bool(getattr(getattr(model_cfg, 'traj_perceiver_v2', ConfigDict()), 'use_mask_id', True))
     if encoder_name == 'perceiver_demo_query_v2':

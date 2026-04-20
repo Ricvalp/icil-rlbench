@@ -14,13 +14,21 @@ class FramePerceiverTokenizer(nn.Module):
     Tokenize N point features into m learned latents via cross-attn.
     This avoids O(N^2) attention over points.
     """
-    def __init__(self, d: int, m: int, n_heads: int, n_layers: int = 2, dropout: float = 0.0):
+    def __init__(
+        self,
+        d: int,
+        m: int,
+        n_heads: int,
+        n_layers: int = 2,
+        dropout: float = 0.0,
+        attention_backend: str = "manual",
+    ):
         super().__init__()
         self.m = m
         self.latents = nn.Parameter(torch.randn(m, d) * 0.02)
         self.layers = nn.ModuleList([
             nn.ModuleDict({
-                "xattn": CrossAttention(d, n_heads, dropout),
+                "xattn": CrossAttention(d, n_heads, dropout, attention_backend=attention_backend),
                 "mlp": nn.Sequential(
                     nn.LayerNorm(d),
                     nn.Linear(d, 4 * d),
@@ -52,13 +60,21 @@ class DemoMemoryPerceiver(nn.Module):
     """
     Compress many tokens (demo frames) into M memory latents.
     """
-    def __init__(self, d: int, M: int, n_heads: int, n_layers: int = 3, dropout: float = 0.0):
+    def __init__(
+        self,
+        d: int,
+        M: int,
+        n_heads: int,
+        n_layers: int = 3,
+        dropout: float = 0.0,
+        attention_backend: str = "manual",
+    ):
         super().__init__()
         self.M = M
         self.latents = nn.Parameter(torch.randn(M, d) * 0.02)
         self.layers = nn.ModuleList([
             nn.ModuleDict({
-                "xattn": CrossAttention(d, n_heads, dropout),
+                "xattn": CrossAttention(d, n_heads, dropout, attention_backend=attention_backend),
                 "mlp": nn.Sequential(
                     nn.LayerNorm(d),
                     nn.Linear(d, 4 * d),
@@ -91,14 +107,22 @@ class TimeLatentPerceiver(nn.Module):
     Perceiver-style compressor over time:
       z (m latents) cross-attends to tokens (T steps)
     """
-    def __init__(self, d: int, m: int, n_heads: int, n_layers: int, dropout: float = 0.0):
+    def __init__(
+        self,
+        d: int,
+        m: int,
+        n_heads: int,
+        n_layers: int,
+        dropout: float = 0.0,
+        attention_backend: str = "manual",
+    ):
         super().__init__()
         self.m = int(m)
         self.latents = nn.Parameter(torch.randn(self.m, d) * 0.02)
         self.layers = nn.ModuleList([
             nn.ModuleDict({
                 "ln": nn.LayerNorm(d),
-                "xattn": CrossAttention(d, n_heads, dropout),
+                "xattn": CrossAttention(d, n_heads, dropout, attention_backend=attention_backend),
                 "mlp": nn.Sequential(
                     nn.LayerNorm(d),
                     nn.Linear(d, 4 * d),

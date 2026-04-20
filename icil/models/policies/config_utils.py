@@ -1,14 +1,17 @@
 from __future__ import annotations
 
+from dataclasses import fields
 from typing import Any, Callable
 
 from icil.models.encoders import (
     Conv3dDemoQueryEncoderConfig,
     PerceiverDemoQueryEncoderConfig,
     PerceiverDemoQueryEncoderV2Config,
+    PerceiverDemoQuerySupernodeEncoderV2Config,
     TrajConv3DConfig,
     TrajPerceiverConfig,
     TrajPerceiverV2Config,
+    TrajSupernodePerceiverV2Config,
 )
 from icil.models.policies.builders import PolicyBuilderConfig
 from icil.models.policies.policy import PolicyConfig
@@ -22,6 +25,73 @@ def _none_config() -> object:
     return object()
 
 
+_ENCODER_CONFIG_KEYS = (
+    "conv3d_demo_query",
+    "perceiver_demo_query",
+    "perceiver_demo_query_v2",
+    "perceiver_demo_query_supernode_v2",
+    "traj_conv3d",
+    "traj_perceiver",
+    "traj_perceiver_v2",
+    "traj_supernode_perceiver_v2",
+)
+
+
+def inherit_missing_encoder_attention_backend(model_cfg: Any) -> Any:
+    """Copy the global policy attention backend into encoder configs when absent.
+
+    Checkpoints store the raw ml_collections config, where the global knob lives
+    under model.policy.attention_backend. Training config construction already
+    uses that knob for encoders; eval reconstruction should do the same.
+    """
+    if not isinstance(model_cfg, dict):
+        return model_cfg
+    policy_cfg = model_cfg.get("policy", {})
+    if not isinstance(policy_cfg, dict) or "attention_backend" not in policy_cfg:
+        return model_cfg
+
+    backend = policy_cfg["attention_backend"]
+    out = dict(model_cfg)
+    for key in _ENCODER_CONFIG_KEYS:
+        encoder_cfg = out.get(key, None)
+        if isinstance(encoder_cfg, dict) and "attention_backend" not in encoder_cfg:
+            encoder_cfg = dict(encoder_cfg)
+            encoder_cfg["attention_backend"] = backend
+            out[key] = encoder_cfg
+    return out
+
+
+def _coerce_like(value: Any, default: Any, *, as_bool: Callable[[Any], bool]) -> Any:
+    if isinstance(default, bool):
+        return as_bool(value)
+    if isinstance(default, int) and not isinstance(default, bool):
+        return int(value)
+    if isinstance(default, float):
+        return float(value)
+    if isinstance(default, str):
+        return str(value)
+    if isinstance(default, tuple) and isinstance(value, (list, tuple)):
+        return tuple(value)
+    return value
+
+
+def _config_dataclass_from_raw(
+    cls: type,
+    raw: Any,
+    *,
+    as_bool: Callable[[Any], bool],
+    fallback_values: dict[str, Any] | None = None,
+) -> Any:
+    default_obj = cls()
+    fallback_values = fallback_values or {}
+    kwargs = {}
+    for field in fields(default_obj):
+        default = fallback_values.get(field.name, getattr(default_obj, field.name))
+        value = _get(raw, field.name, default)
+        kwargs[field.name] = _coerce_like(value, default, as_bool=as_bool)
+    return cls(**kwargs)
+
+
 def build_policy_builder_config_from_configdict(
     cfg: Any,
     *,
@@ -31,9 +101,11 @@ def build_policy_builder_config_from_configdict(
     conv3d_cfg_raw = _get(cfg, "conv3d_demo_query", _none_config())
     perceiver_cfg_raw = cfg.perceiver_demo_query
     perceiver_v2_cfg_raw = _get(cfg, "perceiver_demo_query_v2", _none_config())
+    perceiver_supernode_v2_cfg_raw = _get(cfg, "perceiver_demo_query_supernode_v2", _none_config())
     traj_conv3d_cfg_raw = _get(cfg, "traj_conv3d", _none_config())
     traj_cfg_raw = cfg.traj_perceiver
     traj_v2_cfg_raw = _get(cfg, "traj_perceiver_v2", _none_config())
+    traj_supernode_v2_cfg_raw = _get(cfg, "traj_supernode_perceiver_v2", _none_config())
 
     policy_cfg = PolicyConfig(
         d_model=int(policy_cfg_raw.d_model),
@@ -43,6 +115,7 @@ def build_policy_builder_config_from_configdict(
         dropout=float(policy_cfg_raw.dropout),
         grad_checkpoint_dit=as_bool(_get(policy_cfg_raw, "grad_checkpoint_dit", False)),
         context_attention_mode=str(_get(policy_cfg_raw, "context_attention_mode", "single")),
+        attention_backend=str(_get(policy_cfg_raw, "attention_backend", "manual")),
         num_train_timesteps=int(policy_cfg_raw.num_train_timesteps),
         beta_start=float(_get(policy_cfg_raw, "beta_start", 1e-4)),
         beta_end=float(_get(policy_cfg_raw, "beta_end", 2e-2)),
@@ -71,6 +144,7 @@ def build_policy_builder_config_from_configdict(
         role_embed_max_Tobs=int(perceiver_cfg_raw.role_embed_max_Tobs),
         rgb_alpha_init=float(_get(perceiver_cfg_raw, "rgb_alpha_init", 1.0)),
         dropout=float(perceiver_cfg_raw.dropout),
+        attention_backend=str(_get(perceiver_cfg_raw, "attention_backend", policy_cfg.attention_backend)),
         ignore_demos=as_bool(_get(perceiver_cfg_raw, "ignore_demos", False)),
         compress_demo_latents=as_bool(_get(perceiver_cfg_raw, "compress_demo_latents", True)),
         checkpoint_demo_memory=as_bool(_get(perceiver_cfg_raw, "checkpoint_demo_memory", False)),
@@ -97,6 +171,7 @@ def build_policy_builder_config_from_configdict(
         role_embed_max_Tobs=int(_get(conv3d_cfg_raw, "role_embed_max_Tobs", 16)),
         rgb_alpha_init=float(_get(conv3d_cfg_raw, "rgb_alpha_init", 1.0)),
         dropout=float(_get(conv3d_cfg_raw, "dropout", 0.0)),
+        attention_backend=str(_get(conv3d_cfg_raw, "attention_backend", policy_cfg.attention_backend)),
         ignore_demos=as_bool(_get(conv3d_cfg_raw, "ignore_demos", False)),
     )
 
@@ -114,6 +189,7 @@ def build_policy_builder_config_from_configdict(
         role_embed_max_L=int(_get(traj_cfg_raw, "role_embed_max_L", 64)),
         role_embed_max_Tobs=int(_get(traj_cfg_raw, "role_embed_max_Tobs", 16)),
         rgb_alpha_init=float(_get(traj_cfg_raw, "rgb_alpha_init", 1.0)),
+        attention_backend=str(_get(traj_cfg_raw, "attention_backend", policy_cfg.attention_backend)),
         ignore_demos=as_bool(_get(traj_cfg_raw, "ignore_demos", False)),
         compress_demo_latents=as_bool(_get(traj_cfg_raw, "compress_demo_latents", True)),
         checkpoint_demo_memory=as_bool(_get(traj_cfg_raw, "checkpoint_demo_memory", False)),
@@ -146,6 +222,7 @@ def build_policy_builder_config_from_configdict(
         role_embed_max_L=int(_get(traj_conv3d_cfg_raw, "role_embed_max_L", 64)),
         role_embed_max_Tobs=int(_get(traj_conv3d_cfg_raw, "role_embed_max_Tobs", 16)),
         rgb_alpha_init=float(_get(traj_conv3d_cfg_raw, "rgb_alpha_init", 1.0)),
+        attention_backend=str(_get(traj_conv3d_cfg_raw, "attention_backend", policy_cfg.attention_backend)),
         ignore_demos=as_bool(_get(traj_conv3d_cfg_raw, "ignore_demos", False)),
         m_traj_tokens=int(_get(traj_conv3d_cfg_raw, "m_traj_tokens", 16)),
         traj_perceiver_layers=int(_get(traj_conv3d_cfg_raw, "traj_perceiver_layers", 2)),
@@ -161,6 +238,7 @@ def build_policy_builder_config_from_configdict(
         d_model=int(_get(perceiver_v2_cfg_raw, "d_model", policy_cfg.d_model)),
         n_heads=base_v2_heads,
         dropout=float(_get(perceiver_v2_cfg_raw, "dropout", 0.0)),
+        attention_backend=str(_get(perceiver_v2_cfg_raw, "attention_backend", policy_cfg.attention_backend)),
         demo_m_frame_tokens=int(_get(perceiver_v2_cfg_raw, "demo_m_frame_tokens", _get(perceiver_v2_cfg_raw, "m_frame_tokens", v2_base.demo_m_frame_tokens))),
         demo_frame_tokenizer_layers=int(_get(perceiver_v2_cfg_raw, "demo_frame_tokenizer_layers", _get(perceiver_v2_cfg_raw, "frame_tokenizer_layers", v2_base.demo_frame_tokenizer_layers))),
         demo_n_heads=int(_get(perceiver_v2_cfg_raw, "demo_n_heads", base_v2_heads)),
@@ -197,6 +275,7 @@ def build_policy_builder_config_from_configdict(
         d_model=int(_get(traj_v2_cfg_raw, "d_model", policy_cfg.d_model)),
         n_heads=base_traj_v2_heads,
         dropout=float(_get(traj_v2_cfg_raw, "dropout", 0.0)),
+        attention_backend=str(_get(traj_v2_cfg_raw, "attention_backend", policy_cfg.attention_backend)),
         demo_m_frame_tokens=int(_get(traj_v2_cfg_raw, "demo_m_frame_tokens", _get(traj_v2_cfg_raw, "m_frame_tokens", traj_v2_base.demo_m_frame_tokens))),
         demo_frame_tokenizer_layers=int(_get(traj_v2_cfg_raw, "demo_frame_tokenizer_layers", _get(traj_v2_cfg_raw, "frame_tokenizer_layers", traj_v2_base.demo_frame_tokenizer_layers))),
         demo_n_heads=int(_get(traj_v2_cfg_raw, "demo_n_heads", base_traj_v2_heads)),
@@ -233,13 +312,40 @@ def build_policy_builder_config_from_configdict(
         use_cond_state_as_traj_fallback=as_bool(_get(traj_v2_cfg_raw, "use_cond_state_as_traj_fallback", True)),
     )
 
+    perceiver_supernode_v2_cfg = _config_dataclass_from_raw(
+        PerceiverDemoQuerySupernodeEncoderV2Config,
+        perceiver_supernode_v2_cfg_raw,
+        as_bool=as_bool,
+        fallback_values={
+            "d_model": policy_cfg.d_model,
+            "n_heads": policy_cfg.n_heads,
+            "demo_n_heads": policy_cfg.n_heads,
+            "query_n_heads": policy_cfg.n_heads,
+            "attention_backend": policy_cfg.attention_backend,
+        },
+    )
+    traj_supernode_v2_cfg = _config_dataclass_from_raw(
+        TrajSupernodePerceiverV2Config,
+        traj_supernode_v2_cfg_raw,
+        as_bool=as_bool,
+        fallback_values={
+            "d_model": policy_cfg.d_model,
+            "n_heads": policy_cfg.n_heads,
+            "demo_n_heads": policy_cfg.n_heads,
+            "query_n_heads": policy_cfg.n_heads,
+            "attention_backend": policy_cfg.attention_backend,
+        },
+    )
+
     return PolicyBuilderConfig(
         policy=policy_cfg,
         encoder_name=str(cfg.encoder_name),
         conv3d_demo_query=conv3d_cfg,
         perceiver_demo_query=perceiver_cfg,
         perceiver_demo_query_v2=perceiver_v2_cfg,
+        perceiver_demo_query_supernode_v2=perceiver_supernode_v2_cfg,
         traj_conv3d=traj_conv3d_cfg,
         traj_perceiver=traj_cfg,
         traj_perceiver_v2=traj_v2_cfg,
+        traj_supernode_perceiver_v2=traj_supernode_v2_cfg,
     )

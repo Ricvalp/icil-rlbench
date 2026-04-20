@@ -29,6 +29,7 @@ class Conv3dDemoQueryEncoderConfig:
     role_embed_max_Tobs: int = 16
     rgb_alpha_init: float = 1.0
     dropout: float = 0.0
+    attention_backend: str = "manual"
     ignore_demos: bool = False
 
 class Conv3dDemoQueryEncoder(ContextEncoder):
@@ -70,7 +71,8 @@ class Conv3dDemoQueryEncoder(ContextEncoder):
         # demo memory perceiver
         self.demo_memory = DemoMemoryPerceiver(
             d=d, M=cfg.M_demo_latents, n_heads=cfg.n_heads,
-            n_layers=cfg.demo_perceiver_layers, dropout=cfg.dropout
+            n_layers=cfg.demo_perceiver_layers, dropout=cfg.dropout,
+            attention_backend=str(cfg.attention_backend),
         )
 
     # --------------------

@@ -7,204 +7,38 @@ import torch
 import torch.nn as nn
 from torch.utils.checkpoint import checkpoint
 
-from icil.models.common import DemoMemoryPerceiver, FramePerceiverTokenizer
+from icil.models.common import DemoMemoryPerceiver, SupernodeFrameTokenizer, SupernodeFrameTokenizerConfig
 from icil.models.common.attention import SelfAttention
 from icil.models.encoders.base import ContextEncoder, ContextEncoderOutput
+from icil.models.encoders.perceiver_demo_query_v2 import PerceiverDemoQueryEncoderV2Config
 
 
 @dataclass
-class PerceiverDemoQueryEncoderV2Config:
-    d_model: int = 512
-    n_heads: int = 8
-    dropout: float = 0.0
-    attention_backend: str = "manual"
-
-    # Demo/query frame tokenizers have separate parameters and can use different hyperparams.
-    demo_m_frame_tokens: int = 128
-    demo_frame_tokenizer_layers: int = 2
-    demo_n_heads: int = 8
-    query_m_frame_tokens: int = 64
-    query_frame_tokenizer_layers: int = 2
-    query_n_heads: int = 8
-
-    # Demo memory compressor.
-    M_demo_latents: int = 256
-    demo_perceiver_layers: int = 3
-
-    # Shared role/mask settings.
-    mask_hash_buckets: int = 2048
+class PerceiverDemoQuerySupernodeEncoderV2Config(PerceiverDemoQueryEncoderV2Config):
+    # Request mask ids from the dataset for quota sampling. Mask embeddings remain separate.
     use_mask_id: bool = True
-    role_embed_max_K: int = 32
-    role_embed_max_L: int = 64
-    role_embed_max_Tobs: int = 16
-    ignore_demos: bool = False
-    compress_demo_latents: bool = True
+    use_mask_embedding: bool = False
+    use_mask_instance_quota: bool = True
+    supernode_sampling_mode: str = "fps"
 
-    # Input feature knobs.
-    demo_rgb_alpha_init: float = 1.0
-    query_rgb_alpha_init: float = 1.0
-    use_gripper_point_features: bool = False
+    demo_supernodes: int = 128
+    query_supernodes: int = 128
+    demo_frame_tokens_out: int = 64
+    query_frame_tokens_out: int = 128
+    neighbors_per_supernode: int = 32
+    demo_supernode_refine_layers: int = 1
+    query_supernode_refine_layers: int = 2
+    compress_supernodes_demo: bool = True
+    compress_supernodes_query: bool = True
+    supernode_pool_layers: int = 1
+    min_gripper_supernodes: int = 2
+    min_mask_supernodes: int = 4
+    gripper_sampling_radius: float = 0.10
+    use_gripper_point_features: bool = True
     gripper_xyz_state_start: int = 0
     gripper_alpha_init: float = 1.0
-
-    # Optional token refiners after the perceiver stages.
-    demo_post_self_attn_layers: int = 0
-    query_post_self_attn_layers: int = 0
-    post_self_attn_mlp_mult: int = 4
-
-    # Memory/runtime knobs.
-    checkpoint_demo_memory: bool = False
-    checkpoint_build_demo_memory: bool = False
-    checkpoint_frame_tokenizer: bool = False
-    tokenize_frames_chunked: bool = False
     chunk_frames: int = 32
-
-
-class _FrameTokenizationStack(nn.Module):
-    def __init__(
-        self,
-        *,
-        d: int,
-        n_heads: int,
-        m_frame_tokens: int,
-        frame_tokenizer_layers: int,
-        state_dim: int,
-        mask_hash_buckets: int,
-        use_mask_id: bool,
-        rgb_alpha_init: float,
-        dropout: float,
-        attention_backend: str,
-        use_gripper_point_features: bool,
-        gripper_xyz_state_start: int,
-        gripper_alpha_init: float,
-    ):
-        super().__init__()
-        self.d = int(d)
-        self.use_mask_id = bool(use_mask_id)
-        self.use_gripper_point_features = bool(use_gripper_point_features)
-        self.gripper_xyz_state_start = int(gripper_xyz_state_start)
-
-        self.xyz_proj = nn.Linear(3, d, bias=False)
-        self.rgb_proj = nn.Linear(3, d, bias=False)
-        self.rgb_alpha = nn.Parameter(torch.tensor(float(rgb_alpha_init), dtype=torch.float32))
-
-        self.mask_embed = nn.Embedding(int(mask_hash_buckets), d)
-        self.gripper_proj = (
-            nn.Linear(4, d, bias=False) if self.use_gripper_point_features else None
-        )
-        self.gripper_alpha = (
-            nn.Parameter(torch.tensor(float(gripper_alpha_init), dtype=torch.float32))
-            if self.use_gripper_point_features
-            else None
-        )
-
-        self.state_proj = nn.Sequential(
-            nn.Linear(int(state_dim), d),
-            nn.SiLU(),
-            nn.Linear(d, d),
-        )
-        self.frame_tokenizer = FramePerceiverTokenizer(
-            d=d,
-            m=int(m_frame_tokens),
-            n_heads=int(n_heads),
-            n_layers=int(frame_tokenizer_layers),
-            dropout=float(dropout),
-            attention_backend=str(attention_backend),
-        )
-
-    def _hash_mask_ids(self, mask_id: torch.Tensor) -> torch.Tensor:
-        return torch.remainder(mask_id, self.mask_embed.num_embeddings)
-
-    def _gripper_xyz_from_state(self, state: torch.Tensor) -> torch.Tensor:
-        start = int(self.gripper_xyz_state_start)
-        end = start + 3
-        if int(state.shape[-1]) < end:
-            raise ValueError(
-                f"state_dim={int(state.shape[-1])} is too small for gripper_xyz_state_start={start}."
-            )
-        return state[..., start:end]
-
-    def _encode_points(
-        self,
-        xyz: torch.Tensor,
-        *,
-        state: torch.Tensor,
-        mask_id: Optional[torch.Tensor],
-        rgb: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        h = self.xyz_proj(xyz)
-        if rgb is not None:
-            h = h + self.rgb_alpha.to(dtype=h.dtype) * self.rgb_proj(rgb.to(dtype=xyz.dtype))
-        if self.use_gripper_point_features:
-            if self.gripper_proj is None or self.gripper_alpha is None:
-                raise RuntimeError("gripper point feature modules were not initialized.")
-            gripper_xyz = self._gripper_xyz_from_state(state).to(device=xyz.device, dtype=xyz.dtype)
-            rel = xyz - gripper_xyz.unsqueeze(1)
-            dist = torch.norm(rel, dim=-1, keepdim=True)
-            grip_feat = torch.cat([rel, dist], dim=-1)
-            h = h + self.gripper_alpha.to(dtype=h.dtype) * self.gripper_proj(grip_feat)
-        if self.use_mask_id and mask_id is not None:
-            h = h + self.mask_embed(self._hash_mask_ids(mask_id))
-        return h
-
-    def tokenize_frames(
-        self,
-        *,
-        xyz: torch.Tensor,
-        state: torch.Tensor,
-        mask_id: Optional[torch.Tensor],
-        rgb: Optional[torch.Tensor] = None,
-        point_valid: Optional[torch.Tensor] = None,
-        checkpoint_frame_tokenizer: bool = False,
-    ) -> torch.Tensor:
-        pt = self._encode_points(xyz, state=state, mask_id=mask_id, rgb=rgb)
-        if checkpoint_frame_tokenizer and self.training and torch.is_grad_enabled():
-            if point_valid is None:
-                z = checkpoint(
-                    lambda pt_: self.frame_tokenizer(pt_, point_mask=None),
-                    pt,
-                    use_reentrant=False,
-                )
-            else:
-                z = checkpoint(
-                    lambda pt_, point_valid_: self.frame_tokenizer(pt_, point_mask=point_valid_),
-                    pt,
-                    point_valid,
-                    use_reentrant=False,
-                )
-        else:
-            z = self.frame_tokenizer(pt, point_mask=point_valid)
-        s_tok = self.state_proj(state).unsqueeze(1)
-        return torch.cat([z, s_tok], dim=1)
-
-    def tokenize_frames_chunked(
-        self,
-        *,
-        xyz: torch.Tensor,
-        state: torch.Tensor,
-        mask_id: Optional[torch.Tensor],
-        rgb: Optional[torch.Tensor] = None,
-        point_valid: Optional[torch.Tensor] = None,
-        chunk_frames: int,
-        checkpoint_frame_tokenizer: bool = False,
-    ) -> torch.Tensor:
-        if int(chunk_frames) < 1:
-            raise ValueError(f"chunk_frames must be >= 1, got {chunk_frames}.")
-        outs = []
-        Bf = int(xyz.shape[0])
-        for s in range(0, Bf, int(chunk_frames)):
-            e = min(Bf, s + int(chunk_frames))
-            outs.append(
-                self.tokenize_frames(
-                    xyz=xyz[s:e],
-                    state=state[s:e],
-                    mask_id=None if mask_id is None else mask_id[s:e],
-                    rgb=None if rgb is None else rgb[s:e],
-                    point_valid=None if point_valid is None else point_valid[s:e],
-                    checkpoint_frame_tokenizer=checkpoint_frame_tokenizer,
-                )
-            )
-        return torch.cat(outs, dim=0)
+    tokenize_frames_chunked: bool = True
 
 
 class _TokenSelfAttentionBlock(nn.Module):
@@ -258,8 +92,125 @@ class _TokenSelfAttentionRefiner(nn.Module):
         return x
 
 
-class PerceiverDemoQueryEncoderV2(ContextEncoder):
-    def __init__(self, *, cfg: PerceiverDemoQueryEncoderV2Config, state_dim: int, action_dim: int):
+class _SupernodeFrameTokenizationStack(nn.Module):
+    def __init__(
+        self,
+        *,
+        cfg: PerceiverDemoQuerySupernodeEncoderV2Config,
+        state_dim: int,
+        branch: str,
+    ):
+        super().__init__()
+        if branch not in {"demo", "query"}:
+            raise ValueError(f"Unsupported branch={branch!r}.")
+        if branch == "demo":
+            num_supernodes = int(cfg.demo_supernodes)
+            frame_tokens_out = int(cfg.demo_frame_tokens_out)
+            n_heads = int(cfg.demo_n_heads)
+            refine_layers = int(cfg.demo_supernode_refine_layers)
+            compress = bool(cfg.compress_supernodes_demo)
+            rgb_alpha_init = float(cfg.demo_rgb_alpha_init)
+        else:
+            num_supernodes = int(cfg.query_supernodes)
+            frame_tokens_out = int(cfg.query_frame_tokens_out)
+            n_heads = int(cfg.query_n_heads)
+            refine_layers = int(cfg.query_supernode_refine_layers)
+            compress = bool(cfg.compress_supernodes_query)
+            rgb_alpha_init = float(cfg.query_rgb_alpha_init)
+
+        tokenizer_cfg = SupernodeFrameTokenizerConfig(
+            d_model=int(cfg.d_model),
+            n_heads=n_heads,
+            dropout=float(cfg.dropout),
+            num_supernodes=num_supernodes,
+            frame_tokens_out=frame_tokens_out,
+            neighbors_per_supernode=int(cfg.neighbors_per_supernode),
+            supernode_refine_layers=refine_layers,
+            compress_supernodes=compress,
+            supernode_pool_layers=int(cfg.supernode_pool_layers),
+            use_mask_id=bool(cfg.use_mask_id),
+            use_mask_embedding=bool(cfg.use_mask_embedding),
+            mask_hash_buckets=int(cfg.mask_hash_buckets),
+            supernode_sampling_mode=str(cfg.supernode_sampling_mode),
+            attention_backend=str(cfg.attention_backend),
+            use_mask_instance_quota=bool(cfg.use_mask_instance_quota),
+            min_mask_supernodes=int(cfg.min_mask_supernodes),
+            use_gripper_point_features=bool(cfg.use_gripper_point_features),
+            gripper_xyz_state_start=int(cfg.gripper_xyz_state_start),
+            gripper_alpha_init=float(cfg.gripper_alpha_init),
+            min_gripper_supernodes=int(cfg.min_gripper_supernodes),
+            gripper_sampling_radius=float(cfg.gripper_sampling_radius),
+            rgb_alpha_init=rgb_alpha_init,
+        )
+        self.tokenizer = SupernodeFrameTokenizer(cfg=tokenizer_cfg, state_dim=int(state_dim))
+        self.checkpoint_frame_tokenizer = bool(cfg.checkpoint_frame_tokenizer)
+
+    def tokenize_frames(
+        self,
+        *,
+        xyz: torch.Tensor,
+        state: torch.Tensor,
+        mask_id: Optional[torch.Tensor],
+        rgb: Optional[torch.Tensor] = None,
+        point_valid: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        if point_valid is None:
+            point_valid = torch.ones(xyz.shape[:2], device=xyz.device, dtype=torch.bool)
+        if self.checkpoint_frame_tokenizer and self.training and torch.is_grad_enabled():
+            has_rgb = rgb is not None
+            has_mask = mask_id is not None
+            rgb_arg = rgb if has_rgb else xyz.new_empty((0,))
+            mask_arg = mask_id if has_mask else torch.empty((0,), device=xyz.device, dtype=torch.long)
+
+            def _forward(
+                xyz_: torch.Tensor,
+                state_: torch.Tensor,
+                valid_: torch.Tensor,
+                rgb_: torch.Tensor,
+                mask_: torch.Tensor,
+            ) -> torch.Tensor:
+                return self.tokenizer(
+                    xyz=xyz_,
+                    valid=valid_,
+                    state=state_,
+                    rgb=rgb_ if has_rgb else None,
+                    mask_id=mask_ if has_mask else None,
+                )
+
+            return checkpoint(_forward, xyz, state, point_valid, rgb_arg, mask_arg, use_reentrant=False)
+
+        return self.tokenizer(xyz=xyz, valid=point_valid, state=state, rgb=rgb, mask_id=mask_id)
+
+    def tokenize_frames_chunked(
+        self,
+        *,
+        xyz: torch.Tensor,
+        state: torch.Tensor,
+        mask_id: Optional[torch.Tensor],
+        rgb: Optional[torch.Tensor] = None,
+        point_valid: Optional[torch.Tensor] = None,
+        chunk_frames: int,
+    ) -> torch.Tensor:
+        if int(chunk_frames) < 1:
+            raise ValueError(f"chunk_frames must be >= 1, got {chunk_frames}.")
+        outs = []
+        Bf = int(xyz.shape[0])
+        for s in range(0, Bf, int(chunk_frames)):
+            e = min(Bf, s + int(chunk_frames))
+            outs.append(
+                self.tokenize_frames(
+                    xyz=xyz[s:e],
+                    state=state[s:e],
+                    mask_id=None if mask_id is None else mask_id[s:e],
+                    rgb=None if rgb is None else rgb[s:e],
+                    point_valid=None if point_valid is None else point_valid[s:e],
+                )
+            )
+        return torch.cat(outs, dim=0)
+
+
+class PerceiverDemoQuerySupernodeEncoderV2(ContextEncoder):
+    def __init__(self, *, cfg: PerceiverDemoQuerySupernodeEncoderV2Config, state_dim: int, action_dim: int):
         super().__init__()
         del action_dim
         self.cfg = cfg
@@ -267,36 +218,8 @@ class PerceiverDemoQueryEncoderV2(ContextEncoder):
         self.d_model = int(cfg.d_model)
         d = self.d_model
 
-        self.demo_frame_stack = _FrameTokenizationStack(
-            d=d,
-            n_heads=int(cfg.demo_n_heads),
-            m_frame_tokens=int(cfg.demo_m_frame_tokens),
-            frame_tokenizer_layers=int(cfg.demo_frame_tokenizer_layers),
-            state_dim=int(state_dim),
-            mask_hash_buckets=int(cfg.mask_hash_buckets),
-            use_mask_id=bool(cfg.use_mask_id),
-            rgb_alpha_init=float(cfg.demo_rgb_alpha_init),
-            dropout=float(cfg.dropout),
-            attention_backend=str(cfg.attention_backend),
-            use_gripper_point_features=bool(cfg.use_gripper_point_features),
-            gripper_xyz_state_start=int(cfg.gripper_xyz_state_start),
-            gripper_alpha_init=float(cfg.gripper_alpha_init),
-        )
-        self.query_frame_stack = _FrameTokenizationStack(
-            d=d,
-            n_heads=int(cfg.query_n_heads),
-            m_frame_tokens=int(cfg.query_m_frame_tokens),
-            frame_tokenizer_layers=int(cfg.query_frame_tokenizer_layers),
-            state_dim=int(state_dim),
-            mask_hash_buckets=int(cfg.mask_hash_buckets),
-            use_mask_id=bool(cfg.use_mask_id),
-            rgb_alpha_init=float(cfg.query_rgb_alpha_init),
-            dropout=float(cfg.dropout),
-            attention_backend=str(cfg.attention_backend),
-            use_gripper_point_features=bool(cfg.use_gripper_point_features),
-            gripper_xyz_state_start=int(cfg.gripper_xyz_state_start),
-            gripper_alpha_init=float(cfg.gripper_alpha_init),
-        )
+        self.demo_frame_stack = _SupernodeFrameTokenizationStack(cfg=cfg, state_dim=state_dim, branch="demo")
+        self.query_frame_stack = _SupernodeFrameTokenizationStack(cfg=cfg, state_dim=state_dim, branch="query")
 
         self.demo_id_embed = nn.Embedding(int(cfg.role_embed_max_K), d)
         self.keyframe_embed = nn.Embedding(int(cfg.role_embed_max_L), d)
@@ -340,7 +263,7 @@ class PerceiverDemoQueryEncoderV2(ContextEncoder):
 
     def _tokenize_with_stack(
         self,
-        stack: _FrameTokenizationStack,
+        stack: _SupernodeFrameTokenizationStack,
         *,
         xyz_f: torch.Tensor,
         state_f: torch.Tensor,
@@ -356,7 +279,6 @@ class PerceiverDemoQueryEncoderV2(ContextEncoder):
                 rgb=rgb_f,
                 point_valid=valid_f,
                 chunk_frames=int(self.cfg.chunk_frames),
-                checkpoint_frame_tokenizer=bool(self.cfg.checkpoint_frame_tokenizer),
             )
         return stack.tokenize_frames(
             xyz=xyz_f,
@@ -364,7 +286,6 @@ class PerceiverDemoQueryEncoderV2(ContextEncoder):
             mask_id=mask_f,
             rgb=rgb_f,
             point_valid=valid_f,
-            checkpoint_frame_tokenizer=bool(self.cfg.checkpoint_frame_tokenizer),
         )
 
     def _build_demo_memory(
@@ -495,7 +416,7 @@ class PerceiverDemoQueryEncoderV2(ContextEncoder):
             ctx = z_query
         else:
             if cond_xyz is None or cond_state is None:
-                raise ValueError("PerceiverDemoQueryEncoderV2 requires cond_xyz and cond_state when ignore_demos=False.")
+                raise ValueError("PerceiverDemoQuerySupernodeEncoderV2 requires cond_xyz and cond_state when ignore_demos=False.")
             use_demo_ckpt = bool(
                 self.cfg.checkpoint_build_demo_memory and self.training and torch.is_grad_enabled()
             )

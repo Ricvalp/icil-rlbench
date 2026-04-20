@@ -36,6 +36,7 @@ from icil.models import (
     PolicyConfig,
     build_policy,
 )
+from icil.models.policies.config_utils import inherit_missing_encoder_attention_backend
 from icil.models.maml import MAMLTaskBuilder, MAMLTaskSpec, PolicyLossWrapper, copy_fast_params_into_policy
 
 _CONFIG = config_flags.DEFINE_config_file(
@@ -188,8 +189,10 @@ def _legacy_flat_model_cfg_to_nested(model_from_ckpt: Dict[str, Any]) -> Dict[st
         'policy': {},
         'perceiver_demo_query': {},
         'perceiver_demo_query_v2': {},
+        'perceiver_demo_query_supernode_v2': {},
         'traj_perceiver': {},
         'traj_perceiver_v2': {},
+        'traj_supernode_perceiver_v2': {},
     }
     for k, v in model_from_ckpt.items():
         if k in (
@@ -197,9 +200,11 @@ def _legacy_flat_model_cfg_to_nested(model_from_ckpt: Dict[str, Any]) -> Dict[st
             'conv3d_demo_query',
             'perceiver_demo_query',
             'perceiver_demo_query_v2',
+            'perceiver_demo_query_supernode_v2',
             'traj_conv3d',
             'traj_perceiver',
             'traj_perceiver_v2',
+            'traj_supernode_perceiver_v2',
             'encoder_name',
         ):
             out[k] = v
@@ -222,6 +227,7 @@ def _model_config_from_checkpoint_or_default(ckpt: Dict[str, Any]) -> PolicyBuil
         return defaults
     if 'policy' not in model_from_ckpt:
         model_from_ckpt = _legacy_flat_model_cfg_to_nested(model_from_ckpt)
+    model_from_ckpt = inherit_missing_encoder_attention_backend(model_from_ckpt)
     return _dataclass_from_dict(defaults, model_from_ckpt)
 
 
@@ -236,12 +242,16 @@ def _conditioning_use_mask_id_from_eval_and_checkpoint(
         return bool(model_cfg.perceiver_demo_query.use_mask_id)
     if str(model_cfg.encoder_name) == 'perceiver_demo_query_v2':
         return bool(model_cfg.perceiver_demo_query_v2.use_mask_id)
+    if str(model_cfg.encoder_name) == 'perceiver_demo_query_supernode_v2':
+        return bool(model_cfg.perceiver_demo_query_supernode_v2.use_mask_id)
     if str(model_cfg.encoder_name) == 'traj_conv3d':
         return bool(model_cfg.traj_conv3d.use_mask_id)
     if str(model_cfg.encoder_name) == 'traj_perceiver':
         return bool(model_cfg.traj_perceiver.use_mask_id)
     if str(model_cfg.encoder_name) == 'traj_perceiver_v2':
         return bool(model_cfg.traj_perceiver_v2.use_mask_id)
+    if str(model_cfg.encoder_name) == 'traj_supernode_perceiver_v2':
+        return bool(model_cfg.traj_supernode_perceiver_v2.use_mask_id)
     return _as_bool(getattr(cfg.conditioning, 'use_mask_id', True))
 
 
@@ -253,12 +263,16 @@ def _ignore_demos_from_model_cfg(model_cfg: PolicyBuilderConfig) -> bool:
         return bool(model_cfg.perceiver_demo_query.ignore_demos)
     if str(model_cfg.encoder_name) == 'perceiver_demo_query_v2':
         return bool(model_cfg.perceiver_demo_query_v2.ignore_demos)
+    if str(model_cfg.encoder_name) == 'perceiver_demo_query_supernode_v2':
+        return bool(model_cfg.perceiver_demo_query_supernode_v2.ignore_demos)
     if str(model_cfg.encoder_name) == 'traj_conv3d':
         return bool(model_cfg.traj_conv3d.ignore_demos)
     if str(model_cfg.encoder_name) == 'traj_perceiver':
         return bool(model_cfg.traj_perceiver.ignore_demos)
     if str(model_cfg.encoder_name) == 'traj_perceiver_v2':
         return bool(model_cfg.traj_perceiver_v2.ignore_demos)
+    if str(model_cfg.encoder_name) == 'traj_supernode_perceiver_v2':
+        return bool(model_cfg.traj_supernode_perceiver_v2.ignore_demos)
     return False
 
 

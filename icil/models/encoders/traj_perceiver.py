@@ -32,6 +32,7 @@ class TrajPerceiverConfig:
     role_embed_max_L: int = 64
     role_embed_max_Tobs: int = 16
     rgb_alpha_init: float = 1.0
+    attention_backend: str = "manual"
     ignore_demos: bool = False
     compress_demo_latents: bool = True
     checkpoint_demo_memory: bool = False
@@ -88,6 +89,7 @@ class TrajectoryPerceiverEncoder(ContextEncoder):
                 role_embed_max_Tobs=int(cfg.role_embed_max_Tobs),
                 rgb_alpha_init=float(cfg.rgb_alpha_init),
                 dropout=float(cfg.dropout),
+                attention_backend=str(cfg.attention_backend),
                 ignore_demos=bool(cfg.ignore_demos),
                 compress_demo_latents=bool(cfg.compress_demo_latents),
                 checkpoint_demo_memory=bool(cfg.checkpoint_demo_memory),
@@ -122,6 +124,7 @@ class TrajectoryPerceiverEncoder(ContextEncoder):
             n_heads=int(cfg.n_heads),
             n_layers=int(cfg.traj_perceiver_layers),
             dropout=float(cfg.dropout),
+            attention_backend=str(cfg.attention_backend),
         )
 
     def _resolve_traj_source(
@@ -290,6 +293,7 @@ class TrajectoryOnlyPerceiverEncoder(ContextEncoder):
             n_heads=int(cfg.n_heads),
             n_layers=int(cfg.traj_perceiver_layers),
             dropout=float(cfg.dropout),
+            attention_backend=str(cfg.attention_backend),
         )
 
     def forward(

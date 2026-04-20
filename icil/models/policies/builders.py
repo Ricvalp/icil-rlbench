@@ -11,12 +11,16 @@ from icil.models.encoders import (
     PerceiverDemoQueryEncoderConfig,
     PerceiverDemoQueryEncoderV2,
     PerceiverDemoQueryEncoderV2Config,
+    PerceiverDemoQuerySupernodeEncoderV2,
+    PerceiverDemoQuerySupernodeEncoderV2Config,
     TrajConv3DConfig,
     TrajPerceiverConfig,
     TrajPerceiverV2Config,
+    TrajSupernodePerceiverV2Config,
     TrajectoryConv3DEncoder,
     TrajectoryPerceiverEncoder,
     TrajectoryPerceiverEncoderV2,
+    TrajectorySupernodePerceiverEncoderV2,
 )
 from icil.models.policies.policy import Policy, PolicyConfig
 
@@ -28,9 +32,11 @@ class PolicyBuilderConfig:
     conv3d_demo_query: Conv3dDemoQueryEncoderConfig = field(default_factory=Conv3dDemoQueryEncoderConfig)
     perceiver_demo_query: PerceiverDemoQueryEncoderConfig = field(default_factory=PerceiverDemoQueryEncoderConfig)
     perceiver_demo_query_v2: PerceiverDemoQueryEncoderV2Config = field(default_factory=PerceiverDemoQueryEncoderV2Config)
+    perceiver_demo_query_supernode_v2: PerceiverDemoQuerySupernodeEncoderV2Config = field(default_factory=PerceiverDemoQuerySupernodeEncoderV2Config)
     traj_conv3d: TrajConv3DConfig = field(default_factory=TrajConv3DConfig)
     traj_perceiver: TrajPerceiverConfig = field(default_factory=TrajPerceiverConfig)
     traj_perceiver_v2: TrajPerceiverV2Config = field(default_factory=TrajPerceiverV2Config)
+    traj_supernode_perceiver_v2: TrajSupernodePerceiverV2Config = field(default_factory=TrajSupernodePerceiverV2Config)
 
 
 ContextEncoderBuilder = Callable[[PolicyBuilderConfig, int, int], ContextEncoder]
@@ -72,6 +78,18 @@ def _build_perceiver_demo_query_v2_encoder(
     )
 
 
+def _build_perceiver_demo_query_supernode_v2_encoder(
+    cfg: PolicyBuilderConfig,
+    state_dim: int,
+    action_dim: int,
+) -> ContextEncoder:
+    return PerceiverDemoQuerySupernodeEncoderV2(
+        cfg=cfg.perceiver_demo_query_supernode_v2,
+        state_dim=state_dim,
+        action_dim=action_dim,
+    )
+
+
 def _build_traj_perceiver_encoder(
     cfg: PolicyBuilderConfig,
     state_dim: int,
@@ -96,6 +114,18 @@ def _build_traj_perceiver_v2_encoder(
     )
 
 
+def _build_traj_supernode_perceiver_v2_encoder(
+    cfg: PolicyBuilderConfig,
+    state_dim: int,
+    action_dim: int,
+) -> ContextEncoder:
+    return TrajectorySupernodePerceiverEncoderV2(
+        cfg=cfg.traj_supernode_perceiver_v2,
+        state_dim=state_dim,
+        action_dim=action_dim,
+    )
+
+
 def _build_traj_conv3d_encoder(
     cfg: PolicyBuilderConfig,
     state_dim: int,
@@ -112,9 +142,11 @@ _ENCODER_BUILDERS: Dict[str, ContextEncoderBuilder] = {
     "conv3d_demo_query": _build_conv3d_demo_query_encoder,
     "perceiver_demo_query": _build_perceiver_demo_query_encoder,
     "perceiver_demo_query_v2": _build_perceiver_demo_query_v2_encoder,
+    "perceiver_demo_query_supernode_v2": _build_perceiver_demo_query_supernode_v2_encoder,
     "traj_conv3d": _build_traj_conv3d_encoder,
     "traj_perceiver": _build_traj_perceiver_encoder,
     "traj_perceiver_v2": _build_traj_perceiver_v2_encoder,
+    "traj_supernode_perceiver_v2": _build_traj_supernode_perceiver_v2_encoder,
 }
 
 
@@ -148,12 +180,16 @@ def validate_builder_config(cfg: PolicyBuilderConfig) -> None:
         enc_d = int(cfg.perceiver_demo_query.d_model)
     elif cfg.encoder_name == "perceiver_demo_query_v2":
         enc_d = int(cfg.perceiver_demo_query_v2.d_model)
+    elif cfg.encoder_name == "perceiver_demo_query_supernode_v2":
+        enc_d = int(cfg.perceiver_demo_query_supernode_v2.d_model)
     elif cfg.encoder_name == "traj_conv3d":
         enc_d = int(cfg.traj_conv3d.d_model)
     elif cfg.encoder_name == "traj_perceiver":
         enc_d = int(cfg.traj_perceiver.d_model)
     elif cfg.encoder_name == "traj_perceiver_v2":
         enc_d = int(cfg.traj_perceiver_v2.d_model)
+    elif cfg.encoder_name == "traj_supernode_perceiver_v2":
+        enc_d = int(cfg.traj_supernode_perceiver_v2.d_model)
     else:  # pragma: no cover - guarded above
         enc_d = policy_d
 

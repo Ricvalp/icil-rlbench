@@ -33,6 +33,7 @@ class PolicyConfig:
     dropout: float = 0.0
     grad_checkpoint_dit: bool = False
     context_attention_mode: str = "single"  # "single" | "two_ctx"
+    attention_backend: str = "manual"  # "manual" | "sdpa" ("flash" alias)
 
     # diffusion (DDIM via diffusers)
     num_train_timesteps: int = 1000
@@ -101,6 +102,7 @@ class Policy(nn.Module):
                     cond_dim=d,
                     mlp_mult=cfg.denoiser_mlp_mult,
                     dropout=cfg.dropout,
+                    attention_backend=str(cfg.attention_backend),
                 )
                 for _ in range(cfg.denoiser_layers)
             ]

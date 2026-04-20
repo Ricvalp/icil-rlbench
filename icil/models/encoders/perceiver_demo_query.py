@@ -27,6 +27,7 @@ class PerceiverDemoQueryEncoderConfig:
     role_embed_max_Tobs: int = 16
     rgb_alpha_init: float = 1.0
     dropout: float = 0.0
+    attention_backend: str = "manual"
     ignore_demos: bool = False
     compress_demo_latents: bool = True
     checkpoint_demo_memory: bool = False
@@ -67,7 +68,8 @@ class PerceiverDemoQueryEncoder(ContextEncoder):
         # frame tokenizer (Perceiver)
         self.frame_tokenizer = FramePerceiverTokenizer(
             d=d, m=cfg.m_frame_tokens, n_heads=cfg.n_heads,
-            n_layers=cfg.frame_tokenizer_layers, dropout=cfg.dropout
+            n_layers=cfg.frame_tokenizer_layers, dropout=cfg.dropout,
+            attention_backend=str(cfg.attention_backend),
         )
 
         # demo memory perceiver
@@ -75,7 +77,8 @@ class PerceiverDemoQueryEncoder(ContextEncoder):
         if self.cfg.compress_demo_latents:
             self.demo_memory = DemoMemoryPerceiver(
                 d=d, M=cfg.M_demo_latents, n_heads=cfg.n_heads,
-                n_layers=cfg.demo_perceiver_layers, dropout=cfg.dropout
+                n_layers=cfg.demo_perceiver_layers, dropout=cfg.dropout,
+                attention_backend=str(cfg.attention_backend),
             )
 
     # --------------------

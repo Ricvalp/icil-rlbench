@@ -59,6 +59,7 @@ class TrajectoryPerceiverEncoderV2(ContextEncoder):
             n_heads=int(cfg.n_heads),
             n_layers=int(cfg.traj_perceiver_layers),
             dropout=float(cfg.dropout),
+            attention_backend=str(cfg.attention_backend),
         )
 
     def _resolve_traj_source(
