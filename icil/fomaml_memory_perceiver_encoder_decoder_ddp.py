@@ -253,13 +253,16 @@ def train(cfg: ConfigDict) -> None:
                 )
 
         use_mask_id = memory_train_lib._resolve_use_mask_id(model_cfg)
-        resolved_learn_inner_lrs = memory_train_lib._should_learn_inner_lrs(
+        resolved_inner_lr_mode = memory_train_lib._resolve_inner_lr_mode(
             cfg,
             resume_checkpoint=resume_checkpoint,
+            pretrained_checkpoint=pretrained_checkpoint if pretrained_path is not None and resume_path is None else None,
+            resume_config=resume_config,
+            pretrained_config=pretrained_config,
         )
         memory_cfg = memory_train_lib._build_memory_cfg(cfg)
-        memory_cfg.learn_inner_lrs = bool(resolved_learn_inner_lrs)
-        inner_lr_schedule = memory_train_lib._build_inner_lr_schedule(memory_cfg)
+        memory_cfg.inner_lr_mode = str(resolved_inner_lr_mode)
+        inner_lr_schedule = memory_train_lib._build_inner_lr_schedule_wrapper(memory_cfg)
         if inner_lr_schedule is not None:
             inner_lr_schedule = inner_lr_schedule.to(device)
         memory_train_lib._load_inner_lr_schedule_state(
@@ -323,7 +326,7 @@ def train(cfg: ConfigDict) -> None:
         logging.info(
             'Resolved memory-%s DDP setup: model_source=%s | data.K=%d | memory_support=K-1=%d | '
             'outer_param_tensors=%d | inner_steps=%d | inner_batch=%d | query_batch=%d | grad_accum=%d | '
-            'distributed=%s | world_size=%d | effective_outer_batch=%d | learn_inner_lrs=%s | inner_lrs=%s',
+            'distributed=%s | world_size=%d | effective_outer_batch=%d | inner_lr_mode=%s | inner_lrs=%s',
             'FOMAML' if first_order else 'MAML',
             model_cfg_source,
             int(dataset_cfg.K),
@@ -336,7 +339,7 @@ def train(cfg: ConfigDict) -> None:
             str(bool(distributed)),
             int(world_size),
             int(cfg.train.batch_size) * int(world_size),
-            str(bool(inner_lr_schedule is not None)),
+            str(memory_cfg.inner_lr_mode),
             resolved_inner_lrs,
         )
         logging.info(
@@ -363,7 +366,7 @@ def train(cfg: ConfigDict) -> None:
         config_payload['maml']['num_query_loss_samples'] = int(memory_cfg.num_query_loss_samples)
         config_payload['maml']['holdout_index'] = int(memory_cfg.holdout_index)
         config_payload['maml']['grad_accum_steps'] = int(memory_cfg.grad_accum_steps)
-        config_payload['maml']['learn_inner_lrs'] = bool(inner_lr_schedule is not None)
+        config_payload['maml']['inner_lr_mode'] = str(memory_cfg.inner_lr_mode)
         config_payload['algorithm'] = 'memory_fomaml_ddp' if bool(first_order) else 'memory_maml_ddp'
         config_payload['runtime'] = {
             'run_id': run_id,
@@ -386,7 +389,7 @@ def train(cfg: ConfigDict) -> None:
             'outer_param_names': list(outer_names),
             'fast_object': 'context_encoder.support_tokens',
             'first_order': bool(first_order),
-            'learn_inner_lrs': bool(inner_lr_schedule is not None),
+            'inner_lr_mode': str(memory_cfg.inner_lr_mode),
             'initial_inner_lrs': resolved_inner_lrs,
         }
         config_path = workdir / 'config.json'

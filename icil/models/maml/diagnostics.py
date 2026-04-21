@@ -8,10 +8,14 @@ import torch.nn.functional as F
 from torch.func import functional_call
 
 from icil.models.maml.core import copy_fast_params_into_policy
+from icil.models.maml.inner_lr import (
+    PositiveInnerLRSchedule,
+    inner_lr_tensor_for_step,
+    normalize_inner_lr_mode,
+)
 from icil.models.maml.memory_core import (
     _clip_grad,
     _iter_microbatches,
-    PositiveInnerLRSchedule,
     init_memory_tokens_from_batch,
     memory_diffusion_loss,
     sample_actions_with_memory_tokens,
@@ -108,6 +112,7 @@ def parameter_inner_loop_query_curves(
     eta: float,
     use_mask_id: bool,
     max_tasks: int,
+    inner_lr_schedule: Optional[PositiveInnerLRSchedule] = None,
 ) -> Tuple[List[float], List[float]]:
     selected_tasks = list(prepared_tasks[: max(1, int(max_tasks))])
     if not selected_tasks:
@@ -125,6 +130,7 @@ def parameter_inner_loop_query_curves(
     adapted_policy.eval()
     for param in adapted_policy.parameters():
         param.requires_grad_(False)
+    inner_lr_mode = normalize_inner_lr_mode(getattr(cfg, 'inner_lr_mode', 'fixed'))
 
     try:
         for prepared_task in selected_tasks:
@@ -170,7 +176,15 @@ def parameter_inner_loop_query_curves(
                 grads = _clip_parameter_grads(grads, float(cfg.max_grad_norm))
                 new_params = dict(adapted_params)
                 for name, param, grad in zip(fast_names, fast_tensors, grads):
-                    new_params[name] = (param - float(cfg.inner_lr) * grad).detach().requires_grad_(True)
+                    step_lr = inner_lr_tensor_for_step(
+                        step_idx=step_idx - 1,
+                        mode=inner_lr_mode,
+                        fixed_inner_lr=float(cfg.inner_lr),
+                        schedule=inner_lr_schedule,
+                        device=param.device,
+                        dtype=param.dtype,
+                    )
+                    new_params[name] = (param - step_lr * grad).detach().requires_grad_(True)
                 adapted_params = new_params
                 eval_query(step_idx)
             count += 1
@@ -203,6 +217,7 @@ def memory_inner_loop_query_curves(
 
     was_training = policy.training
     policy.eval()
+    inner_lr_mode = normalize_inner_lr_mode(getattr(cfg, 'inner_lr_mode', 'fixed'))
     try:
         for prepared_task in selected_tasks:
             memory_tokens, memory_token_mask = init_memory_tokens_from_batch(
@@ -272,10 +287,13 @@ def memory_inner_loop_query_curves(
                     if grad is None:
                         raise RuntimeError('No microbatches were produced for memory inner-loop diagnostics.')
                 grad = _clip_grad(grad, float(cfg.max_grad_norm))
-                step_lr = (
-                    inner_lr_schedule.lr_at(step_idx - 1).to(device=memory_tokens.device, dtype=memory_tokens.dtype)
-                    if inner_lr_schedule is not None
-                    else torch.tensor(float(cfg.inner_lr), device=memory_tokens.device, dtype=memory_tokens.dtype)
+                step_lr = inner_lr_tensor_for_step(
+                    step_idx=step_idx - 1,
+                    mode=inner_lr_mode,
+                    fixed_inner_lr=float(cfg.inner_lr),
+                    schedule=inner_lr_schedule,
+                    device=memory_tokens.device,
+                    dtype=memory_tokens.dtype,
                 )
                 memory_tokens = (memory_tokens - step_lr * grad).detach().requires_grad_(True)
                 eval_query(step_idx)

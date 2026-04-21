@@ -338,6 +338,7 @@ def get_config():
     cfg.maml = ConfigDict()
     cfg.maml.inner_steps = 4
     cfg.maml.inner_lr = 1e-4
+    cfg.maml.inner_lr_mode = 'fixed'
     cfg.maml.outer_lr = 1e-4
     cfg.maml.max_grad_norm = 1.0
     cfg.maml.last_frac_fast = 0.25

@@ -45,6 +45,13 @@ from icil.models.maml import (
     copy_fast_params_into_policy,
     get_fast_param_names,
 )
+from icil.models.maml.inner_lr import (
+    PositiveInnerLRSchedule,
+    build_inner_lr_schedule,
+    infer_inner_lr_mode,
+    inner_lr_tensor_for_step,
+    resolved_inner_lr_values,
+)
 
 _CONFIG = config_flags.DEFINE_config_file(
     'config',
@@ -309,6 +316,12 @@ def _resolve_maml_cfg_from_checkpoint(ckpt: Dict[str, Any], *, data_k: int) -> M
         raise ValueError('MAML eval requires checkpoint["config"]["maml"] to be present.')
 
     maml_cfg = _dataclass_from_dict(MAMLConfig(), maml_src)
+    maml_cfg.inner_lr_mode = infer_inner_lr_mode(
+        checkpoint=ckpt,
+        checkpoint_config=ckpt_config,
+        local_mode=getattr(maml_cfg, 'inner_lr_mode', 'fixed'),
+        legacy_learn_inner_lrs=maml_src.get('learn_inner_lrs', None) if isinstance(maml_src, dict) else None,
+    )
     resolved_outer_context_size = int(getattr(maml_cfg, 'outer_context_size', 0))
     if resolved_outer_context_size <= 0:
         resolved_payload = ckpt_config.get('resolved', {}) or {}
@@ -325,6 +338,30 @@ def _resolve_maml_cfg_from_checkpoint(ckpt: Dict[str, Any], *, data_k: int) -> M
         )
     maml_cfg.outer_context_size = int(resolved_outer_context_size)
     return maml_cfg
+
+
+def _build_eval_inner_lr_schedule(
+    *,
+    ckpt: Dict[str, Any],
+    checkpoint_inner_steps: int,
+    maml_cfg: MAMLConfig,
+    device: torch.device,
+) -> Optional[PositiveInnerLRSchedule]:
+    schedule = build_inner_lr_schedule(
+        mode=getattr(maml_cfg, 'inner_lr_mode', 'fixed'),
+        inner_steps=int(checkpoint_inner_steps),
+        init_lr=float(maml_cfg.inner_lr),
+    )
+    if schedule is None:
+        return None
+    schedule = schedule.to(device)
+    state = ckpt.get('inner_lr_schedule', None)
+    if not isinstance(state, dict):
+        raise ValueError(
+            f'Checkpoint declares inner_lr_mode={maml_cfg.inner_lr_mode!r} but has no inner_lr_schedule state.'
+        )
+    schedule.load_state_dict(state, strict=True)
+    return schedule
 
 
 
@@ -1335,6 +1372,8 @@ def _adapt_fast_params_with_stats(
     device: torch.device,
     inner_steps: int,
     inner_lr: float,
+    inner_lr_mode: str,
+    inner_lr_schedule: Optional[PositiveInnerLRSchedule],
     max_grad_norm: float,
     grad_accum_steps: int = 1,
     query_batch: Optional[Dict[str, Any]] = None,
@@ -1458,7 +1497,15 @@ def _adapt_fast_params_with_stats(
             for name, param, grad in zip(fast_names_wrapped, fast_tensors, grads):
                 if grad is None:
                     continue
-                new_params[name] = param - float(inner_lr) * grad
+                step_lr = inner_lr_tensor_for_step(
+                    step_idx=step_idx - 1,
+                    mode=inner_lr_mode,
+                    fixed_inner_lr=float(inner_lr),
+                    schedule=inner_lr_schedule,
+                    device=param.device,
+                    dtype=param.dtype,
+                )
+                new_params[name] = param - step_lr * grad
             adapted_params = new_params
             if query_batch is not None and log_query_loss:
                 query_losses.append(_eval_query_loss(adapted_params))
@@ -1505,6 +1552,7 @@ def _apply_maml_adaptation_in_place(
     device: torch.device,
     maml_cfg: MAMLConfig,
     grad_accum_steps: int = 1,
+    inner_lr_schedule: Optional[PositiveInnerLRSchedule] = None,
     use_mask_id: bool = False,
     log_query_loss: bool = False,
     log_query_sample_mse: bool = False,
@@ -1526,6 +1574,8 @@ def _apply_maml_adaptation_in_place(
             device=device,
             inner_steps=int(maml_cfg.inner_steps),
             inner_lr=float(maml_cfg.inner_lr),
+            inner_lr_mode=str(getattr(maml_cfg, 'inner_lr_mode', 'fixed')),
+            inner_lr_schedule=inner_lr_schedule,
             max_grad_norm=float(maml_cfg.max_grad_norm),
             grad_accum_steps=int(grad_accum_steps),
             log_query_loss=bool(log_query_loss),
@@ -1895,6 +1945,7 @@ def evaluate(cfg: ConfigDict) -> None:
     dataset_cfg = _dataset_config_from_eval_and_checkpoint(cfg, ckpt)
     maml_cfg = _resolve_maml_cfg_from_checkpoint(ckpt, data_k=int(dataset_cfg.K))
     checkpoint_inner_steps = int(maml_cfg.inner_steps)
+    checkpoint_inner_lr_mode = str(getattr(maml_cfg, 'inner_lr_mode', 'fixed'))
     inner_steps_override = int(getattr(cfg.maml_eval, 'inner_steps_override', -1))
     if inner_steps_override < -1:
         raise ValueError(
@@ -1903,6 +1954,28 @@ def evaluate(cfg: ConfigDict) -> None:
         )
     if inner_steps_override >= 0:
         maml_cfg.inner_steps = int(inner_steps_override)
+    inner_lr_schedule = _build_eval_inner_lr_schedule(
+        ckpt=ckpt,
+        checkpoint_inner_steps=int(checkpoint_inner_steps),
+        maml_cfg=maml_cfg,
+        device=device,
+    )
+    if (
+        checkpoint_inner_lr_mode == 'per_step_learned'
+        and int(maml_cfg.inner_steps) > int(checkpoint_inner_steps)
+    ):
+        raise ValueError(
+            f'Checkpoint uses inner_lr_mode={checkpoint_inner_lr_mode!r} with '
+            f'{checkpoint_inner_steps} learned step sizes, but eval requested '
+            f'inner_steps={int(maml_cfg.inner_steps)}. Use inner_steps_override <= {checkpoint_inner_steps} '
+            'or train/evaluate with shared_learned/fixed.'
+        )
+    resolved_inner_lrs = resolved_inner_lr_values(
+        mode=checkpoint_inner_lr_mode,
+        inner_steps=int(maml_cfg.inner_steps),
+        fixed_inner_lr=float(maml_cfg.inner_lr),
+        schedule=inner_lr_schedule,
+    )
     grad_accum_steps = int(getattr(cfg.maml_eval, 'grad_accum_steps', 1))
     if grad_accum_steps < 1:
         raise ValueError(f'cfg.maml_eval.grad_accum_steps must be >= 1, got {grad_accum_steps}.')
@@ -1963,6 +2036,7 @@ def evaluate(cfg: ConfigDict) -> None:
     resolved_payload['dataset']['stride'] = int(dataset_cfg.stride)
     resolved_payload['checkpoint_maml'] = {
         'inner_steps': int(checkpoint_inner_steps),
+        'inner_lr_mode': str(checkpoint_inner_lr_mode),
         'inner_lr': float(maml_cfg.inner_lr),
         'outer_lr': float(maml_cfg.outer_lr),
         'weight_decay': float(maml_cfg.weight_decay),
@@ -1986,6 +2060,8 @@ def evaluate(cfg: ConfigDict) -> None:
         'run_dir': str(run_dir),
         'checkpoint_inner_steps': int(checkpoint_inner_steps),
         'effective_inner_steps': int(maml_cfg.inner_steps),
+        'effective_inner_lr_mode': str(checkpoint_inner_lr_mode),
+        'effective_inner_lrs': resolved_inner_lrs,
         'inner_steps_override': int(inner_steps_override),
         'grad_accum_steps': int(grad_accum_steps),
         'num_support_batches_loo': int(num_support_batches_loo),
@@ -2016,7 +2092,7 @@ def evaluate(cfg: ConfigDict) -> None:
     )
     logging.info(
         'MAML cfg: inner_steps=%d | checkpoint_inner_steps=%d | override=%d | '
-        'grad_accum_steps=%d | inner_lr=%.3e | max_grad_norm=%.3f | outer_context_size=%d | '
+        'grad_accum_steps=%d | inner_lr_mode=%s | inner_lrs=%s | max_grad_norm=%.3f | outer_context_size=%d | '
         'num_loo_per_task=%d | num_support_batches_loo=%d | reuse_diffusion_noise=%s | '
         'preload_support_batches_to_device=%s | '
         'log_query_loss=%s | num_query_loss_samples=%d | log_query_sample_mse=%s',
@@ -2024,7 +2100,8 @@ def evaluate(cfg: ConfigDict) -> None:
         int(checkpoint_inner_steps),
         int(inner_steps_override),
         int(grad_accum_steps),
-        float(maml_cfg.inner_lr),
+        str(checkpoint_inner_lr_mode),
+        resolved_inner_lrs,
         float(maml_cfg.max_grad_norm),
         int(maml_cfg.outer_context_size),
         int(maml_cfg.num_loo_per_task),
@@ -2132,6 +2209,7 @@ def evaluate(cfg: ConfigDict) -> None:
                     device=device,
                     maml_cfg=maml_cfg,
                     grad_accum_steps=int(grad_accum_steps),
+                    inner_lr_schedule=inner_lr_schedule,
                     use_mask_id=use_mask_id,
                     log_query_loss=_as_bool(getattr(cfg.maml_eval, 'log_query_loss', False)),
                     log_query_sample_mse=_as_bool(getattr(cfg.maml_eval, 'log_query_sample_mse', False)),
@@ -2231,6 +2309,8 @@ def evaluate(cfg: ConfigDict) -> None:
                 'outer_context_size': int(maml_cfg.outer_context_size),
                 'inner_steps': int(maml_cfg.inner_steps),
                 'checkpoint_inner_steps': int(checkpoint_inner_steps),
+                'inner_lr_mode': str(checkpoint_inner_lr_mode),
+                'effective_inner_lrs': resolved_inner_lrs,
                 'inner_steps_override': int(inner_steps_override),
                 'grad_accum_steps': int(grad_accum_steps),
                 'num_support_batches_loo': int(num_support_batches_loo),

@@ -8,6 +8,11 @@ import torch
 import torch.nn as nn
 from torch.func import functional_call
 
+from icil.models.maml.inner_lr import (
+    PositiveInnerLRSchedule,
+    inner_lr_tensor_for_step,
+    normalize_inner_lr_mode,
+)
 from icil.models.maml.tasks import MAMLTaskBuilder, MAMLTaskSpec
 
 
@@ -15,6 +20,7 @@ from icil.models.maml.tasks import MAMLTaskBuilder, MAMLTaskSpec
 class MAMLConfig:
     inner_steps: int = 1
     inner_lr: float = 1e-4
+    inner_lr_mode: str = 'fixed'
     outer_lr: float = 1e-4
     weight_decay: float = 0.0
     max_grad_norm: float = 1.0
@@ -189,14 +195,16 @@ def adapt_fast_params_for_prepared_task(
     fast_names: Sequence[str],
     cfg: MAMLConfig,
     create_graph: bool,
+    inner_lr_schedule: Optional[PositiveInnerLRSchedule] = None,
     base_params: Optional[Dict[str, torch.Tensor]] = None,
     buffers: Optional[Dict[str, torch.Tensor]] = None,
     inner_grad_norms_out: Optional[List[torch.Tensor]] = None,
 ) -> Dict[str, torch.Tensor]:
     adapted_params = base_params if base_params is not None else dict(model.named_parameters())
     model_buffers = buffers if buffers is not None else dict(model.named_buffers())
+    inner_lr_mode = normalize_inner_lr_mode(getattr(cfg, 'inner_lr_mode', 'fixed'))
 
-    for support_batch in prepared_task["support_batches"]:
+    for step_idx, support_batch in enumerate(prepared_task["support_batches"]):
         support_loss = functional_call(model, (adapted_params, model_buffers), (support_batch,))
         fast_tensors = [adapted_params[name] for name in fast_names]
         grads = torch.autograd.grad(
@@ -212,7 +220,15 @@ def adapt_fast_params_for_prepared_task(
 
         new_params = dict(adapted_params)
         for name, param, grad in zip(fast_names, fast_tensors, grads):
-            new_params[name] = param - float(cfg.inner_lr) * grad
+            step_lr = inner_lr_tensor_for_step(
+                step_idx=step_idx,
+                mode=inner_lr_mode,
+                fixed_inner_lr=float(cfg.inner_lr),
+                schedule=inner_lr_schedule,
+                device=param.device,
+                dtype=param.dtype,
+            )
+            new_params[name] = param - step_lr * grad
         adapted_params = new_params
 
     return adapted_params
@@ -224,6 +240,7 @@ def maml_task_loss_second_order(
     *,
     fast_names: Sequence[str],
     cfg: MAMLConfig,
+    inner_lr_schedule: Optional[PositiveInnerLRSchedule] = None,
     base_params: Optional[Dict[str, torch.Tensor]] = None,
     buffers: Optional[Dict[str, torch.Tensor]] = None,
 ) -> torch.Tensor:
@@ -233,6 +250,7 @@ def maml_task_loss_second_order(
         fast_names=fast_names,
         cfg=cfg,
         create_graph=True,
+        inner_lr_schedule=inner_lr_schedule,
         base_params=base_params,
         buffers=buffers,
     )
@@ -246,6 +264,7 @@ def maml_step(
     *,
     fast_names: Sequence[str],
     cfg: MAMLConfig,
+    inner_lr_schedule: Optional[PositiveInnerLRSchedule] = None,
 ) -> torch.Tensor:
     base_params = dict(model.named_parameters())
     buffers = dict(model.named_buffers())
@@ -257,6 +276,7 @@ def maml_step(
                 prepared_task,
                 fast_names=fast_names,
                 cfg=cfg,
+                inner_lr_schedule=inner_lr_schedule,
                 base_params=base_params,
                 buffers=buffers,
             )
@@ -270,6 +290,7 @@ def maml_step_with_stats(
     *,
     fast_names: Sequence[str],
     cfg: MAMLConfig,
+    inner_lr_schedule: Optional[PositiveInnerLRSchedule] = None,
 ) -> tuple[torch.Tensor, float]:
     base_params = dict(model.named_parameters())
     buffers = dict(model.named_buffers())
@@ -282,6 +303,7 @@ def maml_step_with_stats(
             fast_names=fast_names,
             cfg=cfg,
             create_graph=True,
+            inner_lr_schedule=inner_lr_schedule,
             base_params=base_params,
             buffers=buffers,
             inner_grad_norms_out=inner_grad_norms,
