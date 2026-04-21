@@ -343,7 +343,7 @@ def get_config():
     )
 
     cfg.wandb = ConfigDict()
-    cfg.wandb.enable = False
+    cfg.wandb.enable = True
     cfg.wandb.project = os.environ.get("WANDB_PROJECT", "icil-perceiver-pretrain")
     cfg.wandb.entity = os.environ.get("WANDB_ENTITY", "ricvalp")
     cfg.wandb.group = ""
