@@ -11,6 +11,7 @@ from icil.models.maml.core import copy_fast_params_into_policy
 from icil.models.maml.memory_core import (
     _clip_grad,
     _iter_microbatches,
+    PositiveInnerLRSchedule,
     init_memory_tokens_from_batch,
     memory_diffusion_loss,
     sample_actions_with_memory_tokens,
@@ -189,6 +190,7 @@ def memory_inner_loop_query_curves(
     inference_steps: int,
     eta: float,
     max_tasks: int,
+    inner_lr_schedule: Optional[PositiveInnerLRSchedule] = None,
 ) -> Tuple[List[float], List[float]]:
     selected_tasks = list(prepared_tasks[: max(1, int(max_tasks))])
     if not selected_tasks:
@@ -270,7 +272,12 @@ def memory_inner_loop_query_curves(
                     if grad is None:
                         raise RuntimeError('No microbatches were produced for memory inner-loop diagnostics.')
                 grad = _clip_grad(grad, float(cfg.max_grad_norm))
-                memory_tokens = (memory_tokens - float(cfg.inner_lr) * grad).detach().requires_grad_(True)
+                step_lr = (
+                    inner_lr_schedule.lr_at(step_idx - 1).to(device=memory_tokens.device, dtype=memory_tokens.dtype)
+                    if inner_lr_schedule is not None
+                    else torch.tensor(float(cfg.inner_lr), device=memory_tokens.device, dtype=memory_tokens.dtype)
+                )
+                memory_tokens = (memory_tokens - step_lr * grad).detach().requires_grad_(True)
                 eval_query(step_idx)
             count += 1
     finally:

@@ -7,6 +7,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 import numpy as np
 import torch
 import torch.nn.functional as F
+from torch import nn
 
 from icil.models.common import sinusoidal_position_embedding, sinusoidal_time_embedding
 from icil.models.maml.tasks import MAMLTaskBuilder, MAMLTaskSpec
@@ -17,6 +18,7 @@ from icil.models.policies.policy import Policy
 class MemoryMAMLConfig:
     inner_steps: int = 1
     inner_lr: float = 1e-4
+    learn_inner_lrs: bool = False
     outer_lr: float = 1e-4
     weight_decay: float = 0.0
     max_grad_norm: float = 1.0
@@ -26,6 +28,36 @@ class MemoryMAMLConfig:
     holdout_index: int = -1
     reuse_diffusion_noise: bool = False
     grad_accum_steps: int = 1
+
+
+class PositiveInnerLRSchedule(nn.Module):
+    def __init__(
+        self,
+        *,
+        inner_steps: int,
+        init_lr: float,
+        min_lr: float = 1e-8,
+    ) -> None:
+        super().__init__()
+        if int(inner_steps) < 1:
+            raise ValueError(f'inner_steps must be >= 1, got {inner_steps}.')
+        if float(init_lr) <= 0.0:
+            raise ValueError(f'init_lr must be > 0, got {init_lr}.')
+        if float(min_lr) < 0.0:
+            raise ValueError(f'min_lr must be >= 0, got {min_lr}.')
+        self.min_lr = float(min_lr)
+        init = torch.full((int(inner_steps),), float(init_lr) - self.min_lr, dtype=torch.float32)
+        init = init.clamp_min(1e-8)
+        self.raw_lrs = nn.Parameter(torch.log(torch.expm1(init)))
+
+    def values(self) -> torch.Tensor:
+        return F.softplus(self.raw_lrs) + float(self.min_lr)
+
+    def lr_at(self, step_idx: int) -> torch.Tensor:
+        values = self.values()
+        if not 0 <= int(step_idx) < int(values.shape[0]):
+            raise IndexError(f'step_idx={step_idx} out of range for {int(values.shape[0])} inner LR values.')
+        return values[int(step_idx)]
 
 
 def _as_bool(value: Any) -> bool:
@@ -674,6 +706,7 @@ def adapt_memory_tokens_for_prepared_task(
     *,
     cfg: MemoryMAMLConfig,
     create_graph: bool,
+    inner_lr_schedule: Optional[PositiveInnerLRSchedule] = None,
     inner_grad_norms_out: Optional[List[torch.Tensor]] = None,
     inner_losses_out: Optional[List[torch.Tensor]] = None,
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
@@ -730,7 +763,12 @@ def adapt_memory_tokens_for_prepared_task(
         if inner_losses_out is not None:
             inner_losses_out.append(loss_for_stats)
         grad = _clip_grad(grad, float(cfg.max_grad_norm))
-        memory_tokens = memory_tokens - float(cfg.inner_lr) * grad
+        step_lr = (
+            inner_lr_schedule.lr_at(step_idx).to(device=memory_tokens.device, dtype=memory_tokens.dtype)
+            if inner_lr_schedule is not None
+            else torch.tensor(float(cfg.inner_lr), device=memory_tokens.device, dtype=memory_tokens.dtype)
+        )
+        memory_tokens = memory_tokens - step_lr * grad
 
     return memory_tokens, memory_token_mask
 
@@ -741,6 +779,7 @@ def memory_maml_step_with_stats(
     *,
     cfg: MemoryMAMLConfig,
     first_order: bool,
+    inner_lr_schedule: Optional[PositiveInnerLRSchedule] = None,
 ) -> Tuple[torch.Tensor, float, float]:
     if not prepared_tasks:
         raise ValueError('prepared_tasks must contain at least one task.')
@@ -753,6 +792,7 @@ def memory_maml_step_with_stats(
             prepared_task,
             cfg=cfg,
             create_graph=not bool(first_order),
+            inner_lr_schedule=inner_lr_schedule,
             inner_grad_norms_out=inner_grad_norms,
             inner_losses_out=inner_losses,
         )

@@ -31,6 +31,7 @@ def get_config():
     cfg.maml.first_order = False
     cfg.maml.inner_steps = 8
     cfg.maml.inner_lr = 1e-4
+    cfg.maml.learn_inner_lrs = False
     cfg.maml.outer_lr = 1e-4
     cfg.maml.max_grad_norm = 1.0
     cfg.maml.num_queries_per_step = 8

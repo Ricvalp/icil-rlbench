@@ -22,6 +22,7 @@ from icil.models.maml.diagnostics import (
 )
 from icil.models.maml.memory_core import (
     MemoryMAMLConfig,
+    PositiveInnerLRSchedule,
     adapt_memory_tokens_for_prepared_task,
     memory_maml_step_with_stats,
     prepare_outer_batch_for_memory_meta_step,
@@ -219,6 +220,7 @@ def _build_memory_cfg(cfg: ConfigDict) -> MemoryMAMLConfig:
     return MemoryMAMLConfig(
         inner_steps=int(cfg.maml.inner_steps),
         inner_lr=float(cfg.maml.inner_lr),
+        learn_inner_lrs=_as_bool(getattr(cfg.maml, 'learn_inner_lrs', False)),
         outer_lr=float(cfg.maml.outer_lr),
         weight_decay=float(cfg.train.weight_decay),
         max_grad_norm=float(cfg.maml.max_grad_norm),
@@ -229,6 +231,70 @@ def _build_memory_cfg(cfg: ConfigDict) -> MemoryMAMLConfig:
         reuse_diffusion_noise=_as_bool(getattr(cfg.maml, 'reuse_diffusion_noise', False)),
         grad_accum_steps=int(getattr(cfg.maml, 'grad_accum_steps', 1)),
     )
+
+
+def _should_learn_inner_lrs(
+    cfg: ConfigDict,
+    *,
+    resume_checkpoint: Optional[Dict[str, Any]],
+) -> bool:
+    if _as_bool(getattr(cfg.maml, 'learn_inner_lrs', False)):
+        return True
+    if isinstance(resume_checkpoint, dict) and isinstance(resume_checkpoint.get('inner_lr_schedule'), dict):
+        return True
+    return False
+
+
+def _build_inner_lr_schedule(memory_cfg: MemoryMAMLConfig) -> Optional[PositiveInnerLRSchedule]:
+    if not bool(memory_cfg.learn_inner_lrs) or int(memory_cfg.inner_steps) < 1:
+        return None
+    return PositiveInnerLRSchedule(
+        inner_steps=int(memory_cfg.inner_steps),
+        init_lr=float(memory_cfg.inner_lr),
+    )
+
+
+def _load_inner_lr_schedule_state(
+    schedule: Optional[PositiveInnerLRSchedule],
+    *,
+    checkpoint: Optional[Dict[str, Any]],
+    checkpoint_path: Optional[Path],
+) -> bool:
+    if schedule is None or not isinstance(checkpoint, dict):
+        return False
+    state = checkpoint.get('inner_lr_schedule', None)
+    if not isinstance(state, dict):
+        return False
+    schedule.load_state_dict(state, strict=True)
+    logging.info('Resumed learned inner LR schedule from %s', checkpoint_path)
+    return True
+
+
+def _inner_lr_values(
+    *,
+    schedule: Optional[PositiveInnerLRSchedule],
+    cfg: MemoryMAMLConfig,
+) -> List[float]:
+    num_steps = max(0, int(cfg.inner_steps))
+    if schedule is None:
+        return [float(cfg.inner_lr) for _ in range(num_steps)]
+    return [float(v) for v in schedule.values().detach().cpu().tolist()]
+
+
+def _inner_lr_log_dict(
+    *,
+    schedule: Optional[PositiveInnerLRSchedule],
+    cfg: MemoryMAMLConfig,
+    prefix: str = 'train',
+) -> Dict[str, float]:
+    values = _inner_lr_values(schedule=schedule, cfg=cfg)
+    if not values:
+        return {}
+    return {
+        f'{prefix}/inner_lr_min': float(min(values)),
+        f'{prefix}/inner_lr_max': float(max(values)),
+        f'{prefix}/inner_lr_mean': float(sum(values) / len(values)),
+    }
 
 
 def _build_logging_task_batch(
@@ -264,6 +330,7 @@ def _sample_adapted_queries_for_tasks(
     tasks: Sequence[MAMLTaskSpec],
     task_builder: MAMLTaskBuilder,
     memory_cfg: MemoryMAMLConfig,
+    inner_lr_schedule: Optional[PositiveInnerLRSchedule],
     device: torch.device,
     use_mask_id: bool,
     inference_steps: int,
@@ -302,6 +369,7 @@ def _sample_adapted_queries_for_tasks(
                     prepared_task,
                     cfg=memory_cfg,
                     create_graph=False,
+                    inner_lr_schedule=inner_lr_schedule,
                 )
             query_batch = prepared_task['query_batch']
             pred = sample_actions_with_memory_tokens(
@@ -334,6 +402,7 @@ def _estimate_adapted_x0_mse(
     dataset_cfg: ICILConfig,
     task_builder: MAMLTaskBuilder,
     memory_cfg: MemoryMAMLConfig,
+    inner_lr_schedule: Optional[PositiveInnerLRSchedule],
     total_items: int,
     per_batch_items: int,
     seed: int,
@@ -367,6 +436,7 @@ def _estimate_adapted_x0_mse(
             tasks=task_batch,
             task_builder=task_builder,
             memory_cfg=memory_cfg,
+            inner_lr_schedule=inner_lr_schedule,
             device=device,
             use_mask_id=use_mask_id,
             inference_steps=inference_steps,
@@ -390,17 +460,18 @@ def _save_checkpoint(
     model: torch.nn.Module,
     optimizer: torch.optim.Optimizer,
     config_payload: Dict[str, Any],
+    extra_state: Optional[Dict[str, Any]] = None,
 ) -> None:
     ckpt_path.parent.mkdir(parents=True, exist_ok=True)
-    torch.save(
-        {
-            'step': int(step),
-            'model': model.state_dict(),
-            'optimizer': optimizer.state_dict(),
-            'config': config_payload,
-        },
-        ckpt_path,
-    )
+    payload = {
+        'step': int(step),
+        'model': model.state_dict(),
+        'optimizer': optimizer.state_dict(),
+        'config': config_payload,
+    }
+    if extra_state:
+        payload.update(extra_state)
+    torch.save(payload, ckpt_path)
 
 
 def train_memory_maml(cfg: ConfigDict) -> None:
@@ -547,7 +618,20 @@ def train_memory_maml(cfg: ConfigDict) -> None:
                 )
 
         use_mask_id = _resolve_use_mask_id(model_cfg)
+        resolved_learn_inner_lrs = _should_learn_inner_lrs(
+            cfg,
+            resume_checkpoint=resume_checkpoint,
+        )
         memory_cfg = _build_memory_cfg(cfg)
+        memory_cfg.learn_inner_lrs = bool(resolved_learn_inner_lrs)
+        inner_lr_schedule = _build_inner_lr_schedule(memory_cfg)
+        if inner_lr_schedule is not None:
+            inner_lr_schedule = inner_lr_schedule.to(device)
+        _load_inner_lr_schedule_state(
+            inner_lr_schedule,
+            checkpoint=resume_checkpoint,
+            checkpoint_path=resume_path,
+        )
         outer_names = get_outer_param_names(
             policy,
             train_encoder=_as_bool(cfg.outer.train_encoder),
@@ -558,8 +642,9 @@ def train_memory_maml(cfg: ConfigDict) -> None:
         )
         set_outer_trainable_params(policy, outer_names)
         outer_params = [param for param in policy.parameters() if param.requires_grad]
+        inner_lr_params = list(inner_lr_schedule.parameters()) if inner_lr_schedule is not None else []
         optimizer = torch.optim.AdamW(
-            outer_params,
+            outer_params + inner_lr_params,
             lr=float(memory_cfg.outer_lr),
             weight_decay=float(memory_cfg.weight_decay),
         )
@@ -567,13 +652,21 @@ def train_memory_maml(cfg: ConfigDict) -> None:
         global_step = 0
         if resume_checkpoint is not None:
             optimizer_state = resume_checkpoint.get('optimizer', None)
+            optimizer_resumed = False
             if isinstance(optimizer_state, dict):
-                optimizer.load_state_dict(optimizer_state)
+                try:
+                    optimizer.load_state_dict(optimizer_state)
+                    optimizer_resumed = True
+                except ValueError as exc:
+                    logging.warning('Skipping optimizer state load from %s due to mismatch: %s', resume_path, exc)
             global_step = int(resume_checkpoint.get('step', 0))
-            logging.info('Resumed optimizer state from %s at step=%d', resume_path, global_step)
+            if optimizer_resumed:
+                logging.info('Resumed optimizer state from %s at step=%d', resume_path, global_step)
 
         n_total, n_trainable = _count_parameters(policy)
         n_outer = count_params_by_name(policy, outer_names)
+        n_inner_lr = sum(int(param.numel()) for param in inner_lr_params)
+        resolved_inner_lrs = _inner_lr_values(schedule=inner_lr_schedule, cfg=memory_cfg)
         logging.info('Run id=%s', run_id)
         logging.info('Output dir=%s', workdir)
         logging.info('Checkpoint dir=%s', checkpoint_dir)
@@ -583,26 +676,30 @@ def train_memory_maml(cfg: ConfigDict) -> None:
         if excluded_store is not None:
             logging.info('Excluded-task sampling store=%s | variations=%d', excluded_tasks_used, len(excluded_store))
         logging.info(
-            'Model params: total=%s (%.3fM) | trainable=%s (%.3fM) | outer=%s (%.3fM)',
+            'Model params: total=%s (%.3fM) | trainable=%s (%.3fM) | outer=%s (%.3fM) | inner_lr=%s',
             f'{n_total:,}',
             n_total / 1e6,
-            f'{n_trainable:,}',
-            n_trainable / 1e6,
-            f'{n_outer:,}',
-            n_outer / 1e6,
+            f'{n_trainable + n_inner_lr:,}',
+            (n_trainable + n_inner_lr) / 1e6,
+            f'{n_outer + n_inner_lr:,}',
+            (n_outer + n_inner_lr) / 1e6,
+            f'{n_inner_lr:,}',
         )
         logging.info(
             'Resolved memory-%s setup: model_source=%s | data.K=%d | memory_support=K-1=%d | '
-            'outer_param_tensors=%d | inner_steps=%d | inner_batch=%d | query_batch=%d | grad_accum=%d',
+            'outer_param_tensors=%d | inner_steps=%d | inner_batch=%d | query_batch=%d | grad_accum=%d | '
+            'learn_inner_lrs=%s | inner_lrs=%s',
             'FOMAML' if first_order else 'MAML',
             model_cfg_source,
             int(dataset_cfg.K),
             int(dataset_cfg.K) - 1,
-            len(outer_names),
+            len(outer_names) + len(inner_lr_params),
             int(memory_cfg.inner_steps),
             int(memory_cfg.num_queries_per_step),
             int(memory_cfg.num_query_loss_samples),
             int(memory_cfg.grad_accum_steps),
+            str(bool(inner_lr_schedule is not None)),
+            resolved_inner_lrs,
         )
         logging.info(
             'Resolved dataset: K=%d | L=%d | T_obs=%d | H=%d | stride=%d',
@@ -628,6 +725,7 @@ def train_memory_maml(cfg: ConfigDict) -> None:
         config_payload['maml']['num_query_loss_samples'] = int(memory_cfg.num_query_loss_samples)
         config_payload['maml']['holdout_index'] = int(memory_cfg.holdout_index)
         config_payload['maml']['grad_accum_steps'] = int(memory_cfg.grad_accum_steps)
+        config_payload['maml']['learn_inner_lrs'] = bool(inner_lr_schedule is not None)
         config_payload['runtime'] = {
             'run_id': run_id,
             'output_dir': str(workdir),
@@ -643,6 +741,8 @@ def train_memory_maml(cfg: ConfigDict) -> None:
             'outer_param_names': list(outer_names),
             'fast_object': 'context_encoder.support_tokens',
             'first_order': bool(first_order),
+            'learn_inner_lrs': bool(inner_lr_schedule is not None),
+            'initial_inner_lrs': resolved_inner_lrs,
         }
         config_path = workdir / 'config.json'
         with config_path.open('w', encoding='utf-8') as f:
@@ -664,8 +764,9 @@ def train_memory_maml(cfg: ConfigDict) -> None:
             wandb_run.log(
                 {
                     'model/num_params_total': n_total,
-                    'model/num_params_trainable': n_trainable,
-                    'model/num_params_outer': n_outer,
+                    'model/num_params_trainable': n_trainable + n_inner_lr,
+                    'model/num_params_outer': n_outer + n_inner_lr,
+                    'model/num_params_inner_lr': n_inner_lr,
                 },
                 step=global_step,
             )
@@ -721,10 +822,12 @@ def train_memory_maml(cfg: ConfigDict) -> None:
                 prepared_tasks,
                 cfg=memory_cfg,
                 first_order=first_order,
+                inner_lr_schedule=inner_lr_schedule,
             )
             meta_loss.backward()
+            all_outer_trainables = outer_params + inner_lr_params
             if float(memory_cfg.max_grad_norm) > 0.0:
-                torch.nn.utils.clip_grad_norm_(outer_params, float(memory_cfg.max_grad_norm))
+                torch.nn.utils.clip_grad_norm_(all_outer_trainables, float(memory_cfg.max_grad_norm))
             optimizer.step()
             global_step += 1
 
@@ -741,13 +844,14 @@ def train_memory_maml(cfg: ConfigDict) -> None:
                 steps_per_sec = log_count / elapsed
                 avg_loss = log_loss / max(1, log_count)
                 logging.info(
-                    'step %d/%d | meta_loss %.6f | inner_loss %.6f | inner_grad %.6f | lr %.3e | %.2f step/s',
+                    'step %d/%d | meta_loss %.6f | inner_loss %.6f | inner_grad %.6f | outer_lr %.3e | inner_lr_mean %.3e | %.2f step/s',
                     global_step,
                     int(cfg.train.num_steps),
                     avg_loss,
                     float(avg_inner_loss),
                     float(avg_inner_memory_grad_norm),
                     float(optimizer.param_groups[0]['lr']),
+                    _inner_lr_log_dict(schedule=inner_lr_schedule, cfg=memory_cfg).get('train/inner_lr_mean', float(memory_cfg.inner_lr)),
                     steps_per_sec,
                 )
                 log_loss = 0.0
@@ -763,6 +867,7 @@ def train_memory_maml(cfg: ConfigDict) -> None:
                         'train/inner_support_loss': wb_inner_loss_sum / max(1, wb_count),
                         'train/lr': float(optimizer.param_groups[0]['lr']),
                         'train/step': global_step,
+                        **_inner_lr_log_dict(schedule=inner_lr_schedule, cfg=memory_cfg),
                     },
                     step=global_step,
                 )
@@ -784,6 +889,7 @@ def train_memory_maml(cfg: ConfigDict) -> None:
                     inference_steps=wandb_sample_inference_steps,
                     eta=wandb_sample_eta,
                     max_tasks=max_diag_tasks,
+                    inner_lr_schedule=inner_lr_schedule,
                 )
                 fig_diff = plot_scalar_curve(
                     query_diffusion_curve,
@@ -828,6 +934,7 @@ def train_memory_maml(cfg: ConfigDict) -> None:
                         tasks=sample_tasks,
                         task_builder=task_builder,
                         memory_cfg=memory_cfg,
+                        inner_lr_schedule=inner_lr_schedule,
                         device=device,
                         use_mask_id=use_mask_id,
                         inference_steps=wandb_sample_inference_steps,
@@ -840,6 +947,7 @@ def train_memory_maml(cfg: ConfigDict) -> None:
                     dataset_cfg=dataset_cfg,
                     task_builder=task_builder,
                     memory_cfg=memory_cfg,
+                    inner_lr_schedule=inner_lr_schedule,
                     total_items=wandb_sample_mse_items,
                     per_batch_items=max(1, wandb_sample_batch),
                     seed=seed + 4_000_003 + global_step,
@@ -855,6 +963,7 @@ def train_memory_maml(cfg: ConfigDict) -> None:
                     dataset_cfg=dataset_cfg,
                     task_builder=excluded_task_builder if excluded_task_builder is not None else task_builder,
                     memory_cfg=memory_cfg,
+                    inner_lr_schedule=inner_lr_schedule,
                     total_items=wandb_sample_mse_items,
                     per_batch_items=max(1, wandb_sample_batch),
                     seed=seed + 5_000_003 + global_step,
@@ -902,6 +1011,11 @@ def train_memory_maml(cfg: ConfigDict) -> None:
                     model=policy,
                     optimizer=optimizer,
                     config_payload=config_payload,
+                    extra_state=(
+                        {'inner_lr_schedule': inner_lr_schedule.state_dict()}
+                        if inner_lr_schedule is not None
+                        else None
+                    ),
                 )
                 logging.info('Saved checkpoint: %s', ckpt_path)
 
@@ -912,6 +1026,11 @@ def train_memory_maml(cfg: ConfigDict) -> None:
             model=policy,
             optimizer=optimizer,
             config_payload=config_payload,
+            extra_state=(
+                {'inner_lr_schedule': inner_lr_schedule.state_dict()}
+                if inner_lr_schedule is not None
+                else None
+            ),
         )
         logging.info('Training complete. Final checkpoint: %s', final_ckpt)
 

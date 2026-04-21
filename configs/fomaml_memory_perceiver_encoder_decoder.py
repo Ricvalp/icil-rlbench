@@ -25,6 +25,7 @@ def get_config():
         ),
     )
     cfg.maml.first_order = True
+    cfg.maml.learn_inner_lrs = True
     cfg.wandb.project = os.environ.get('WANDB_PROJECT', 'icil-perceiver-memory-fomaml')
 
     return cfg

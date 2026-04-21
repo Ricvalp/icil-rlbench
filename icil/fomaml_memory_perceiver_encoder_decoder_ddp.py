@@ -253,7 +253,20 @@ def train(cfg: ConfigDict) -> None:
                 )
 
         use_mask_id = memory_train_lib._resolve_use_mask_id(model_cfg)
+        resolved_learn_inner_lrs = memory_train_lib._should_learn_inner_lrs(
+            cfg,
+            resume_checkpoint=resume_checkpoint,
+        )
         memory_cfg = memory_train_lib._build_memory_cfg(cfg)
+        memory_cfg.learn_inner_lrs = bool(resolved_learn_inner_lrs)
+        inner_lr_schedule = memory_train_lib._build_inner_lr_schedule(memory_cfg)
+        if inner_lr_schedule is not None:
+            inner_lr_schedule = inner_lr_schedule.to(device)
+        memory_train_lib._load_inner_lr_schedule_state(
+            inner_lr_schedule,
+            checkpoint=resume_checkpoint,
+            checkpoint_path=resume_path,
+        )
         outer_names = get_outer_param_names(
             policy,
             train_encoder=memory_train_lib._as_bool(cfg.outer.train_encoder),
@@ -264,8 +277,9 @@ def train(cfg: ConfigDict) -> None:
         )
         set_outer_trainable_params(policy, outer_names)
         outer_params = [param for param in policy.parameters() if param.requires_grad]
+        inner_lr_params = list(inner_lr_schedule.parameters()) if inner_lr_schedule is not None else []
         optimizer = torch.optim.AdamW(
-            outer_params,
+            outer_params + inner_lr_params,
             lr=float(memory_cfg.outer_lr),
             weight_decay=float(memory_cfg.weight_decay),
         )
@@ -273,13 +287,21 @@ def train(cfg: ConfigDict) -> None:
         global_step = 0
         if resume_checkpoint is not None:
             optimizer_state = resume_checkpoint.get('optimizer', None)
+            optimizer_resumed = False
             if isinstance(optimizer_state, dict):
-                optimizer.load_state_dict(optimizer_state)
+                try:
+                    optimizer.load_state_dict(optimizer_state)
+                    optimizer_resumed = True
+                except ValueError as exc:
+                    logging.warning('Skipping optimizer state load from %s due to mismatch: %s', resume_path, exc)
             global_step = int(resume_checkpoint.get('step', 0))
-            logging.info('Resumed optimizer state from %s at step=%d', resume_path, global_step)
+            if optimizer_resumed:
+                logging.info('Resumed optimizer state from %s at step=%d', resume_path, global_step)
 
         n_total, n_trainable = memory_train_lib._count_parameters(policy)
         n_outer = count_params_by_name(policy, outer_names)
+        n_inner_lr = sum(int(param.numel()) for param in inner_lr_params)
+        resolved_inner_lrs = memory_train_lib._inner_lr_values(schedule=inner_lr_schedule, cfg=memory_cfg)
         logging.info('Run id=%s', run_id)
         logging.info('Output dir=%s', workdir)
         logging.info('Checkpoint dir=%s', checkpoint_dir)
@@ -289,23 +311,24 @@ def train(cfg: ConfigDict) -> None:
         if excluded_store is not None:
             logging.info('Excluded-task sampling store=%s | variations=%d', excluded_tasks_used, len(excluded_store))
         logging.info(
-            'Model params: total=%s (%.3fM) | trainable=%s (%.3fM) | outer=%s (%.3fM)',
+            'Model params: total=%s (%.3fM) | trainable=%s (%.3fM) | outer=%s (%.3fM) | inner_lr=%s',
             f'{n_total:,}',
             n_total / 1e6,
-            f'{n_trainable:,}',
-            n_trainable / 1e6,
-            f'{n_outer:,}',
-            n_outer / 1e6,
+            f'{n_trainable + n_inner_lr:,}',
+            (n_trainable + n_inner_lr) / 1e6,
+            f'{n_outer + n_inner_lr:,}',
+            (n_outer + n_inner_lr) / 1e6,
+            f'{n_inner_lr:,}',
         )
         logging.info(
             'Resolved memory-%s DDP setup: model_source=%s | data.K=%d | memory_support=K-1=%d | '
             'outer_param_tensors=%d | inner_steps=%d | inner_batch=%d | query_batch=%d | grad_accum=%d | '
-            'distributed=%s | world_size=%d | effective_outer_batch=%d',
+            'distributed=%s | world_size=%d | effective_outer_batch=%d | learn_inner_lrs=%s | inner_lrs=%s',
             'FOMAML' if first_order else 'MAML',
             model_cfg_source,
             int(dataset_cfg.K),
             int(dataset_cfg.K) - 1,
-            len(outer_names),
+            len(outer_names) + len(inner_lr_params),
             int(memory_cfg.inner_steps),
             int(memory_cfg.num_queries_per_step),
             int(memory_cfg.num_query_loss_samples),
@@ -313,6 +336,8 @@ def train(cfg: ConfigDict) -> None:
             str(bool(distributed)),
             int(world_size),
             int(cfg.train.batch_size) * int(world_size),
+            str(bool(inner_lr_schedule is not None)),
+            resolved_inner_lrs,
         )
         logging.info(
             'Resolved dataset: K=%d | L=%d | T_obs=%d | H=%d | stride=%d',
@@ -338,6 +363,7 @@ def train(cfg: ConfigDict) -> None:
         config_payload['maml']['num_query_loss_samples'] = int(memory_cfg.num_query_loss_samples)
         config_payload['maml']['holdout_index'] = int(memory_cfg.holdout_index)
         config_payload['maml']['grad_accum_steps'] = int(memory_cfg.grad_accum_steps)
+        config_payload['maml']['learn_inner_lrs'] = bool(inner_lr_schedule is not None)
         config_payload['algorithm'] = 'memory_fomaml_ddp' if bool(first_order) else 'memory_maml_ddp'
         config_payload['runtime'] = {
             'run_id': run_id,
@@ -360,6 +386,8 @@ def train(cfg: ConfigDict) -> None:
             'outer_param_names': list(outer_names),
             'fast_object': 'context_encoder.support_tokens',
             'first_order': bool(first_order),
+            'learn_inner_lrs': bool(inner_lr_schedule is not None),
+            'initial_inner_lrs': resolved_inner_lrs,
         }
         config_path = workdir / 'config.json'
         if is_main:
@@ -382,8 +410,9 @@ def train(cfg: ConfigDict) -> None:
             wandb_run.log(
                 {
                     'model/num_params_total': n_total,
-                    'model/num_params_trainable': n_trainable,
-                    'model/num_params_outer': n_outer,
+                    'model/num_params_trainable': n_trainable + n_inner_lr,
+                    'model/num_params_outer': n_outer + n_inner_lr,
+                    'model/num_params_inner_lr': n_inner_lr,
                 },
                 step=global_step,
             )
@@ -439,14 +468,15 @@ def train(cfg: ConfigDict) -> None:
                 prepared_tasks,
                 cfg=memory_cfg,
                 first_order=first_order,
+                inner_lr_schedule=inner_lr_schedule,
             )
             meta_loss.backward()
-            _all_reduce_outer_grads(outer_params, device)
+            _all_reduce_outer_grads(outer_params + inner_lr_params, device)
             loss_value = _distributed_mean(float(meta_loss.detach().cpu()), device)
             avg_inner_memory_grad_norm = _distributed_mean(float(avg_inner_memory_grad_norm_local), device)
             avg_inner_loss = _distributed_mean(float(avg_inner_loss_local), device)
             if float(memory_cfg.max_grad_norm) > 0.0:
-                torch.nn.utils.clip_grad_norm_(outer_params, float(memory_cfg.max_grad_norm))
+                torch.nn.utils.clip_grad_norm_(outer_params + inner_lr_params, float(memory_cfg.max_grad_norm))
             optimizer.step()
             global_step += 1
 
@@ -462,13 +492,14 @@ def train(cfg: ConfigDict) -> None:
                 steps_per_sec = log_count / elapsed
                 avg_loss = log_loss / max(1, log_count)
                 logging.info(
-                    'step %d/%d | meta_loss %.6f | inner_loss %.6f | inner_grad %.6f | lr %.3e | %.2f step/s',
+                    'step %d/%d | meta_loss %.6f | inner_loss %.6f | inner_grad %.6f | outer_lr %.3e | inner_lr_mean %.3e | %.2f step/s',
                     global_step,
                     int(cfg.train.num_steps),
                     avg_loss,
                     float(avg_inner_loss),
                     float(avg_inner_memory_grad_norm),
                     float(optimizer.param_groups[0]['lr']),
+                    memory_train_lib._inner_lr_log_dict(schedule=inner_lr_schedule, cfg=memory_cfg).get('train/inner_lr_mean', float(memory_cfg.inner_lr)),
                     steps_per_sec,
                 )
                 log_loss = 0.0
@@ -484,6 +515,7 @@ def train(cfg: ConfigDict) -> None:
                         'train/inner_support_loss': wb_inner_loss_sum / max(1, wb_count),
                         'train/lr': float(optimizer.param_groups[0]['lr']),
                         'train/step': global_step,
+                        **memory_train_lib._inner_lr_log_dict(schedule=inner_lr_schedule, cfg=memory_cfg),
                     },
                     step=global_step,
                 )
@@ -506,6 +538,7 @@ def train(cfg: ConfigDict) -> None:
                     inference_steps=wandb_sample_inference_steps,
                     eta=wandb_sample_eta,
                     max_tasks=max_diag_tasks,
+                    inner_lr_schedule=inner_lr_schedule,
                 )
                 fig_diff = plot_scalar_curve(
                     query_diffusion_curve,
@@ -550,6 +583,7 @@ def train(cfg: ConfigDict) -> None:
                         tasks=sample_tasks,
                         task_builder=task_builder,
                         memory_cfg=memory_cfg,
+                        inner_lr_schedule=inner_lr_schedule,
                         device=device,
                         use_mask_id=use_mask_id,
                         inference_steps=wandb_sample_inference_steps,
@@ -562,6 +596,7 @@ def train(cfg: ConfigDict) -> None:
                     dataset_cfg=dataset_cfg,
                     task_builder=task_builder,
                     memory_cfg=memory_cfg,
+                    inner_lr_schedule=inner_lr_schedule,
                     total_items=wandb_sample_mse_items,
                     per_batch_items=max(1, wandb_sample_batch),
                     seed=seed + 4_000_003 + global_step,
@@ -577,6 +612,7 @@ def train(cfg: ConfigDict) -> None:
                     dataset_cfg=dataset_cfg,
                     task_builder=excluded_task_builder if excluded_task_builder is not None else task_builder,
                     memory_cfg=memory_cfg,
+                    inner_lr_schedule=inner_lr_schedule,
                     total_items=wandb_sample_mse_items,
                     per_batch_items=max(1, wandb_sample_batch),
                     seed=seed + 5_000_003 + global_step,
@@ -624,6 +660,11 @@ def train(cfg: ConfigDict) -> None:
                     model=policy,
                     optimizer=optimizer,
                     config_payload=config_payload,
+                    extra_state=(
+                        {'inner_lr_schedule': inner_lr_schedule.state_dict()}
+                        if inner_lr_schedule is not None
+                        else None
+                    ),
                 )
                 logging.info('Saved checkpoint: %s', ckpt_path)
 
@@ -635,6 +676,11 @@ def train(cfg: ConfigDict) -> None:
                 model=policy,
                 optimizer=optimizer,
                 config_payload=config_payload,
+                extra_state=(
+                    {'inner_lr_schedule': inner_lr_schedule.state_dict()}
+                    if inner_lr_schedule is not None
+                    else None
+                ),
             )
             logging.info('Training complete. Final checkpoint: %s', final_ckpt)
         if distributed:
