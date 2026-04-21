@@ -363,7 +363,7 @@ def get_config():
     cfg.train.batch_size = 2  # outer batch size in tasks
     cfg.train.weight_decay = 1e-4
     cfg.train.log_every = 20
-    cfg.train.ckpt_every = 500
+    cfg.train.ckpt_every = 100
     cfg.train.resume_path = ''
     cfg.train.checkpoint_parent_dir = os.environ.get(
         'ICIL_CHECKPOINT_PARENT_DIR',
@@ -384,8 +384,8 @@ def get_config():
     cfg.wandb.mode = os.environ.get('WANDB_MODE', 'online')
     cfg.wandb.tags = ()
     cfg.wandb.n_loss_steps = 20
-    cfg.wandb.n_sample_steps = 1000
-    cfg.wandb.n_inner_loss_steps = 1000
+    cfg.wandb.n_sample_steps = 200
+    cfg.wandb.n_inner_loss_steps = 200
     cfg.wandb.sample_batch_items = 8
     cfg.wandb.sample_mse_items = 32
     cfg.wandb.sample_inference_steps = 100
