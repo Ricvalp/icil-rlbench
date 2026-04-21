@@ -7,24 +7,24 @@
 # =============================================================================
 
 # Root of cached RLBench dense H5 variations.
-export ICIL_CACHE_ROOT="/scratch/rvalper/robotics/rlbench/icil_rlbench/.rlbench_cache_dense_v4/"
+export ICIL_CACHE_ROOT="/scratch/rvalper/robotics/icil_rlbench/.rlbench_cache_dense_v4/"
 
 # =============================================================================
 # OUTPUT DIRECTORIES
 # =============================================================================
 
 # Parent directory for run outputs (each run uses a subdirectory named by wandb run id).
-export ICIL_OUTPUT_PARENT_DIR="/scratch/rvalper/robotics/rlbench/icil_runs/outputs"
+export ICIL_OUTPUT_PARENT_DIR="/scratch/rvalper/robotics/icil_rlbench/icil_runs/outputs"
 
 # Parent directory for checkpoints (each run uses a subdirectory named by wandb run id).
-export ICIL_CHECKPOINT_PARENT_DIR="/scratch/rvalper/robotics/rlbench/icil_runs/checkpoints"
+export ICIL_CHECKPOINT_PARENT_DIR="/scratch/rvalper/robotics/icil_rlbench/icil_runs/checkpoints"
 
 # =============================================================================
 # PROFILING OUTPUT DIRECTORIES
 # =============================================================================
 
 # Base directory for all profiling traces.
-export ICIL_PROFILE_TRACE_DIR="/scratch/rvalper/robotics/rlbench/icil_runs/profiles"
+export ICIL_PROFILE_TRACE_DIR="/scratch/rvalper/robotics/icil_rlbench/icil_runs/profiles"
 
 # Distinct trace file names within the same profiling directory.
 export ICIL_PRETRAIN_PROFILE_TRACE_FILE="pretrain_trace.json"
@@ -34,7 +34,7 @@ export ICIL_TTT_PROFILE_TRACE_FILE="ttt_trace.json"
 # WANDB
 # =============================================================================
 
-export WANDB_PROJECT="icil-perceiver-pretrain"
+export WANDB_PROJECT="icil-memory-fomaml"
 export WANDB_ENTITY="ricvalp"
 export WANDB_MODE="online"
 

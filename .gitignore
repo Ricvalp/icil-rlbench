@@ -6,6 +6,7 @@ rlbench/
 inspect_*
 legacy/
 eval_checkpoints/
+pretrained_checkpoints/
 
 *.mp4
 raw_episodes_videos/*
