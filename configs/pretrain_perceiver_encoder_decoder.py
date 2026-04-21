@@ -270,7 +270,7 @@ def get_config():
     cfg.model.traj_supernode_perceiver_v2.post_self_attn_mlp_mult = 4
     cfg.model.traj_supernode_perceiver_v2.demo_supernodes = 64
     cfg.model.traj_supernode_perceiver_v2.query_supernodes = 128
-    cfg.model.traj_supernode_perceiver_v2.demo_frame_tokens_out = 32
+    cfg.model.traj_supernode_perceiver_v2.demo_frame_tokens_out = 64
     cfg.model.traj_supernode_perceiver_v2.query_frame_tokens_out = 128
     cfg.model.traj_supernode_perceiver_v2.neighbors_per_supernode = 64
     cfg.model.traj_supernode_perceiver_v2.demo_supernode_refine_layers = 2
@@ -286,7 +286,7 @@ def get_config():
     cfg.model.traj_supernode_perceiver_v2.checkpoint_frame_tokenizer = False
     cfg.model.traj_supernode_perceiver_v2.tokenize_frames_chunked = False
     cfg.model.traj_supernode_perceiver_v2.chunk_frames = 256
-    cfg.model.traj_supernode_perceiver_v2.m_traj_tokens = 32
+    cfg.model.traj_supernode_perceiver_v2.m_traj_tokens = 64
     cfg.model.traj_supernode_perceiver_v2.traj_perceiver_layers = 2
     cfg.model.traj_supernode_perceiver_v2.traj_dim = 8
     cfg.model.traj_supernode_perceiver_v2.use_demo_id_embed = True
