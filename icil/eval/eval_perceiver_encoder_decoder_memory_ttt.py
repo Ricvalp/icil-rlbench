@@ -37,6 +37,14 @@ from icil.models import (
     PolicyConfig,
     build_policy,
 )
+from icil.models.maml.inner_lr import (
+    PositiveInnerLRSchedule,
+    build_inner_lr_schedule,
+    infer_inner_lr_mode,
+    inner_lr_tensor_for_step,
+    normalize_inner_lr_mode,
+    resolved_inner_lr_values,
+)
 from icil.models.policies.config_utils import inherit_missing_encoder_attention_backend
 from icil.models.maml import MAMLTaskBuilder
 from icil.models.common import sinusoidal_position_embedding, sinusoidal_time_embedding
@@ -354,6 +362,169 @@ def _support_cache_root_from_eval_and_checkpoint(cfg: ConfigDict, ckpt: Dict[str
         raise FileNotFoundError(f'Support cache root not found: {cache_root}')
     return cache_root
 
+
+
+def _checkpoint_section(ckpt: Dict[str, Any], section_name: str) -> Dict[str, Any]:
+    if not isinstance(ckpt.get('config', None), dict):
+        return {}
+    section = ckpt['config'].get(section_name, {})
+    return section if isinstance(section, dict) else {}
+
+
+def _is_unset_int(value: Any) -> bool:
+    if value is None or isinstance(value, bool):
+        return value is None
+    try:
+        return int(value) < 0
+    except (TypeError, ValueError):
+        return False
+
+
+def _is_unset_float(value: Any) -> bool:
+    if value is None or isinstance(value, bool):
+        return value is None
+    try:
+        return float(value) < 0.0
+    except (TypeError, ValueError):
+        return False
+
+
+def _is_unset_bool(value: Any) -> bool:
+    if value is None:
+        return True
+    if isinstance(value, str):
+        return value.strip().lower() in {'', 'infer', 'auto', 'checkpoint', 'none'}
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return float(value) < 0.0
+    return False
+
+
+def _is_unset_str(value: Any) -> bool:
+    if value is None:
+        return True
+    return str(value).strip().lower() in {'', 'infer', 'auto', 'checkpoint', 'none'}
+
+
+def _resolve_memory_ttt_cfg_from_eval_and_checkpoint(cfg: ConfigDict, ckpt: Dict[str, Any]) -> ConfigDict:
+    raw_cfg = cfg.memory_ttt
+    resolved = ConfigDict(raw_cfg.to_dict())
+    memory_section = _checkpoint_section(ckpt, 'memory_ttt')
+    maml_section = _checkpoint_section(ckpt, 'maml')
+    has_maml_section = bool(maml_section)
+
+    def _ckpt_value(field_name: str, *, fallback: Any = None) -> Any:
+        if field_name in memory_section:
+            return memory_section[field_name]
+        if field_name in maml_section:
+            return maml_section[field_name]
+        return fallback
+
+    configured_inner_lr_mode = getattr(resolved, 'inner_lr_mode', None)
+    if _is_unset_str(configured_inner_lr_mode):
+        resolved.inner_lr_mode = infer_inner_lr_mode(
+            checkpoint=ckpt,
+            checkpoint_config=ckpt.get('config', None) if isinstance(ckpt.get('config', None), dict) else None,
+            legacy_learn_inner_lrs=maml_section.get('learn_inner_lrs', None) if isinstance(maml_section, dict) else None,
+        )
+    else:
+        resolved.inner_lr_mode = normalize_inner_lr_mode(configured_inner_lr_mode)
+
+    if _is_unset_int(getattr(resolved, 'inner_steps', None)):
+        resolved.inner_steps = int(_ckpt_value('inner_steps', fallback=0))
+
+    if _is_unset_float(getattr(resolved, 'inner_lr', None)):
+        resolved.inner_lr = float(_ckpt_value('inner_lr', fallback=3e-4))
+
+    if _is_unset_str(getattr(resolved, 'optimizer', None)):
+        if 'optimizer' in memory_section:
+            resolved.optimizer = str(memory_section['optimizer']).lower()
+        elif has_maml_section:
+            # Memory MAML/FOMAML adapts support tokens with explicit GD updates, so
+            # SGD is the faithful eval default when replaying a training checkpoint.
+            resolved.optimizer = 'sgd'
+        else:
+            resolved.optimizer = 'adam'
+
+    if _is_unset_float(getattr(resolved, 'sgd_momentum', None)):
+        resolved.sgd_momentum = float(memory_section['sgd_momentum']) if 'sgd_momentum' in memory_section else 0.0
+
+    if _is_unset_float(getattr(resolved, 'max_grad_norm', None)):
+        resolved.max_grad_norm = float(_ckpt_value('max_grad_norm', fallback=1.0))
+
+    if _is_unset_int(getattr(resolved, 'num_queries_per_step', None)):
+        resolved.num_queries_per_step = int(_ckpt_value('num_queries_per_step', fallback=maml_section.get('num_loo_per_task', 1)))
+
+    if _is_unset_int(getattr(resolved, 'num_inner_batches', None)):
+        resolved.num_inner_batches = int(_ckpt_value('num_inner_batches', fallback=0))
+
+    if _is_unset_bool(getattr(resolved, 'reuse_diffusion_noise', None)):
+        resolved.reuse_diffusion_noise = bool(_ckpt_value('reuse_diffusion_noise', fallback=False))
+
+    if _is_unset_bool(getattr(resolved, 'optimize_decoder', None)):
+        if 'optimize_decoder' in memory_section:
+            resolved.optimize_decoder = bool(memory_section['optimize_decoder'])
+        elif has_maml_section:
+            # Memory MAML/FOMAML uses support tokens as the fast variables. The
+            # decoder may be trained as a slow component, but it is not adapted in
+            # the inner loop unless eval explicitly opts into it.
+            resolved.optimize_decoder = False
+        else:
+            resolved.optimize_decoder = False
+
+    if _is_unset_float(getattr(resolved, 'decoder_lr', None)):
+        if 'decoder_lr' in memory_section:
+            resolved.decoder_lr = float(memory_section['decoder_lr'])
+        else:
+            resolved.decoder_lr = float(getattr(resolved, 'inner_lr', 3e-4))
+
+    if getattr(resolved, 'holdout_index', None) is None:
+        resolved.holdout_index = int(_ckpt_value('holdout_index', fallback=-1))
+
+    if _is_unset_int(getattr(resolved, 'num_query_loss_samples', None)):
+        resolved.num_query_loss_samples = int(
+            _ckpt_value('num_query_loss_samples', fallback=getattr(resolved, 'num_queries_per_step', 1))
+        )
+
+    return resolved
+
+
+def _checkpoint_memory_inner_steps(ckpt: Dict[str, Any]) -> int:
+    memory_section = _checkpoint_section(ckpt, 'memory_ttt')
+    if 'inner_steps' in memory_section:
+        return int(memory_section['inner_steps'])
+    maml_section = _checkpoint_section(ckpt, 'maml')
+    if 'inner_steps' in maml_section:
+        return int(maml_section['inner_steps'])
+    schedule_state = ckpt.get('inner_lr_schedule', None)
+    if isinstance(schedule_state, dict):
+        raw_lrs = schedule_state.get('raw_lrs', None)
+        if torch.is_tensor(raw_lrs):
+            return int(raw_lrs.numel())
+    return 0
+
+
+def _build_eval_inner_lr_schedule(
+    *,
+    ckpt: Dict[str, Any],
+    checkpoint_inner_steps: int,
+    memory_cfg: ConfigDict,
+    device: torch.device,
+) -> Optional[PositiveInnerLRSchedule]:
+    schedule = build_inner_lr_schedule(
+        mode=getattr(memory_cfg, 'inner_lr_mode', 'fixed'),
+        inner_steps=int(max(1, checkpoint_inner_steps)),
+        init_lr=float(memory_cfg.inner_lr),
+    )
+    if schedule is None:
+        return None
+    schedule = schedule.to(device)
+    state = ckpt.get('inner_lr_schedule', None)
+    if not isinstance(state, dict):
+        raise ValueError(
+            f'Checkpoint declares inner_lr_mode={memory_cfg.inner_lr_mode!r} but has no inner_lr_schedule state.'
+        )
+    schedule.load_state_dict(state, strict=True)
+    return schedule
 
 
 def _warn_if_cached_num_points_mismatch(
@@ -1230,6 +1401,29 @@ def _make_memory_optimizer(
     return torch.optim.SGD(param_groups, momentum=float(getattr(memory_cfg, 'sgd_momentum', 0.0)))
 
 
+def _make_decoder_optimizer(
+    memory_cfg: ConfigDict,
+    *,
+    decoder_params: Sequence[torch.nn.Parameter],
+) -> Optional[torch.optim.Optimizer]:
+    if not decoder_params:
+        return None
+    param_groups: List[Dict[str, Any]] = [
+        {'params': list(decoder_params), 'lr': float(getattr(memory_cfg, 'decoder_lr', memory_cfg.inner_lr))}
+    ]
+    opt_name = _memory_optimizer_name(memory_cfg)
+    if opt_name == 'adam':
+        return torch.optim.Adam(param_groups)
+    return torch.optim.SGD(param_groups, momentum=float(getattr(memory_cfg, 'sgd_momentum', 0.0)))
+
+
+def _use_manual_memory_update(memory_cfg: ConfigDict) -> bool:
+    return (
+        _memory_optimizer_name(memory_cfg) == 'sgd'
+        and float(getattr(memory_cfg, 'sgd_momentum', 0.0)) == 0.0
+    )
+
+
 
 def _num_valid_query_t0s(task_builder: MAMLTaskBuilder, *, vidx: int, episode_id: int) -> int:
     T = int(task_builder.store.episode_length(int(vidx), int(episode_id)))
@@ -1573,6 +1767,7 @@ def _apply_memory_ttt_adaptation_in_place(
     decoder_param_names: Sequence[str],
     device: torch.device,
     memory_cfg: ConfigDict,
+    inner_lr_schedule: Optional[PositiveInnerLRSchedule],
     use_mask_id: bool,
     sample_mse_inference_steps: int,
     sample_mse_eta: float,
@@ -1611,13 +1806,26 @@ def _apply_memory_ttt_adaptation_in_place(
 
         initial_memory = memory_tokens.detach().clone()
         optim_params: List[torch.nn.Parameter] = [memory_tokens] + list(decoder_params)
-        optimizer = _make_memory_optimizer(
-            memory_cfg,
-            memory_tokens=memory_tokens,
-            decoder_params=decoder_params,
-        )
+        use_manual_memory_update = _use_manual_memory_update(memory_cfg)
+        memory_optimizer = None
+        decoder_optimizer = None
+        if use_manual_memory_update:
+            decoder_optimizer = _make_decoder_optimizer(memory_cfg, decoder_params=decoder_params)
+        else:
+            memory_optimizer = _make_memory_optimizer(
+                memory_cfg,
+                memory_tokens=memory_tokens,
+                decoder_params=decoder_params,
+            )
 
         inner_steps = int(getattr(memory_cfg, 'inner_steps', 0))
+        inner_lr_mode = normalize_inner_lr_mode(getattr(memory_cfg, 'inner_lr_mode', 'fixed'))
+        effective_inner_lrs = resolved_inner_lr_values(
+            mode=inner_lr_mode,
+            inner_steps=int(inner_steps),
+            fixed_inner_lr=float(memory_cfg.inner_lr),
+            schedule=inner_lr_schedule,
+        )
         inner_losses: List[float] = []
         inner_grad_norms: List[float] = []
         query_losses: List[float] = []
@@ -1683,9 +1891,24 @@ def _apply_memory_ttt_adaptation_in_place(
                 unit='step',
             )
         try:
-            for step_idx in range(1, inner_steps + 1):
-                inner_batch = inner_batches[(step_idx - 1) % len(inner_batches)]
-                optimizer.zero_grad(set_to_none=True)
+            for step_idx in range(inner_steps):
+                inner_batch = inner_batches[step_idx % len(inner_batches)]
+                step_lr = inner_lr_tensor_for_step(
+                    step_idx=step_idx,
+                    mode=inner_lr_mode,
+                    fixed_inner_lr=float(memory_cfg.inner_lr),
+                    schedule=inner_lr_schedule,
+                    device=memory_tokens.device,
+                    dtype=memory_tokens.dtype,
+                )
+                if memory_tokens.grad is not None:
+                    memory_tokens.grad = None
+                if memory_optimizer is not None:
+                    memory_optimizer.zero_grad(set_to_none=True)
+                    if memory_optimizer.param_groups:
+                        memory_optimizer.param_groups[0]['lr'] = float(step_lr.detach().cpu().item())
+                elif decoder_optimizer is not None:
+                    decoder_optimizer.zero_grad(set_to_none=True)
                 if grad_accum_steps == 1:
                     loss = _memory_diffusion_loss(
                         policy,
@@ -1712,7 +1935,18 @@ def _apply_memory_ttt_adaptation_in_place(
                 max_grad_norm = float(getattr(memory_cfg, 'max_grad_norm', 0.0))
                 if max_grad_norm > 0.0:
                     torch.nn.utils.clip_grad_norm_(optim_params, max_grad_norm)
-                optimizer.step()
+                if use_manual_memory_update:
+                    if memory_tokens.grad is None:
+                        raise RuntimeError('Manual memory-token update expected memory_tokens.grad to be populated.')
+                    with torch.no_grad():
+                        memory_tokens.sub_(step_lr * memory_tokens.grad)
+                    if decoder_optimizer is not None:
+                        decoder_optimizer.step()
+                    memory_tokens.grad = None
+                else:
+                    if memory_optimizer is None:
+                        raise RuntimeError('Expected memory optimizer to be initialized.')
+                    memory_optimizer.step()
 
                 inner_losses.append(loss_value)
                 inner_grad_norms.append(float(grad_norm))
@@ -1724,7 +1958,7 @@ def _apply_memory_ttt_adaptation_in_place(
 
                 if pbar is not None:
                     pbar.update(1)
-                    pbar.set_postfix(step=step_idx, loss=f'{loss_value:.4g}')
+                    pbar.set_postfix(step=step_idx + 1, loss=f'{loss_value:.4g}')
         finally:
             if pbar is not None:
                 pbar.close()
@@ -1757,6 +1991,8 @@ def _apply_memory_ttt_adaptation_in_place(
             'decoder_param_tensors': int(len(decoder_param_names)),
             'decoder_param_count': int(sum(int(param.numel()) for param in decoder_params)),
             'grad_accum_steps': int(grad_accum_steps),
+            'inner_lr_mode': str(inner_lr_mode),
+            'effective_inner_lrs': list(effective_inner_lrs),
             'support_ids': list(support_package['support_ids']),
             'memory_support_ids': list(support_package['memory_support_ids']),
             'heldout_episode_id': int(support_package['heldout_episode_id']),
@@ -2234,12 +2470,39 @@ def evaluate(cfg: ConfigDict) -> None:
     dataset_cfg = _dataset_config_from_eval_and_checkpoint(cfg, ckpt)
     if not hasattr(cfg, 'memory_ttt'):
         raise ValueError('Memory TTT eval requires cfg.memory_ttt.')
-    memory_cfg = cfg.memory_ttt
+    memory_cfg = _resolve_memory_ttt_cfg_from_eval_and_checkpoint(cfg, ckpt)
     use_mask_id = _conditioning_use_mask_id_from_eval_and_checkpoint(cfg, model_cfg)
     ignore_demos = _ignore_demos_from_model_cfg(model_cfg)
     query_stride_mode = _query_stride_mode_from_eval(cfg)
     support_source = _support_source_from_eval(cfg)
     state_dim, action_dim = _infer_state_action_dims_from_state_dict(state_dict)
+    checkpoint_inner_steps = _checkpoint_memory_inner_steps(ckpt)
+    inner_lr_mode = normalize_inner_lr_mode(getattr(memory_cfg, 'inner_lr_mode', 'fixed'))
+    if inner_lr_mode == 'per_step_learned' and int(memory_cfg.inner_steps) > int(checkpoint_inner_steps):
+        raise ValueError(
+            f'Per-step learned inner LR schedule has only {checkpoint_inner_steps} values, '
+            f'but eval requested inner_steps={int(memory_cfg.inner_steps)}.'
+        )
+    inner_lr_schedule = _build_eval_inner_lr_schedule(
+        ckpt=ckpt,
+        checkpoint_inner_steps=int(checkpoint_inner_steps),
+        memory_cfg=memory_cfg,
+        device=device,
+    )
+    resolved_inner_lrs = resolved_inner_lr_values(
+        mode=inner_lr_mode,
+        inner_steps=int(memory_cfg.inner_steps),
+        fixed_inner_lr=float(memory_cfg.inner_lr),
+        schedule=inner_lr_schedule,
+    )
+    if inner_lr_mode != 'fixed' and not _use_manual_memory_update(memory_cfg):
+        logging.warning(
+            'inner_lr_mode=%s with optimizer=%s and sgd_momentum=%.3f will use the learned LR values, '
+            'but does not exactly match training-time explicit GD updates.',
+            inner_lr_mode,
+            _memory_optimizer_name(memory_cfg),
+            float(getattr(memory_cfg, 'sgd_momentum', 0.0)),
+        )
 
     if ignore_demos:
         raise ValueError('Memory TTT eval requires a checkpoint whose model conditions on support demos (ignore_demos=False).')
@@ -2283,6 +2546,7 @@ def evaluate(cfg: ConfigDict) -> None:
     resolved_payload['dataset']['T_obs'] = int(dataset_cfg.T_obs)
     resolved_payload['dataset']['H'] = int(dataset_cfg.H)
     resolved_payload['dataset']['stride'] = int(dataset_cfg.stride)
+    resolved_payload['memory_ttt'] = memory_cfg.to_dict()
     resolved_payload['memory_ttt']['grad_accum_steps'] = int(grad_accum_steps)
     resolved_payload['resolved'] = {
         'checkpoint_path': str(checkpoint_path),
@@ -2292,6 +2556,9 @@ def evaluate(cfg: ConfigDict) -> None:
         'decoder_param_tensors': len(decoder_param_names),
         'decoder_param_count': int(decoder_param_count),
         'support_source': support_source,
+        'inner_lr_mode': str(inner_lr_mode),
+        'checkpoint_inner_steps': int(checkpoint_inner_steps),
+        'effective_inner_lrs': list(resolved_inner_lrs),
     }
     config_path = run_dir / 'resolved_eval_config.json'
     with config_path.open('w', encoding='utf-8') as f:
@@ -2314,12 +2581,13 @@ def evaluate(cfg: ConfigDict) -> None:
         dataset_cfg.stride,
     )
     logging.info(
-        'Memory TTT cfg: inner_steps=%d | inner_lr=%.3e | optimizer=%s | max_grad_norm=%.3f | '
+        'Memory TTT cfg: inner_steps=%d | inner_lr=%.3e | inner_lr_mode=%s | optimizer=%s | max_grad_norm=%.3f | '
         'num_queries_per_step=%d | grad_accum_steps=%d | num_inner_batches=%d | reuse_diffusion_noise=%s | '
         'optimize_decoder=%s | decoder_params=%d | preload_batches=%s | log_query_loss=%s | '
         'num_query_loss_samples=%d | log_query_sample_mse=%s',
         int(memory_cfg.inner_steps),
         float(memory_cfg.inner_lr),
+        str(inner_lr_mode),
         _memory_optimizer_name(memory_cfg),
         float(memory_cfg.max_grad_norm),
         int(memory_cfg.num_queries_per_step),
@@ -2338,6 +2606,12 @@ def evaluate(cfg: ConfigDict) -> None:
         len(decoder_param_names),
         f'{decoder_param_count:,}',
         decoder_param_names[:8],
+    )
+    logging.info(
+        'Resolved inner LR schedule: checkpoint_inner_steps=%d | mode=%s | values=%s',
+        int(checkpoint_inner_steps),
+        str(inner_lr_mode),
+        resolved_inner_lrs if len(resolved_inner_lrs) <= 16 else (resolved_inner_lrs[:16] + ['...']),
     )
 
     env = None
@@ -2413,6 +2687,7 @@ def evaluate(cfg: ConfigDict) -> None:
                     decoder_param_names=decoder_param_names,
                     device=device,
                     memory_cfg=memory_cfg,
+                    inner_lr_schedule=inner_lr_schedule,
                     use_mask_id=use_mask_id,
                     sample_mse_inference_steps=int(cfg.inference.inference_steps),
                     sample_mse_eta=float(cfg.inference.eta),
@@ -2519,6 +2794,8 @@ def evaluate(cfg: ConfigDict) -> None:
             'resolved_memory_ttt': {
                 'inner_steps': int(memory_cfg.inner_steps),
                 'inner_lr': float(memory_cfg.inner_lr),
+                'inner_lr_mode': str(inner_lr_mode),
+                'effective_inner_lrs': list(resolved_inner_lrs),
                 'optimizer': _memory_optimizer_name(memory_cfg),
                 'max_grad_norm': float(memory_cfg.max_grad_norm),
                 'num_queries_per_step': int(memory_cfg.num_queries_per_step),

@@ -38,25 +38,26 @@ def get_config():
     cfg.conditioning.num_points = 1024
 
     cfg.memory_ttt = ConfigDict()
-    cfg.memory_ttt.inner_steps = 100
-    cfg.memory_ttt.inner_lr = 3e-4
-    cfg.memory_ttt.optimizer = 'adam'  # 'adam' | 'sgd'
-    cfg.memory_ttt.sgd_momentum = 0.0
-    cfg.memory_ttt.max_grad_norm = 1.0
-    cfg.memory_ttt.num_queries_per_step = 32
+    cfg.memory_ttt.inner_steps = -1  # <0 => infer from checkpoint maml/memory_ttt config if available.
+    cfg.memory_ttt.inner_lr = -1.0  # <0 => infer from checkpoint maml/memory_ttt config if available.
+    cfg.memory_ttt.inner_lr_mode = 'infer'  # 'infer' | 'fixed' | 'shared_learned' | 'per_step_learned'
+    cfg.memory_ttt.optimizer = 'infer'  # 'infer' | 'adam' | 'sgd'
+    cfg.memory_ttt.sgd_momentum = -1.0  # <0 => infer if possible, else 0.0.
+    cfg.memory_ttt.max_grad_norm = -1.0  # <0 => infer from checkpoint maml/memory_ttt config if available.
+    cfg.memory_ttt.num_queries_per_step = -1  # <0 => infer from checkpoint maml/memory_ttt config if available.
     cfg.memory_ttt.grad_accum_steps = 1  # Split each inner-loop query batch into this many microbatches.
-    cfg.memory_ttt.num_inner_batches = 128  # 0 => build inner_steps batches, else reuse min(this, inner_steps).
-    cfg.memory_ttt.reuse_diffusion_noise = False
+    cfg.memory_ttt.num_inner_batches = -1  # <0 => infer from checkpoint; 0 => build inner_steps batches.
+    cfg.memory_ttt.reuse_diffusion_noise = None  # None => infer from checkpoint if available.
     cfg.memory_ttt.preload_support_batches_to_device = False
-    cfg.memory_ttt.holdout_index = -1  # -1 => random support episode holdout.
+    cfg.memory_ttt.holdout_index = None  # None => infer from checkpoint if available, else random holdout.
     cfg.memory_ttt.log_query_loss = True
-    cfg.memory_ttt.num_query_loss_samples = 16
+    cfg.memory_ttt.num_query_loss_samples = 16  # <0 => infer from checkpoint if available, else inner batch size.
     cfg.memory_ttt.log_query_sample_mse = True  # If True, sample actions on the extra query episode and log MSE to GT.
     cfg.memory_ttt.num_tries_per_item = 100
 
     # Optional: also adapt decoder params. Off by default so the experiment is memory-token-only.
-    cfg.memory_ttt.optimize_decoder = False
-    cfg.memory_ttt.decoder_lr = 3e-5
+    cfg.memory_ttt.optimize_decoder = None  # None => infer from checkpoint if available, else False.
+    cfg.memory_ttt.decoder_lr = -1.0  # <0 => infer from checkpoint if available, else inner_lr.
     cfg.memory_ttt.decoder_param_prefixes = ('denoiser.', 'action_in.', 'action_out.', 't_mlp.')
 
     cfg.sim = ConfigDict()
