@@ -13,6 +13,8 @@ raw_episodes_videos/*
 
 get_ckpt
 
+supernode-tokenizer/
+
 .smanager/
 
 TODO.md

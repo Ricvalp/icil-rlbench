@@ -1,0 +1,723 @@
+You are working inside the existing `icil-rlbench` repository. The goal is to create a NEW repository / codepath called `supernode-tokenizer` for a NeurIPS-style paper on standard imitation learning with point-cloud tokenizers.
+
+IMPORTANT: this new repo/codepath is **NOT** for in-context imitation learning.
+- No in-context support/query episodes.
+- No test-time training.
+- No FOMAML / MAML / TTT.
+- No ICIL-specific losses, batching, metrics, or logging.
+- This is plain supervised imitation learning / behavior cloning on RLBench, with point clouds + proprio + task conditioning.
+
+The repo you are working in already contains almost everything needed:
+- RLBench cached dataset and dataloader code.
+- DDP training infrastructure.
+- AMP, checkpointing, logging, and wandb integration.
+- DiT decoder / diffusion policy code.
+- Perceiver encoder code.
+- Supernode tokenizer / encoder code.
+- General project structure and configs.
+
+Your job is to implement the new standard-IL research codepath by **re-using as much of the existing repo as possible** and changing only what is necessary.
+
+================================================================================
+0. PAPER STORY / CLAIMS
+================================================================================
+
+The paper story is:
+
+> A locality-preserving supernode point-cloud tokenizer improves robot imitation
+> learning, especially on geometry-sensitive manipulation tasks, under matched
+> downstream policy heads and comparable compute.
+
+The core hypothesis is:
+- Perceiver-style global compression is efficient, but may lose fine local geometry.
+- The supernode tokenizer preserves local structure before global compression.
+- This improves policy performance on tasks requiring precise 3D grounding:
+  grasp alignment, handles, inserts, local contact, and clutter.
+
+The paper must isolate the effect of the tokenizer. Therefore:
+- Keep the downstream policy head fixed whenever comparing tokenizers.
+- Keep task conditioning fixed whenever comparing tokenizers.
+- Keep training budget / data / evaluation protocol fixed whenever comparing tokenizers.
+
+Do NOT turn this into a broad “new robot policy architecture” paper.
+This is a tokenizer / representation paper.
+
+================================================================================
+1. RELEVANT PAPERS TO READ BEFORE CODING
+================================================================================
+
+Before implementing, inspect the details of the following papers and reuse the parts
+that are relevant. The goal is not to reproduce them exactly, but to match current
+SOTA design standards where appropriate.
+
+Must inspect:
+1. RLBench: The Robot Learning Benchmark & Learning Environment
+2. RT-1: Robotics Transformer for Real-World Control at Scale
+3. ACT: Action Chunking with Transformers
+4. Diffusion Policy: Visuomotor Policy Learning via Action Diffusion
+5. PerAct: Perceiver-Actor
+6. UPT: Universal Physics Transformers (for the supernode/message-passing idea)
+
+Interpretation for implementation:
+- RLBench gives the benchmark setting.
+- RT-1 gives the standard recipe for early task conditioning (FiLM-like / task-aware encoder)
+  and action token / decoder design ideas.
+- ACT gives the standard recipe for chunked action prediction with a transformer decoder.
+- Diffusion Policy gives the standard recipe for a diffusion action head as a secondary experiment.
+- PerAct gives the canonical RLBench-18 multitask setup and a widely used 18-task suite.
+- UPT gives the locality-preserving supernode message-passing tokenizer idea.
+
+================================================================================
+2. SCOPE OF THE IMPLEMENTATION
+================================================================================
+
+Implement RLBench-only experiments first.
+No LIBERO, no CALVIN for now.
+No ICIL. No MAML. No test-time training.
+
+The code must target a clean standard-IL pipeline with:
+- point cloud + proprio input,
+- class-conditioned multitask policy,
+- chunked action prediction,
+- shared training/eval infrastructure,
+- strong controlled tokenizer comparisons.
+
+================================================================================
+3. BENCHMARK AND DATA SETTINGS (EXACT)
+================================================================================
+
+Use RLBench-18 as the primary benchmark, following the canonical 18-task multitask setup
+used by PerAct.
+
+Exact RLBench-18 task list:
+- open_drawer
+- slide_block_to_color_target
+- sweep_to_dustpan_of_size
+- meat_off_grill
+- turn_tap
+- put_item_in_drawer
+- close_jar
+- reach_and_drag
+- stack_blocks
+- light_bulb_in
+- put_money_in_safe
+- place_wine_at_rack_location
+- put_groceries_in_cupboard
+- place_shape_in_shape_sorter
+- push_buttons
+- insert_onto_square_peg
+- stack_cups
+- place_cups
+
+Data splits:
+- train: 100 demos per task
+- val: 25 demos per task
+- test: 25 demos per task
+
+Use the existing RLBench cached dataset / dataloader implementation already present in the repo.
+Do not rebuild the cache format.
+
+Point-cloud input / observation settings:
+- point cloud + proprio only
+- no support demos
+- no in-context inputs
+- current observation history length T_obs = 2
+- observation stride = 2 (reuse existing convention if already implemented)
+- action chunk horizon H = 16
+- action dimension = inferred from dataset/cache (typically 8 in current RLBench setup)
+- max point count per observation frame = 4096 by default
+
+Point-cloud preprocessing:
+- keep the same workspace crop / static background masking pipeline as the current repo where possible
+- conservative masking only: walls / outside-workspace / clearly irrelevant static background is OK
+- NO oracle target-object masking in the main experiments
+- all architectures must use exactly the same point-cloud preprocessing
+- expose the point cloud preprocessing in config, but keep the default shared across all runs
+
+Create a geometry-sensitive task subset for reporting:
+- open_drawer
+- put_item_in_drawer
+- close_jar
+- turn_tap
+- light_bulb_in
+- place_wine_at_rack_location
+- place_shape_in_shape_sorter
+- insert_onto_square_peg
+
+This subset should be reported automatically in evaluation.
+
+================================================================================
+4. MAIN ARCHITECTURAL PRINCIPLE
+================================================================================
+
+All experiments must use the same high-level policy pattern:
+
+(observation point clouds + proprio + task id)
+    -> tokenizer / encoder
+    -> memory tokens
+    -> transformer-based action decoder / policy head
+    -> action chunk
+
+The ONLY thing that should change between the main tokenizer comparison models is the tokenizer.
+
+In other words:
+- same task conditioning
+- same decoder structure (for the chunk-regression family)
+- same training objective family
+- same rollout / eval protocol
+
+================================================================================
+5. TASK CONDITIONING (IMPORTANT)
+================================================================================
+
+This is simple class-conditioned IL, not language-conditioned IL in v1.
+So the default conditioning is **task id embedding**, not a text encoder.
+
+However, implement the conditioning stack cleanly and modularly so that a language embedding
+backend could be plugged in later.
+
+Use BOTH of the following simultaneously:
+
+LEVEL 1 = early conditioning in the encoder/tokenizer
+LEVEL 2 = late conditioning in the decoder/policy head
+
+These are not alternatives. Use both.
+
+5.1 Level 1 conditioning (encoder-side)
+--------------------------------------
+Goal: the task should influence what geometry is extracted from the point cloud.
+
+Implement a `TaskConditioner` module that produces:
+- `task_emb: [B, d_model]`
+- `task_tokens: [B, n_task_tokens, d_model]`
+
+For v1:
+- task conditioning source = `nn.Embedding(num_tasks, d_model)`
+- no text model yet
+
+Encoder-side conditioning should use a standard strong recipe inspired by RT-1:
+- identity-initialized FiLM / AdaLN-style modulation inside the encoder/tokenizer blocks
+- where identity-init means the conditioning starts as a no-op
+- do this in places where it is cheap and stable:
+  - supernode update MLPs / point-to-supernode aggregation MLPs
+  - optional Perceiver frame tokenizer internal blocks
+  - post-tokenizer self-attention refiner blocks
+
+At minimum:
+- if full FiLM/AdaLN insertion is too invasive in v1, do additive conditioning to tokens as a fallback
+- but the preferred implementation is identity-init FiLM/AdaLN
+
+5.2 Level 2 conditioning (decoder-side)
+--------------------------------------
+Goal: the task should influence the action generation stage explicitly.
+
+Use task tokens in the decoder memory:
+- project `task_emb` into `n_task_tokens` learned tokens
+- append them to the encoder memory tokens
+- decoder cross-attends to `[obs_memory_tokens ; task_tokens]`
+
+Defaults:
+- `n_task_tokens = 4`
+- task tokens are always present in all main experiments
+
+Optionally:
+- allow decoder AdaLN to consume `task_emb` as well, if this can be re-used cheaply from current DiT code
+- keep this behind config and default ON if implementation is clean
+
+================================================================================
+6. ENCODERS / TOKENIZERS TO IMPLEMENT
+================================================================================
+
+Reuse as much of the existing encoder/tokenizer code as possible.
+
+Implement a common interface:
+
+`ObservationEncoderOutput`
+- `tokens: [B, M, d_model]`
+- `token_mask: Optional[Tensor]`
+- optional debug fields (supernode assignments, counts, etc.)
+
+All observation encoders must work on standard IL inputs only:
+- current observation/history frames
+- no support/demo branch
+- no trajectory support tokens
+
+Use the current query branch from the existing ICIL encoder as the starting point.
+The current query-only path is already very close to what is needed.
+
+6.1 Encoder A: Perceiver tokenizer baseline
+-------------------------------------------
+Implement a standard IL observation encoder that reuses the current Perceiver query-frame stack.
+
+Expected structure:
+- per frame:
+  - xyz projection
+  - optional rgb projection with learnable alpha
+  - optional gripper-relative point features (configurable)
+  - FramePerceiverTokenizer -> frame tokens
+  - append projected state token
+- across T_obs frames:
+  - add learned frame-time embeddings
+  - flatten across time
+  - post-tokenizer self-attention refiner (reuse current query post-self-attn)
+- encoder output = observation memory tokens
+
+This should be the primary baseline.
+
+6.2 Encoder B: Supernode tokenizer (main model)
+-----------------------------------------------
+Reuse the implemented supernode frame tokenizer.
+
+Expected structure:
+- per frame:
+  - project point features
+  - sample supernodes
+  - point -> supernode message passing / local aggregation
+  - optional supernode self-attention refinement
+  - optional Perceiver pooling / learned-query pooling from supernodes to fixed frame token count
+  - append projected state token
+- across T_obs frames:
+  - add learned frame-time embeddings
+  - flatten across time
+  - post-tokenizer self-attention refiner
+- output = observation memory tokens
+
+Important:
+- the final number of tokens per frame must be configurable
+- default should match the Perceiver baseline output token count as closely as possible
+- expose the number of raw supernodes and final output frame tokens separately
+
+6.3 Encoder C: Supernode without message passing (ablation)
+----------------------------------------------------------
+Implement an ablation version where:
+- supernode sampling remains
+- but there is no local point->supernode message passing
+- use a simpler assignment / pooling into supernodes (or direct learned pooling) so that the role of message passing is isolated
+
+This is important for the paper.
+
+6.4 Encoder D: Supernode matched-budget / matched-token ablation
+----------------------------------------------------------------
+Implement a config variant that matches the final downstream token count and tries to stay close
+in params/compute to the Perceiver baseline.
+
+This is also important for the paper.
+
+6.5 Optional Encoder E: simple PointNet/MLP tokenizer baseline
+-------------------------------------------------------------
+Only implement this if it is cheap and clean.
+Do NOT spend major time here.
+If there is already a lightweight point encoder path in the repo, expose it.
+If not, skip for v1.
+
+================================================================================
+7. COMMON POLICY HEADS / DECODERS
+================================================================================
+
+Two policy heads are needed:
+
+PRIMARY = chunk regression transformer decoder
+SECONDARY = diffusion transformer decoder
+
+The main paper comparison should use the PRIMARY head.
+The diffusion head is a secondary experiment to show the tokenizer gains are not specific to one head.
+
+7.1 Primary policy head: Chunk regression decoder
+------------------------------------------------
+This is the main head for the paper.
+
+Requirements:
+- transformer-based action decoder
+- same decoder shared across all tokenizers
+- outputs an H-step action chunk in parallel
+- loss = L1 by default
+- optional diagonal Gaussian NLL behind config, but not needed for main paper
+
+Design requirements (inspired by ACT / strong standard practice):
+- use learned action query tokens of length H
+- add learned or sinusoidal action-slot positional embeddings
+- stack decoder blocks with:
+  - self-attention over action query tokens
+  - cross-attention to encoder memory tokens + task tokens
+  - MLP / FFN
+- no autoregressive decoding in the main head
+- predict all H action slots in parallel
+- output projection to action_dim
+
+Strong preference:
+- re-use the current DiT decoder block implementation as much as possible
+- create a simplified non-diffusion variant instead of writing an entirely new decoder from scratch
+- for example, adapt the current DiT block to a single-context standard transformer decoder block
+- if there is existing AdaLN infrastructure that can consume task embeddings cleanly, reuse it
+
+Default architecture for the chunk decoder:
+- d_model = 512
+- n_heads = 8
+- n_layers = 8
+- mlp_mult = 4
+- dropout = 0.0
+- action horizon H = 16
+- task tokens appended to memory
+- L1 loss as default objective
+
+7.2 Secondary policy head: Diffusion decoder
+--------------------------------------------
+Implement a standard IL diffusion policy by adapting the current DiT diffusion code.
+
+Requirements:
+- single observation memory only (no two-context ICIL split)
+- memory = observation tokens + task tokens
+- reuse existing DiT decoder, scheduler, v-prediction setup as much as possible
+- no support/demo branch
+- no ICIL-specific losses
+
+Default diffusion settings:
+- reuse current repo defaults if they match the ICIL codepath:
+  - DDIM or current scheduler path already implemented
+  - v-prediction target if already present
+  - H = 16
+  - d_model = 512
+  - n_heads = 8
+  - 10 diffusion decoder layers (reuse current default if possible)
+
+================================================================================
+8. STANDARD IL DATASET / DATALOADER
+================================================================================
+
+Create a standard IL dataset path that reuses the RLBench cache reader but does NOT construct
+ICIL support/query examples.
+
+Implement something like:
+- `RLBenchStandardILDataset`
+- `StandardILCollator`
+
+Each sample should provide:
+- task id
+- T_obs query frames (point clouds, rgb if available, state, valid mask)
+- target action chunk of length H
+- any additional metadata needed for evaluation / logging
+
+The dataset should support:
+- full-data regime: 100 demos/task
+- low-data regime: 20 demos/task (subsample training split deterministically)
+
+Keep the repo structure similar to `icil-rlbench`.
+Do not fork the whole data pipeline unless necessary.
+
+================================================================================
+9. REPO STRUCTURE / CODE ORGANIZATION
+================================================================================
+
+Create the new code in a structure that mirrors the existing `icil-rlbench` repo style.
+
+Suggested structure:
+
+supernode-tokenizer/
+  configs/
+    data/
+    model/
+    train/
+    eval/
+    experiment/
+  supernode_tokenizer/
+    data/
+      rlbench_standard_il_dataset.py
+      collate_standard_il.py
+    models/
+      condition/
+        task_conditioner.py
+      encoders/
+        observation_encoder_perceiver.py
+        observation_encoder_supernode.py
+        observation_encoder_supernode_nomsg.py
+      policies/
+        chunk_decoder_policy.py
+        diffusion_policy.py
+      common/
+        blocks.py
+        pooling.py
+    trainers/
+      train_chunk.py
+      train_diffusion.py
+    eval/
+      eval_rlbench.py
+      eval_robustness.py
+    utils/
+      wandb_utils.py
+      ddp_utils.py
+      metrics.py
+  scripts/
+    train_chunk_policy.py
+    train_diffusion_policy.py
+    eval_policy.py
+    eval_robustness.py
+  experiments/
+    exp01_rlbench18_perceiver_chunk.sh
+    exp02_rlbench18_supernode_chunk.sh
+    exp03_rlbench18_supernode_nomsg_chunk.sh
+    exp04_rlbench18_supernode_matched_chunk.sh
+    exp05_rlbench18_perceiver_chunk_lowdata20.sh
+    exp06_rlbench18_supernode_chunk_lowdata20.sh
+    exp07_rlbench18_perceiver_diffusion.sh
+    exp08_rlbench18_supernode_diffusion.sh
+    exp09_rlbench18_robustness_perceiver.sh
+    exp10_rlbench18_robustness_supernode.sh
+
+Use shared trainers and shared evaluation code.
+The per-experiment scripts should be thin wrappers around shared entrypoints/configs.
+
+================================================================================
+10. DDP / TRAINING INFRASTRUCTURE / LOGGING
+================================================================================
+
+All training scripts must support multi-GPU DDP by reusing the existing DDP implementation in `icil-rlbench`.
+Do not re-invent DDP.
+
+Reuse existing infrastructure for:
+- torchrun / DDP launch
+- AMP / autocast / GradScaler if already present
+- checkpointing
+- resume
+- distributed samplers
+- gradient clipping
+- wandb integration
+- logging cadence
+
+Logging requirements:
+Log everything currently logged in `icil-rlbench` except ICIL-specific metrics.
+At minimum log:
+- train loss
+- val loss
+- per-head losses (L1, MSE, diffusion loss, etc.)
+- gradient norm
+- learning rate
+- throughput / steps per second / samples per second
+- GPU memory (if already logged in repo)
+- rollout success rate
+- per-task success rate
+- geometry-sensitive subset success rate
+- low-data regime success rate (for those runs)
+- robustness curves / eval metrics
+- token counts / average supernode counts / average neighbor counts (for debug)
+
+Also save:
+- rollout videos or debug traces if the repo already supports this cleanly
+- per-task metrics JSON / CSV for paper table generation
+
+================================================================================
+11. EXACT EXPERIMENTS TO IMPLEMENT
+================================================================================
+
+These are the experiments to code and run. They are enough for a strong RLBench-only NeurIPS-style submission if done correctly.
+
+All main experiments should use 3 random seeds.
+All evals should use 25 evaluation episodes per task where possible.
+
+PRIMARY MODELS / MAIN TABLE
+---------------------------
+
+Experiment 1: RLBench-18, full data, chunk regression, Perceiver tokenizer baseline
+- script: exp01_rlbench18_perceiver_chunk.sh
+- model: Perceiver observation encoder + shared chunk decoder
+- conditioning: task-id embedding, Level 1 + Level 2
+- loss: L1 on action chunk
+
+Experiment 2: RLBench-18, full data, chunk regression, Supernode tokenizer (main model)
+- script: exp02_rlbench18_supernode_chunk.sh
+- same as Exp 1, only tokenizer changes
+
+These two experiments are the core of the paper.
+
+TOKENIZER ABLATIONS
+-------------------
+
+Experiment 3: RLBench-18, full data, chunk regression, Supernode w/o message passing
+- script: exp03_rlbench18_supernode_nomsg_chunk.sh
+- isolate the value of local message passing
+
+Experiment 4: RLBench-18, full data, chunk regression, Supernode matched-token / matched-budget ablation
+- script: exp04_rlbench18_supernode_matched_chunk.sh
+- match downstream token count and keep params/compute as close as possible to Perceiver baseline
+
+LOW-DATA REGIME
+---------------
+
+Experiment 5: RLBench-18, low-data (20 demos/task), chunk regression, Perceiver baseline
+- script: exp05_rlbench18_perceiver_chunk_lowdata20.sh
+
+Experiment 6: RLBench-18, low-data (20 demos/task), chunk regression, Supernode tokenizer
+- script: exp06_rlbench18_supernode_chunk_lowdata20.sh
+
+SECONDARY HEAD (DIFFUSION)
+--------------------------
+
+Experiment 7: RLBench-18, full data, diffusion head, Perceiver tokenizer
+- script: exp07_rlbench18_perceiver_diffusion.sh
+
+Experiment 8: RLBench-18, full data, diffusion head, Supernode tokenizer
+- script: exp08_rlbench18_supernode_diffusion.sh
+
+These are secondary experiments, not the first priority.
+
+ROBUSTNESS EVALS
+----------------
+
+Experiment 9: Robustness eval for trained chunk-regression Perceiver baseline
+- script: exp09_rlbench18_robustness_perceiver.sh
+
+Experiment 10: Robustness eval for trained chunk-regression Supernode model
+- script: exp10_rlbench18_robustness_supernode.sh
+
+Robustness sweeps must include at least:
+- point count = [4096, 2048, 1024, 512]
+- random point dropout = [0%, 25%, 50%]
+Optional if easy:
+- xyz jitter
+- random cuboid occlusion
+
+EVAL REPORTING
+--------------
+Each eval should report:
+- average success over all 18 tasks
+- success on the geometry-sensitive subset
+- per-task success
+- if robustness eval: performance as a function of perturbation level
+
+================================================================================
+12. TRAINING HYPERPARAMETERS (DEFAULTS)
+================================================================================
+
+Use conservative defaults first, reusing the repo conventions.
+Keep them configurable.
+
+Common optimizer defaults:
+- AdamW
+- lr = 1e-4
+- betas = (0.9, 0.95)
+- weight_decay = 1e-4
+- grad_clip_norm = 1.0
+- amp = True
+- DDP = True
+
+Common model defaults:
+- d_model = 512
+- n_heads = 8
+- dropout = 0.0
+- horizon H = 16
+- T_obs = 2
+- pointcloud_max_points = 4096
+- batch size: start conservative and match current repo conventions; expose config for per-GPU batch size and grad accumulation
+
+Suggested paper defaults:
+- chunk-regression runs: 300k optimizer steps
+- diffusion runs: 400k optimizer steps
+- eval every 5k steps
+- checkpoint every 10k steps
+- keep a short smoke-test config (e.g. 1k-5k steps)
+
+If the repo already has strong defaults for mixed precision, gradient accumulation, and checkpointing,
+reuse them.
+
+================================================================================
+13. IMPORTANT IMPLEMENTATION DETAILS / FAIRNESS CONSTRAINTS
+================================================================================
+
+These are mandatory.
+
+1. The main tokenizer comparison must change ONLY the tokenizer.
+   - same decoder
+   - same task conditioning
+   - same action horizon
+   - same data
+   - same training budget
+
+2. The main paper should be class-conditioned IL, not language-conditioned IL.
+   - use task-id embeddings in v1
+   - implement a clean path for future language embeddings, but do not make this a dependency for the first paper
+
+3. Do not implement PerAct / Act3D / DP3 as full baselines inside the repo.
+   - too expensive and out of scope for v1
+   - focus on controlled internal baselines
+   - if a trivial PointNet baseline exists already, expose it; otherwise skip
+
+4. Reuse the current repo modules whenever possible.
+   - DiT blocks
+   - Perceiver frame tokenizer
+   - supernode tokenizer
+   - query branch post-self-attention blocks
+   - DDP launcher / logging / checkpointing
+
+5. The standard IL codepath must be cleanly separated from the ICIL codepath.
+   - no support/query ICIL logic leaking into standard IL code
+   - but reuse modules internally where appropriate
+
+================================================================================
+14. ACCEPTANCE CRITERIA / DELIVERABLES
+================================================================================
+
+The implementation is complete only when all of the following are true:
+
+A. Code structure
+- new standard-IL codepath exists and is cleanly separated from ICIL
+- repo structure mirrors existing `icil-rlbench` style
+- configs exist for all main experiments
+
+B. Models
+- Perceiver baseline works
+- Supernode tokenizer works
+- Supernode no-message-passing ablation works
+- Supernode matched-budget ablation works
+- shared chunk-regression decoder works
+- diffusion decoder adaptation works
+
+C. Training / eval
+- all training scripts support DDP and resume
+- eval script computes all-task success, subset success, per-task success
+- robustness eval exists
+- low-data subsampling exists
+
+D. Logging
+- wandb logging mirrors current repo style, minus ICIL-specific items
+- metrics are exportable for paper tables
+
+E. Sanity checks
+Before large runs, add smoke tests / debug configs:
+- overfit one batch
+- overfit one task on a tiny dataset
+- 1-step rollout sanity check
+- DDP smoke test
+
+================================================================================
+15. RECOMMENDED IMPLEMENTATION ORDER
+================================================================================
+
+Follow this order exactly to reduce wasted cluster time:
+
+1. Build standard IL dataset + collator on top of existing RLBench cache
+2. Build common task-conditioning module (task-id embedding, Level 1 + Level 2)
+3. Build Perceiver standard IL encoder using existing query branch code
+4. Build chunk-regression decoder using reused DiT block code where possible
+5. Train / overfit / rollout sanity-check Perceiver + chunk model
+6. Plug in supernode tokenizer
+7. Train / overfit / rollout sanity-check Supernode + chunk model
+8. Add supernode ablations
+9. Add low-data configs
+10. Add robustness eval
+11. Add diffusion head adaptation
+12. Only after all of the above is stable, clean up configs / scripts / docs
+
+================================================================================
+16. FINAL OUTPUT EXPECTED FROM CODEX
+================================================================================
+
+Produce:
+1. The full code implementation in a new `supernode-tokenizer`-style codepath within the repo.
+2. All configs and experiment launch scripts listed above.
+3. A short README section explaining:
+   - what the repo/codepath does
+   - how it differs from ICIL
+   - how to train and evaluate each experiment
+4. Any migration notes if small refactors of shared modules were necessary.
+
+Again: reuse as much as possible from `icil-rlbench`.
+Do not over-engineer. Keep the code focused on the tokenizer paper story.
