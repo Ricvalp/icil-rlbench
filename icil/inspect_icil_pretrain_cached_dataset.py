@@ -12,6 +12,7 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader
 
+from icil.action_representation import decode_action_chunk
 from icil.datasets.in_context_imitation_learning.icil_datasets import (
     ICILConfig,
     ICILPretrainBatchIterable,
@@ -57,6 +58,13 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--T-obs", dest="T_obs", type=int, default=2)
     parser.add_argument("--H", type=int, default=8)
     parser.add_argument("--stride", type=int, default=1)
+    parser.add_argument(
+        "--action-representation",
+        type=str,
+        default="absolute",
+        choices=("absolute", "delta_xyz"),
+        help="Interpret target_action/cond_traj as absolute positions or delta xyz actions.",
+    )
 
     parser.add_argument("--batch-size", type=int, default=2, help="Pretrain batch size B.")
     parser.add_argument("--num-batches", type=int, default=4, help="Number of batches to inspect.")
@@ -360,6 +368,7 @@ def main() -> None:
             T_obs=int(args.T_obs),
             H=int(args.H),
             stride=int(args.stride),
+            action_representation=str(args.action_representation),
         )
 
         pretrain_ds = ICILPretrainBatchIterable(
@@ -446,7 +455,12 @@ def main() -> None:
 
                 action_xyz = None
                 if target_action.shape[1] >= 3:
-                    action_xyz = target_action[:, :3].detach().cpu().numpy()
+                    target_action_for_plot = decode_action_chunk(
+                        target_action.unsqueeze(0),
+                        query_state=query_state.unsqueeze(0),
+                        representation=str(cfg.action_representation),
+                    )[0]
+                    action_xyz = target_action_for_plot[:, :3].detach().cpu().numpy()
 
                 support_html = sample_dir / "support_frames.html"
                 query_html = sample_dir / "query_frames_with_actions.html"
@@ -464,7 +478,10 @@ def main() -> None:
                     out_path=query_html,
                     xyz_seq=query_xyz,
                     valid_seq=query_valid,
-                    title=f"batch {batch_idx} sample {sample_idx} | query frames + target action xyz",
+                    title=(
+                        f"batch {batch_idx} sample {sample_idx} | "
+                        f"query frames + target action xyz ({cfg.action_representation})"
+                    ),
                     rng=rng,
                     max_points_per_trace=int(args.max_points_per_trace),
                     action_xyz=action_xyz,
@@ -485,6 +502,7 @@ def main() -> None:
                     "cond_state_shape": list(cond_state.shape),
                     "query_state_shape": list(query_state.shape),
                     "target_action_shape": list(target_action.shape),
+                    "action_representation": str(cfg.action_representation),
                     "meta": _to_serializable(batch.get("meta", [])[sample_idx] if sample_idx < len(batch.get("meta", [])) else {}),
                 }
                 (sample_dir / "sample_meta.json").write_text(
