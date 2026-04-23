@@ -24,6 +24,7 @@ def get_config():
     cfg.dataset.T_obs = 2
     cfg.dataset.H = 16
     cfg.dataset.stride = 2
+    cfg.dataset.action_representation = "absolute"  # "absolute" | "delta_xyz"; checkpoint overrides when enabled
     # Controls how query windows are built from eval history:
     # - "dataset": use dataset stride spacing
     # - "consecutive": use adjacent history frames (no extra striding)

@@ -121,7 +121,7 @@ def _build_query_sample_at_t0(
         'query_xyz': q_obs['xyz'],
         'query_state': q_obs['state'],
         'query_valid': q_obs['valid'],
-        'target_action': q_act['action'],
+        'target_action': task_builder._encode_target_action(q_obs['state'], q_act['action']),
         'meta': {
             'vidx': int(vidx),
             'query_episode': int(episode_id),

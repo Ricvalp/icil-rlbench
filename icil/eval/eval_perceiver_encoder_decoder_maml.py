@@ -18,6 +18,7 @@ from ml_collections.config_flags import config_flags
 from torch.func import functional_call
 from tqdm.auto import tqdm
 
+from icil.action_representation import decode_action_chunk
 from icil.datasets.in_context_imitation_learning.cache_variation_h5 import (
     MASK_NAME_SUBSTRINGS_TO_IGNORE,
     MASK_NAMES_TO_IGNORE,
@@ -378,12 +379,17 @@ def _dataset_config_from_eval_and_checkpoint(cfg: ConfigDict, ckpt: Dict[str, An
             return int(ckpt_dataset[name])
         return int(getattr(cfg.dataset, name, default))
 
+    action_representation = str(getattr(cfg.dataset, 'action_representation', 'absolute'))
+    if use_ckpt and 'action_representation' in ckpt_dataset:
+        action_representation = str(ckpt_dataset['action_representation'])
+
     return ICILConfig(
         K=int(resolved_k),
         L=_ival('L', 1),
         T_obs=_ival('T_obs', 1),
         H=_ival('H', 1),
         stride=_ival('stride', 1),
+        action_representation=action_representation,
     )
 
 
@@ -992,7 +998,7 @@ def _build_query_sample_at_t0(
         'query_xyz': q_obs['xyz'],
         'query_state': q_obs['state'],
         'query_valid': q_obs['valid'],
-        'target_action': q_act['action'],
+        'target_action': task_builder._encode_target_action(q_obs['state'], q_act['action']),
         'meta': {
             'vidx': int(vidx),
             'query_episode': int(episode_id),
@@ -1870,7 +1876,12 @@ def _run_eval_episode(
                     inference_steps=int(cfg.inference.inference_steps),
                     eta=float(cfg.inference.eta),
                 )
-            plan_np = plan[0].detach().cpu().numpy()
+                plan = decode_action_chunk(
+                    plan,
+                    query_state=query_state,
+                    representation=str(dataset_cfg.action_representation),
+                )
+                plan_np = plan[0].detach().cpu().numpy()
             n_exec = int(min(execute_actions, plan_np.shape[0], max_env_steps - env_steps))
 
             for i in range(n_exec):
@@ -2173,6 +2184,7 @@ def evaluate(cfg: ConfigDict) -> None:
                         T_obs=int(dataset_cfg.T_obs),
                         H=int(dataset_cfg.H),
                         stride=int(dataset_cfg.stride),
+                        action_representation=str(dataset_cfg.action_representation),
                     ),
                     variation=variation,
                     rng=rng,
@@ -2267,6 +2279,7 @@ def evaluate(cfg: ConfigDict) -> None:
                     T_obs=int(dataset_cfg.T_obs),
                     H=int(dataset_cfg.H),
                     stride=int(dataset_cfg.stride),
+                    action_representation=str(dataset_cfg.action_representation),
                 ),
                 support_cond=current_support_package['support_cond'] if current_support_package is not None else None,
                 ignore_demos=ignore_demos,

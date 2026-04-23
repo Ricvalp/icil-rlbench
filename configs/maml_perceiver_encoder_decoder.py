@@ -41,6 +41,7 @@ def get_config():
     cfg.dataset.T_obs = 2
     cfg.dataset.H = 16
     cfg.dataset.stride = 2
+    cfg.dataset.action_representation = 'absolute'  # 'absolute' | 'delta_xyz'
     cfg.dataset.num_tries_per_item = 100
 
     cfg.model = ConfigDict()

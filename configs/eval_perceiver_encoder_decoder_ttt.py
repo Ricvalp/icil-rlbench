@@ -24,6 +24,7 @@ def get_config():
     cfg.dataset.T_obs = 2
     cfg.dataset.H = 16
     cfg.dataset.stride = 2
+    cfg.dataset.action_representation = 'absolute'  # 'absolute' | 'delta_xyz'; checkpoint overrides when enabled
     cfg.dataset.query_stride_mode = 'consecutive'  # 'dataset' | 'consecutive'
 
     cfg.conditioning = ConfigDict()

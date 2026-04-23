@@ -165,7 +165,7 @@ class MAMLTaskBuilder(ICILSamplerCore):
         if load_rgb and "rgb" in sample:
             out["cond_rgb"] = sample["rgb"]
         if load_full_traj and "traj" in sample:
-            out["cond_traj"] = self._stride_traj(sample["traj"])
+            out["cond_traj"] = self._stride_and_encode_traj(sample["traj"])
         return out
 
     def _stack_support_conditioning_items(
@@ -224,7 +224,7 @@ class MAMLTaskBuilder(ICILSamplerCore):
             "query_xyz": q_obs["xyz"],
             "query_state": q_obs["state"],
             "query_valid": q_obs["valid"],
-            "target_action": q_act["action"],
+            "target_action": self._encode_target_action(q_obs["state"], q_act["action"]),
             "meta": {
                 "vidx": int(vidx),
                 "query_episode": int(episode_id),

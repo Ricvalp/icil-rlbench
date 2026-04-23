@@ -15,6 +15,7 @@ from ml_collections import ConfigDict
 from ml_collections.config_flags import config_flags
 from tqdm.auto import tqdm
 
+from icil.action_representation import decode_action_chunk
 from icil.datasets.in_context_imitation_learning.cache_variation_h5 import (
     MASK_NAME_SUBSTRINGS_TO_IGNORE,
     MASK_NAMES_TO_IGNORE,
@@ -250,12 +251,17 @@ def _dataset_config_from_eval_and_checkpoint(cfg: ConfigDict, ckpt: Dict[str, An
             return int(ckpt_dataset[name])
         return int(getattr(cfg.dataset, name, default))
 
+    action_representation = str(getattr(cfg.dataset, "action_representation", "absolute"))
+    if use_ckpt and "action_representation" in ckpt_dataset:
+        action_representation = str(ckpt_dataset["action_representation"])
+
     return ICILConfig(
         K=_ival("K", 1),
         L=_ival("L", 1),
         T_obs=_ival("T_obs", 1),
         H=_ival("H", 1),
         stride=_ival("stride", 1),
+        action_representation=action_representation,
     )
 
 
@@ -584,7 +590,7 @@ def _build_live_support_conditioning(
         "cond_valid": torch.stack(cond_valid, 0).unsqueeze(0),  # [1,K,L,N]
     }
     # Trajectory branch compatibility: use keyframe state sequence as support trajectory fallback.
-    out["cond_traj"] = out["cond_state"]  # [1,K,L,S]
+    out["cond_traj"] = sampler._encode_support_traj(out["cond_state"])  # [1,K,L,S]
     out["cond_traj_mask"] = torch.ones(
         out["cond_state"].shape[:3],
         dtype=torch.bool,
@@ -839,6 +845,11 @@ def _run_eval_episode(
                     inference_steps=int(cfg.inference.inference_steps),
                     eta=float(cfg.inference.eta),
                 )
+            plan = decode_action_chunk(
+                plan,
+                query_state=query_state,
+                representation=str(dataset_cfg.action_representation),
+            )
             plan_np = plan[0].detach().cpu().numpy()
             n_exec = int(min(execute_actions, plan_np.shape[0], max_env_steps - env_steps))
 

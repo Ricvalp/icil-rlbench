@@ -19,6 +19,7 @@ from ml_collections.config_flags import config_flags
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
 
+from icil.action_representation import decode_action_chunk, decode_action_trace
 from icil.datasets.in_context_imitation_learning.icil_datasets import (
     ICILConfig,
     ICILPretrainBatchIterable,
@@ -696,6 +697,7 @@ def train(cfg: ConfigDict) -> None:
             T_obs=int(cfg.dataset.T_obs),
             H=int(cfg.dataset.H),
             stride=int(cfg.dataset.stride),
+            action_representation=str(getattr(cfg.dataset, "action_representation", "absolute")),
             task_sampling=str(getattr(cfg.data, "task_sampling", "variation_power")),
             task_sampling_alpha=float(getattr(cfg.data, "task_sampling_alpha", 1.0)),
         )
@@ -985,9 +987,19 @@ def train(cfg: ConfigDict) -> None:
                     if was_training:
                         ddp_model.train()
 
+                    plot_pred_x0 = decode_action_chunk(
+                        pred_x0,
+                        query_state=batch["query_state"],
+                        representation=str(dataset_cfg.action_representation),
+                    )
+                    plot_gt_x0 = decode_action_chunk(
+                        batch["target_action"],
+                        query_state=batch["query_state"],
+                        representation=str(dataset_cfg.action_representation),
+                    )
                     fig = _plot_pred_vs_gt_3d(
-                        pred_x0=pred_x0,
-                        gt_x0=batch["target_action"],
+                        pred_x0=plot_pred_x0,
+                        gt_x0=plot_gt_x0,
                         max_items=wandb_sample_batch,
                         include_query_pointcloud=wandb_include_query_pc,
                         query_xyz=batch.get("query_xyz", None),
@@ -997,16 +1009,30 @@ def train(cfg: ConfigDict) -> None:
                     fig_trace = None
                     if denoise_trace is not None:
                         fig_trace = _plot_denoising_trace_3d(
-                            denoise_trace["x0_hat"],
+                            decode_action_trace(
+                                denoise_trace["x0_hat"],
+                                query_state=batch["query_state"],
+                                representation=str(dataset_cfg.action_representation),
+                            ),
                             denoise_trace["timesteps"],
                             max_items=max(1, min(2, wandb_sample_batch)),
                         )
                     fig_excluded = None
                     fig_trace_excluded = None
                     if excluded_batch is not None and pred_x0_excluded is not None:
+                        plot_pred_x0_excluded = decode_action_chunk(
+                            pred_x0_excluded,
+                            query_state=excluded_batch["query_state"],
+                            representation=str(dataset_cfg.action_representation),
+                        )
+                        plot_gt_x0_excluded = decode_action_chunk(
+                            excluded_batch["target_action"],
+                            query_state=excluded_batch["query_state"],
+                            representation=str(dataset_cfg.action_representation),
+                        )
                         fig_excluded = _plot_pred_vs_gt_3d(
-                            pred_x0=pred_x0_excluded,
-                            gt_x0=excluded_batch["target_action"],
+                            pred_x0=plot_pred_x0_excluded,
+                            gt_x0=plot_gt_x0_excluded,
                             max_items=wandb_sample_batch,
                             include_query_pointcloud=wandb_include_query_pc,
                             query_xyz=excluded_batch.get("query_xyz", None),
@@ -1015,7 +1041,11 @@ def train(cfg: ConfigDict) -> None:
                         )
                         if denoise_trace_excluded is not None:
                             fig_trace_excluded = _plot_denoising_trace_3d(
-                                denoise_trace_excluded["x0_hat"],
+                                decode_action_trace(
+                                    denoise_trace_excluded["x0_hat"],
+                                    query_state=excluded_batch["query_state"],
+                                    representation=str(dataset_cfg.action_representation),
+                                ),
                                 denoise_trace_excluded["timesteps"],
                                 max_items=max(1, min(2, wandb_sample_batch)),
                             )

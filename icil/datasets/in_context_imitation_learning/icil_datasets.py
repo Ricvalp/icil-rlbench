@@ -10,6 +10,12 @@ import numpy as np
 import torch
 from torch.utils.data import IterableDataset, get_worker_info
 
+from icil.action_representation import (
+    encode_action_chunk,
+    encode_support_traj,
+    normalize_action_representation,
+)
+
 try:
     from .variation_store import VariationStore, build_variation_keys
 except ImportError:  # pragma: no cover - allow direct script execution
@@ -34,6 +40,7 @@ class ICILConfig:
     T_obs: int
     H: int
     stride: int = 1
+    action_representation: str = "absolute"
     task_sampling: str = "variation_power"
     task_sampling_alpha: float = 1.0
 
@@ -52,6 +59,7 @@ class ICILConfig:
             raise ValueError("H must be >= 1.")
         if self.stride < 1:
             raise ValueError("stride must be >= 1.")
+        normalize_action_representation(self.action_representation)
         if str(self.task_sampling) not in ("variation_power", "variation_uniform", "task_uniform"):
             raise ValueError(
                 "task_sampling must be one of: variation_power, variation_uniform, task_uniform."
@@ -237,6 +245,22 @@ class ICILSamplerCore:
             return traj
         return traj[::stride]
 
+    def _encode_target_action(self, query_state: torch.Tensor, target_action: torch.Tensor) -> torch.Tensor:
+        return encode_action_chunk(
+            target_action,
+            query_state=query_state,
+            representation=str(self.cfg.action_representation),
+        )
+
+    def _encode_support_traj(self, traj: torch.Tensor) -> torch.Tensor:
+        return encode_support_traj(
+            traj,
+            representation=str(self.cfg.action_representation),
+        )
+
+    def _stride_and_encode_traj(self, traj: torch.Tensor) -> torch.Tensor:
+        return self._encode_support_traj(self._stride_traj(traj))
+
     def _pack_traj_list(
         self,
         traj_list: Sequence[torch.Tensor],
@@ -352,7 +376,7 @@ class ICILSamplerCore:
             elif load_rgb:
                 cond_has_rgb_for_all = False
             if load_full_traj and "traj" in c:
-                cond_traj.append(self._stride_traj(c["traj"]))
+                cond_traj.append(self._stride_and_encode_traj(c["traj"]))
             elif load_full_traj:
                 cond_has_traj = False
 
@@ -429,7 +453,7 @@ class ICILSamplerCore:
             "query_xyz": q_obs["xyz"],                     # [T_obs,N,3]
             "query_state": q_obs["state"],                 # [T_obs,S]
             "query_valid": q_obs["valid"],                 # [T_obs,N]
-            "target_action": q_act["action"],              # [H,A]
+            "target_action": self._encode_target_action(q_obs["state"], q_act["action"]),  # [H,A]
             "meta": {"vidx": vidx, "query_episode": query_id, "t0": t0},
         }
         sample.update(support)
@@ -526,7 +550,7 @@ class ICILSamplerCore:
             query_xyz_list.append(q_obs["xyz"])
             query_state_list.append(q_obs["state"])
             query_valid_list.append(q_obs["valid"])
-            target_action_list.append(q_act["action"])
+            target_action_list.append(self._encode_target_action(q_obs["state"], q_act["action"]))
             if "mask_id" in q_obs:
                 query_mask_list.append(q_obs["mask_id"])
             else:
@@ -573,7 +597,7 @@ class ICILSamplerCore:
                 else:
                     cond_has_rgb_this_j = False
                 if "traj" in s:
-                    cond_traj.append(self._stride_traj(s["traj"]))
+                    cond_traj.append(self._stride_and_encode_traj(s["traj"]))
                 else:
                     cond_has_traj_this_j = False
             cond_xyz_J.append(torch.stack(cond_xyz, 0))       # [K,L,N,3]

@@ -14,6 +14,7 @@ from absl import logging
 from ml_collections import ConfigDict
 from torch.utils.data import DataLoader
 
+from icil.action_representation import decode_action_chunk
 from icil.datasets.in_context_imitation_learning.icil_datasets import ICILConfig
 from icil.models import build_policy
 from icil.models.maml.diagnostics import (
@@ -192,6 +193,14 @@ def _resolve_dataset_cfg(
             resume_config=resume_config,
             pretrained_config=pretrained_config,
             transform=int,
+        ),
+        action_representation=_resolve_checkpoint_field(
+            local_value=getattr(cfg.dataset, 'action_representation', 'absolute'),
+            section_name='dataset',
+            field_name='action_representation',
+            resume_config=resume_config,
+            pretrained_config=pretrained_config,
+            transform=str,
         ),
         task_sampling=str(getattr(cfg.data, 'task_sampling', 'variation_power')),
         task_sampling_alpha=float(getattr(cfg.data, 'task_sampling_alpha', 1.0)),
@@ -1005,9 +1014,19 @@ def train_memory_maml(cfg: ConfigDict) -> None:
 
                 fig = None
                 if pred_x0 is not None and gt_x0 is not None:
+                    pred_x0_plot = decode_action_chunk(
+                        pred_x0,
+                        query_state=query_state,
+                        representation=str(dataset_cfg.action_representation),
+                    )
+                    gt_x0_plot = decode_action_chunk(
+                        gt_x0,
+                        query_state=query_state,
+                        representation=str(dataset_cfg.action_representation),
+                    )
                     fig = _plot_pred_vs_gt_3d(
-                        pred_x0=pred_x0,
-                        gt_x0=gt_x0,
+                        pred_x0=pred_x0_plot,
+                        gt_x0=gt_x0_plot,
                         max_items=max(1, wandb_sample_batch),
                         include_query_pointcloud=wandb_include_query_pc,
                         query_xyz=query_xyz,
