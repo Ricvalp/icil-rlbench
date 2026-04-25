@@ -1,7 +1,7 @@
 #!/bin/bash
-#SBATCH --job-name=direct_reg_dnk1gv9j_encoder
-#SBATCH --output=/gpfs/home1/rvalperga/icil-rlbench/.smanager/scripts/icil.pretrain_perceiver_encoder_decoder_ddp/logs/direct_reg_dnk1gv9j_encoder.%j.out
-#SBATCH --error=/gpfs/home1/rvalperga/icil-rlbench/.smanager/scripts/icil.pretrain_perceiver_encoder_decoder_ddp/logs/direct_reg_dnk1gv9j_encoder.%j.err
+#SBATCH --job-name=direct_regression_perceiver_encoder
+#SBATCH --output=/gpfs/home1/rvalperga/icil-rlbench/.smanager/scripts/icil.pretrain_perceiver_encoder_decoder_ddp/logs/direct_regression_perceiver_encoder.%j.out
+#SBATCH --error=/gpfs/home1/rvalperga/icil-rlbench/.smanager/scripts/icil.pretrain_perceiver_encoder_decoder_ddp/logs/direct_regression_perceiver_encoder.%j.err
 #SBATCH --partition=gpu_h100
 #SBATCH --gres=gpu:4
 #SBATCH --time=72:00:00
