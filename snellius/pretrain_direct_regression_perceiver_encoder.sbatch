@@ -1,7 +1,7 @@
 #!/bin/bash
-#SBATCH --job-name=direct_regression_perceiver_encoder
-#SBATCH --output=/gpfs/home1/rvalperga/icil-rlbench/.smanager/scripts/icil.pretrain_perceiver_encoder_decoder_ddp/logs/direct_regression_perceiver_encoder.%j.out
-#SBATCH --error=/gpfs/home1/rvalperga/icil-rlbench/.smanager/scripts/icil.pretrain_perceiver_encoder_decoder_ddp/logs/direct_regression_perceiver_encoder.%j.err
+#SBATCH --job-name=direct_regression_traj_perceiver_v2
+#SBATCH --output=/gpfs/home1/rvalperga/icil-rlbench/.smanager/scripts/icil.pretrain_perceiver_encoder_decoder_ddp/logs/direct_regression_traj_perceiver_v2.%j.out
+#SBATCH --error=/gpfs/home1/rvalperga/icil-rlbench/.smanager/scripts/icil.pretrain_perceiver_encoder_decoder_ddp/logs/direct_regression_traj_perceiver_v2.%j.err
 #SBATCH --partition=gpu_h100
 #SBATCH --gres=gpu:4
 #SBATCH --time=72:00:00
@@ -28,7 +28,7 @@ torchrun --standalone --nproc_per_node=4 \
   /gpfs/home1/rvalperga/icil-rlbench/icil/pretrain_direct_regression_perceiver_encoder_decoder_ddp.py \
   --config=configs/pretrain_direct_regression_perceiver_encoder_decoder.py \
   --config.data.task_sampling=variation_uniform \
-  --config.model.encoder_name=traj_perceiver \
+  --config.model.encoder_name=traj_perceiver_v2 \
   --config.dataset.K=4 \
   --config.dataset.L=10 \
   --config.dataset.T_obs=2 \
@@ -39,13 +39,7 @@ torchrun --standalone --nproc_per_node=4 \
   --config.model.direct_regression.context_attention_mode=two_ctx \
   --config.model.direct_regression.loss_type=l1 \
   --config.model.direct_regression.attention_backend=manual \
-  --config.model.traj_perceiver.m_frame_tokens=128 \
-  --config.model.traj_perceiver.frame_tokenizer_layers=2 \
-  --config.model.traj_perceiver.M_demo_latents=256 \
-  --config.model.traj_perceiver.demo_perceiver_layers=3 \
-  --config.model.traj_perceiver.use_mask_id=False \
-  --config.model.traj_perceiver.m_traj_tokens=16 \
-  --config.model.traj_perceiver.traj_perceiver_layers=2 \
-  --config.model.traj_perceiver.include_traj_tokens=True \
-  --config.model.traj_perceiver.use_demo_id_embed=True \
-  --config.model.traj_perceiver.use_cond_state_as_traj_fallback=False
+  --config.model.traj_perceiver_v2.use_mask_id=False \
+  --config.model.traj_perceiver_v2.include_traj_tokens=True \
+  --config.model.traj_perceiver_v2.use_demo_id_embed=True \
+  --config.model.traj_perceiver_v2.use_cond_state_as_traj_fallback=False
