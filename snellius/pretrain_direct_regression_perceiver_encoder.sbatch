@@ -34,6 +34,7 @@ torchrun --standalone --nproc_per_node=4 \
   --config.dataset.T_obs=2 \
   --config.dataset.H=16 \
   --config.dataset.stride=2 \
+  --config.train.batch_size=32 \
   --config.model.direct_regression.horizon=16 \
   --config.model.direct_regression.context_attention_mode=two_ctx \
   --config.model.direct_regression.loss_type=l1 \

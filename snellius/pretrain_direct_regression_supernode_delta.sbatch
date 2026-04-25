@@ -28,6 +28,7 @@ torchrun --standalone --nproc_per_node=4 \
   /gpfs/home1/rvalperga/icil-rlbench/icil/pretrain_direct_regression_perceiver_encoder_decoder_ddp.py \
   --config=configs/pretrain_direct_regression_perceiver_encoder_decoder.py \
   --config.data.task_sampling=variation_uniform \
+  --config.train.batch_size=32 \
   --config.model.encoder_name=traj_supernode_perceiver_v2 \
   --config.dataset.action_representation=delta_xyz \
   --config.model.direct_regression.context_attention_mode=two_ctx \

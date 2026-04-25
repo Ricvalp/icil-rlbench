@@ -31,7 +31,7 @@ def get_config():
     cfg.data.persistent_workers = True
     # Sample tasks with probability proportional to num_variations ** alpha.
     # alpha=1.0 is the old variation-uniform behavior; alpha=0.0 is task-uniform.
-    cfg.data.task_sampling = "variation_power" # "variation_power" or "variation_uniform""
+    cfg.data.task_sampling = "variation_uniform" # "variation_power" or "variation_uniform""
     cfg.data.task_sampling_alpha = 0.6
 
     cfg.dataset = ConfigDict()
@@ -352,7 +352,7 @@ def get_config():
     cfg.wandb.mode = os.environ.get("WANDB_MODE", "online")  # online | offline | disabled
     cfg.wandb.tags = ()
     cfg.wandb.n_loss_steps = 20
-    cfg.wandb.n_sample_steps = 1000
+    cfg.wandb.n_sample_steps = 10000
     cfg.wandb.sample_batch_items = 16
     cfg.wandb.sample_mse_items = 64
     cfg.wandb.sample_inference_steps = 100
