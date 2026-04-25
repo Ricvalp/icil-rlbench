@@ -4,7 +4,7 @@
 #SBATCH --error=/home/rvalper/icil-rlbench/hipster/logs/direct_reg_supernode_delta.%j.err
 #SBATCH --partition=performance
 #SBATCH --gres=gpu:4
-#SBATCH --time=72:00:00
+#SBATCH --time=48:00:00
 #SBATCH -n 128
 
 source ~/miniconda3/bin/activate
