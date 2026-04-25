@@ -55,10 +55,6 @@ def get_config():
     cfg.control.normalize_quaternion = True
     cfg.control.discretize_gripper = True
 
-    cfg.inference = ConfigDict()
-    cfg.inference.inference_steps = 100
-    cfg.inference.eta = 0.0
-
     cfg.video = ConfigDict()
     cfg.video.enable = True
     cfg.video.camera = "front"  # left_shoulder | right_shoulder | overhead | wrist | front
@@ -71,7 +67,7 @@ def get_config():
         os.path.join(
             "output",
             ".experiments",
-            "perceiver_encoder_decoder_eval",
+            "direct_regression_perceiver_encoder_decoder_eval",
         ),
     )
 

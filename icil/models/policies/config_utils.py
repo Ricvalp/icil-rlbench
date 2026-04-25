@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import fields
+from types import SimpleNamespace
 from typing import Any, Callable
 
 from icil.models.encoders import (
@@ -14,6 +15,7 @@ from icil.models.encoders import (
     TrajSupernodePerceiverV2Config,
 )
 from icil.models.policies.builders import PolicyBuilderConfig
+from icil.models.policies.direct_regression_policy import DirectRegressionPolicyConfig
 from icil.models.policies.policy import PolicyConfig
 
 
@@ -41,16 +43,19 @@ def inherit_missing_encoder_attention_backend(model_cfg: Any) -> Any:
     """Copy the global policy attention backend into encoder configs when absent.
 
     Checkpoints store the raw ml_collections config, where the global knob lives
-    under model.policy.attention_backend. Training config construction already
-    uses that knob for encoders; eval reconstruction should do the same.
+    under model.policy.attention_backend or model.direct_regression.attention_backend.
+    Training config construction already uses that knob for encoders; eval
+    reconstruction should do the same.
     """
     if not isinstance(model_cfg, dict):
         return model_cfg
-    policy_cfg = model_cfg.get("policy", {})
-    if not isinstance(policy_cfg, dict) or "attention_backend" not in policy_cfg:
+    shared_cfg = model_cfg.get("policy", {})
+    if not isinstance(shared_cfg, dict) or "attention_backend" not in shared_cfg:
+        shared_cfg = model_cfg.get("direct_regression", {})
+    if not isinstance(shared_cfg, dict) or "attention_backend" not in shared_cfg:
         return model_cfg
 
-    backend = policy_cfg["attention_backend"]
+    backend = shared_cfg["attention_backend"]
     out = dict(model_cfg)
     for key in _ENCODER_CONFIG_KEYS:
         encoder_cfg = out.get(key, None)
@@ -349,3 +354,64 @@ def build_policy_builder_config_from_configdict(
         traj_perceiver_v2=traj_v2_cfg,
         traj_supernode_perceiver_v2=traj_supernode_v2_cfg,
     )
+
+
+def build_direct_regression_builder_config_from_configdict(
+    cfg: Any,
+    *,
+    as_bool: Callable[[Any], bool] = bool,
+) -> PolicyBuilderConfig:
+    sentinel = _none_config()
+    direct_cfg_raw = _get(cfg, "direct_regression", sentinel)
+    if direct_cfg_raw is sentinel:
+        raise ValueError("Expected cfg.direct_regression to be present for direct-regression models.")
+
+    direct_cfg = DirectRegressionPolicyConfig(
+        d_model=int(_get(direct_cfg_raw, "d_model", 512)),
+        n_heads=int(_get(direct_cfg_raw, "n_heads", 8)),
+        decoder_layers=int(_get(direct_cfg_raw, "decoder_layers", 8)),
+        decoder_mlp_mult=int(_get(direct_cfg_raw, "decoder_mlp_mult", 4)),
+        dropout=float(_get(direct_cfg_raw, "dropout", 0.0)),
+        grad_checkpoint_decoder=as_bool(_get(direct_cfg_raw, "grad_checkpoint_decoder", False)),
+        context_attention_mode=str(_get(direct_cfg_raw, "context_attention_mode", "single")),
+        attention_backend=str(_get(direct_cfg_raw, "attention_backend", "manual")),
+        loss_type=str(_get(direct_cfg_raw, "loss_type", "l1")),
+        horizon=int(_get(direct_cfg_raw, "horizon", 16)),
+        conditioner_mlp_mult=int(_get(direct_cfg_raw, "conditioner_mlp_mult", 2)),
+        conditioner_dropout=float(_get(direct_cfg_raw, "conditioner_dropout", 0.0)),
+    )
+
+    # Reuse the existing encoder-config parser by supplying a synthetic shared-policy
+    # config carrying the dimensions and backend defaults required by the encoders.
+    shadow_cfg = SimpleNamespace(
+        policy=SimpleNamespace(
+            d_model=direct_cfg.d_model,
+            n_heads=direct_cfg.n_heads,
+            denoiser_layers=max(1, direct_cfg.decoder_layers),
+            denoiser_mlp_mult=direct_cfg.decoder_mlp_mult,
+            dropout=direct_cfg.dropout,
+            grad_checkpoint_dit=direct_cfg.grad_checkpoint_decoder,
+            context_attention_mode=direct_cfg.context_attention_mode,
+            attention_backend=direct_cfg.attention_backend,
+            num_train_timesteps=1000,
+            beta_start=1e-4,
+            beta_end=2e-2,
+            beta_schedule="squaredcos_cap_v2",
+            prediction_type="v_prediction",
+            set_alpha_to_one=True,
+            steps_offset=0,
+            num_inference_steps=None,
+        ),
+        encoder_name=str(_get(cfg, "encoder_name", "perceiver_demo_query")),
+        conv3d_demo_query=_get(cfg, "conv3d_demo_query", _none_config()),
+        perceiver_demo_query=_get(cfg, "perceiver_demo_query", _none_config()),
+        perceiver_demo_query_v2=_get(cfg, "perceiver_demo_query_v2", _none_config()),
+        perceiver_demo_query_supernode_v2=_get(cfg, "perceiver_demo_query_supernode_v2", _none_config()),
+        traj_conv3d=_get(cfg, "traj_conv3d", _none_config()),
+        traj_perceiver=_get(cfg, "traj_perceiver", _none_config()),
+        traj_perceiver_v2=_get(cfg, "traj_perceiver_v2", _none_config()),
+        traj_supernode_perceiver_v2=_get(cfg, "traj_supernode_perceiver_v2", _none_config()),
+    )
+    builder_cfg = build_policy_builder_config_from_configdict(shadow_cfg, as_bool=as_bool)
+    builder_cfg.direct_regression = direct_cfg
+    return builder_cfg

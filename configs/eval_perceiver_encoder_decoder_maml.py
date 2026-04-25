@@ -51,7 +51,7 @@ def get_config():
     cfg.sim = ConfigDict()
     cfg.sim.headless = True
     cfg.sim.renderer = 'opengl'  # 'opengl' | 'opengl3'
-    cfg.sim.image_size = (256, 256)
+    cfg.sim.image_size = (128, 128)
     cfg.sim.arm_max_velocity = 1.0
     cfg.sim.arm_max_acceleration = 4.0
     cfg.sim.collision_checking = False
