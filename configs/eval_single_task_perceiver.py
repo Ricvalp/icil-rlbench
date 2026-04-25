@@ -40,7 +40,7 @@ def get_config():
     cfg.conditioning.use_rgb = True
     # Fallback for checkpoints that do not store mask-id usage in model config.
     cfg.conditioning.use_mask_id = False
-    cfg.conditioning.num_points = 4096
+    cfg.conditioning.num_points = 1024
 
     cfg.sim = ConfigDict()
     cfg.sim.headless = True
@@ -51,12 +51,12 @@ def get_config():
     cfg.sim.collision_checking = False
 
     cfg.control = ConfigDict()
-    cfg.control.execute_actions_per_plan = 2
+    cfg.control.execute_actions_per_plan = 8
     cfg.control.normalize_quaternion = True
     cfg.control.discretize_gripper = True
 
     cfg.inference = ConfigDict()
-    cfg.inference.inference_steps = 100
+    cfg.inference.inference_steps = 10
     cfg.inference.eta = 0.0
 
     cfg.video = ConfigDict()
