@@ -2,7 +2,7 @@
 #SBATCH --job-name=memory_fomaml_shared_i4uve44g
 #SBATCH --output=/home/rvalper/icil-rlbench/hipster/logs/%x.%j.out
 #SBATCH --error=/home/rvalper/icil-rlbench/hipster/logs/%x.%j.err
-#SBATCH --partition=performance
+#SBATCH --partition=capacity
 #SBATCH --gres=gpu:4
 #SBATCH --time=48:00:00
 #SBATCH -n 128
@@ -23,7 +23,7 @@ export PYTHONPATH=/home/rvalper/icil-rlbench
 torchrun --standalone --nproc_per_node=2 \
   icil/fomaml_memory_perceiver_encoder_decoder_ddp.py \
   --config=configs/fomaml_memory_perceiver_encoder_decoder.py \
-  --config.finetune.pretrained_checkpoint=/home/rvalper/icil-rlbench/pretrained_checkpoints/i4uve44g/step_0561000.pt \
+  --config.finetune.pretrained_checkpoint=/home/rvalper/icil-rlbench/pretrained_checkpoints/sohm04l4/step_0314000.pt \
   --config.finetune.strict_load=True \
   --config.train.resume_path='' \
   --config.dataset.K=0 \
@@ -35,8 +35,8 @@ torchrun --standalone --nproc_per_node=2 \
   --config.train.log_every=10 \
   --config.train.ckpt_every=500 \
   --config.maml.first_order=True \
-  --config.maml.inner_steps=4 \
-  --config.maml.inner_lr=1e-2 \
+  --config.maml.inner_steps=5 \
+  --config.maml.inner_lr=2e-1 \
   --config.maml.inner_lr_mode=shared_learned \
   --config.maml.outer_lr=1e-4 \
   --config.maml.max_grad_norm=1.0 \
@@ -47,7 +47,7 @@ torchrun --standalone --nproc_per_node=2 \
   --config.maml.reuse_diffusion_noise=False \
   --config.maml.grad_accum_steps=4 \
   --config.outer.train_encoder=True \
-  --config.outer.train_decoder=False \
+  --config.outer.train_decoder=True \
   --config.outer.train_input_projections=False \
   --config.outer.train_output_head=False \
   --config.outer.train_diffusion_conditioning=False \
