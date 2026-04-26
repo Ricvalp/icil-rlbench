@@ -331,7 +331,7 @@ def get_config():
     cfg.train.grad_clip_norm = 1.0
     cfg.train.use_amp = True
     cfg.train.log_every = 20
-    cfg.train.ckpt_every = 500
+    cfg.train.ckpt_every = 2000
     cfg.train.resume_path = ""
     cfg.train.checkpoint_parent_dir = os.environ.get(
         "ICIL_CHECKPOINT_PARENT_DIR",
