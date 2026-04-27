@@ -4,7 +4,7 @@
 #SBATCH --job-name=memory_fomaml_shared_ddp
 #SBATCH --partition=defq
 #SBATCH --gres=gpu:4
-#SBATCH --mem=128G
+#SBATCH --mem=64G
 #SBATCH --cpus-per-task=16
 #SBATCH --time=00:10:00
 #SBATCH --output=/home/valperga/icil-rlbench/sbatch/das/logs/memory_fomaml_shared_ddp-%j.out
