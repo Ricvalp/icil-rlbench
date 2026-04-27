@@ -6,7 +6,7 @@
 #SBATCH --gres=gpu:4
 #SBATCH --mem=128G
 #SBATCH --cpus-per-task=32
-#SBATCH --time=2-00:00
+#SBATCH --time=00:10:00
 #SBATCH --output=/home/valperga/icil-rlbench/sbatch/das/logs/memory_fomaml_shared_ddp-%j.out
 #SBATCH --error=/home/valperga/icil-rlbench/sbatch/das/logs/memory_fomaml_shared_ddp-%j.err
 
