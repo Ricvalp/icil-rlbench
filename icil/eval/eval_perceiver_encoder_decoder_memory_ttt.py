@@ -33,10 +33,8 @@ from icil.datasets.in_context_imitation_learning.variation_store import (
     build_variation_keys,
 )
 from icil.models import (
-    Policy,
     PolicyBuilderConfig,
     PolicyConfig,
-    build_policy,
 )
 from icil.models.maml.inner_lr import (
     PositiveInnerLRSchedule,
@@ -48,6 +46,16 @@ from icil.models.maml.inner_lr import (
 )
 from icil.models.policies.config_utils import inherit_missing_encoder_attention_backend
 from icil.models.maml import MAMLTaskBuilder
+from icil.models.maml.memory_core import (
+    init_memory_tokens_from_batch as _generic_init_memory_tokens_from_batch,
+    memory_diffusion_loss as _generic_memory_adaptation_loss,
+    sample_actions_with_memory_tokens as _generic_sample_actions_with_memory_tokens,
+)
+from icil.models.maml.train_utils import (
+    build_model as _build_model,
+    build_model_cfg as _shared_build_model_cfg,
+    num_train_timesteps_for_model as _num_train_timesteps_for_model,
+)
 from icil.models.common import sinusoidal_position_embedding, sinusoidal_time_embedding
 
 _CONFIG = config_flags.DEFINE_config_file(
@@ -233,13 +241,12 @@ def _model_config_from_checkpoint_or_default(ckpt: Dict[str, Any]) -> PolicyBuil
     if isinstance(ckpt.get('config', None), dict):
         model_from_ckpt = ckpt['config'].get('model', {}) or {}
 
-    defaults = PolicyBuilderConfig()
     if not isinstance(model_from_ckpt, dict) or not model_from_ckpt:
-        return defaults
-    if 'policy' not in model_from_ckpt:
+        return PolicyBuilderConfig()
+    if 'policy' not in model_from_ckpt and 'direct_regression' not in model_from_ckpt:
         model_from_ckpt = _legacy_flat_model_cfg_to_nested(model_from_ckpt)
     model_from_ckpt = inherit_missing_encoder_attention_backend(model_from_ckpt)
-    return _dataclass_from_dict(defaults, model_from_ckpt)
+    return _shared_build_model_cfg(ConfigDict(model_from_ckpt))
 
 
 
@@ -1000,8 +1007,13 @@ def _memory_optimizer_name(memory_cfg: ConfigDict) -> str:
     return name
 
 
-def _memory_decoder_prefixes(memory_cfg: ConfigDict) -> Tuple[str, ...]:
-    prefixes = getattr(memory_cfg, 'decoder_param_prefixes', ('denoiser.', 'action_in.', 'action_out.', 't_mlp.'))
+def _memory_decoder_prefixes(model: torch.nn.Module, memory_cfg: ConfigDict) -> Tuple[str, ...]:
+    default_prefixes: Tuple[str, ...]
+    if hasattr(model, 'denoiser'):
+        default_prefixes = ('denoiser.', 'action_in.', 'action_out.', 't_mlp.')
+    else:
+        default_prefixes = ('decoder.', 'context_conditioner.', 'action_out.')
+    prefixes = getattr(memory_cfg, 'decoder_param_prefixes', default_prefixes)
     if isinstance(prefixes, str):
         prefixes = tuple(part.strip() for part in prefixes.split(',') if part.strip())
     else:
@@ -1011,14 +1023,20 @@ def _memory_decoder_prefixes(memory_cfg: ConfigDict) -> Tuple[str, ...]:
     return prefixes
 
 
-def _select_memory_decoder_param_names(model: Policy, memory_cfg: ConfigDict) -> List[str]:
+def _select_memory_decoder_param_names(model: torch.nn.Module, memory_cfg: ConfigDict) -> List[str]:
     if not _as_bool(getattr(memory_cfg, 'optimize_decoder', False)):
         return []
-    prefixes = _memory_decoder_prefixes(memory_cfg)
-    selected = sorted(
+    prefixes = _memory_decoder_prefixes(model, memory_cfg)
+    selected = {
         name for name, _ in model.named_parameters()
         if any(name.startswith(prefix) for prefix in prefixes)
-    )
+    }
+    if not hasattr(model, 'denoiser'):
+        selected.update(
+            name for name, _ in model.named_parameters()
+            if name in {'action_queries', 'action_slot_embed'}
+        )
+    selected = sorted(selected)
     if not selected:
         raise RuntimeError(f'No decoder parameters matched prefixes={prefixes}.')
     return selected
@@ -1069,7 +1087,7 @@ def _infer_num_support_demos_from_batch(batch: Dict[str, Any]) -> Optional[int]:
 
 
 def _traj_support_token_count(
-    policy: Policy,
+    policy: torch.nn.Module,
     support_tokens: Optional[torch.Tensor],
     *,
     num_support_demos: Optional[int],
@@ -1091,7 +1109,7 @@ def _traj_support_token_count(
 
 
 def _single_context_from_memory_tokens(
-    policy: Policy,
+    policy: torch.nn.Module,
     *,
     support_tokens: Optional[torch.Tensor],
     support_mask: Optional[torch.Tensor],
@@ -1139,7 +1157,7 @@ def _single_context_from_memory_tokens(
     )
 
 
-def _encode_context_no_grad(policy: Policy, batch: Dict[str, torch.Tensor]) -> Any:
+def _encode_context_no_grad(policy: torch.nn.Module, batch: Dict[str, torch.Tensor]) -> Any:
     with torch.no_grad():
         ctx_out = policy.context_encoder(
             query_xyz=batch['query_xyz'],
@@ -1159,26 +1177,18 @@ def _encode_context_no_grad(policy: Policy, batch: Dict[str, torch.Tensor]) -> A
 
 
 def _init_memory_tokens_from_batch(
-    policy: Policy,
+    policy: torch.nn.Module,
     batch: Dict[str, Any],
     *,
     device: torch.device,
 ) -> Tuple[nn.Parameter, Optional[torch.Tensor]]:
     batch_dev = _to_device_batch(batch, device)
-    ctx = _encode_context_no_grad(policy, batch_dev)
-    if ctx.support_tokens is None:
-        raise RuntimeError('Context encoder did not return support_tokens; memory TTT requires demo support tokens.')
-    support_tokens = ctx.support_tokens.detach().clone()
-    support_mask = _detach_optional_tensor(ctx.support_token_mask)
-    if support_tokens.shape[0] != 1:
-        support_tokens = support_tokens[:1].contiguous()
-        if support_mask is not None:
-            support_mask = support_mask[:1].contiguous()
+    support_tokens, support_mask = _generic_init_memory_tokens_from_batch(policy, batch_dev)
     return nn.Parameter(support_tokens), support_mask
 
 
 def _query_tokens_from_batch(
-    policy: Policy,
+    policy: torch.nn.Module,
     batch: Dict[str, torch.Tensor],
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
     ctx = _encode_context_no_grad(policy, batch)
@@ -1187,14 +1197,14 @@ def _query_tokens_from_batch(
     return ctx.query_tokens.detach(), _detach_optional_tensor(ctx.query_token_mask)
 
 
-def _resolve_batch_timesteps(policy: Policy, batch: Dict[str, torch.Tensor]) -> torch.Tensor:
+def _resolve_batch_timesteps(policy: torch.nn.Module, batch: Dict[str, torch.Tensor]) -> torch.Tensor:
     x0 = batch['target_action']
     B = int(x0.shape[0])
     provided = batch.get('timesteps', None)
     if provided is None:
         return torch.randint(
             low=0,
-            high=int(policy.noise_scheduler.config.num_train_timesteps),
+            high=int(_num_train_timesteps_for_model(policy)),
             size=(B,),
             device=x0.device,
             dtype=torch.long,
@@ -1226,7 +1236,7 @@ def _resolve_batch_noise(batch: Dict[str, torch.Tensor]) -> torch.Tensor:
 
 
 def _diffusion_training_target(
-    policy: Policy,
+    policy: torch.nn.Module,
     *,
     x0: torch.Tensor,
     noise: torch.Tensor,
@@ -1249,7 +1259,7 @@ def _diffusion_training_target(
 
 
 def _predict_model_output_from_tokens(
-    policy: Policy,
+    policy: torch.nn.Module,
     *,
     x_t: torch.Tensor,
     t: torch.Tensor,
@@ -1317,7 +1327,7 @@ def _predict_model_output_from_tokens(
 
 
 def _memory_diffusion_loss(
-    policy: Policy,
+    policy: torch.nn.Module,
     batch: Dict[str, Any],
     *,
     memory_tokens: torch.Tensor,
@@ -1325,27 +1335,16 @@ def _memory_diffusion_loss(
     device: torch.device,
 ) -> torch.Tensor:
     batch_dev = _to_device_batch(batch, device)
-    x0 = batch_dev['target_action']
-    t = _resolve_batch_timesteps(policy, batch_dev)
-    noise = _resolve_batch_noise(batch_dev)
-    x_t = policy.noise_scheduler.add_noise(x0, noise, t)
-    query_tokens, query_mask = _query_tokens_from_batch(policy, batch_dev)
-    model_out = _predict_model_output_from_tokens(
+    return _generic_memory_adaptation_loss(
         policy,
-        x_t=x_t,
-        t=t,
-        query_tokens=query_tokens,
-        query_mask=query_mask,
-        support_tokens=memory_tokens,
-        support_mask=memory_token_mask,
-        num_support_demos=_infer_num_support_demos_from_batch(batch_dev),
+        batch_dev,
+        memory_tokens=memory_tokens,
+        memory_token_mask=memory_token_mask,
     )
-    target = _diffusion_training_target(policy, x0=x0, noise=noise, t=t)
-    return F.mse_loss(model_out, target)
 
 
 def _query_sample_mse_with_memory_tokens(
-    policy: Policy,
+    policy: torch.nn.Module,
     batch: Dict[str, Any],
     *,
     memory_tokens: torch.Tensor,
@@ -1767,7 +1766,7 @@ def _build_cached_memory_ttt_package(
 
 def _apply_memory_ttt_adaptation_in_place(
     *,
-    policy: Policy,
+    policy: torch.nn.Module,
     base_state_dict: Dict[str, torch.Tensor],
     support_package: Dict[str, Any],
     decoder_param_names: Sequence[str],
@@ -2182,7 +2181,7 @@ def _maybe_log_wandb_eval_summary(
 
 @torch.no_grad()
 def _sample_actions_with_memory_tokens(
-    policy: Policy,
+    policy: torch.nn.Module,
     *,
     adapted_support_tokens: torch.Tensor,
     adapted_support_token_mask: Optional[torch.Tensor],
@@ -2215,6 +2214,7 @@ def _sample_actions_with_memory_tokens(
     query_batch: Dict[str, Any] = {
         'query_xyz': query_xyz,
         'query_state': query_state,
+        'target_action': torch.zeros((B, H, A), device=device, dtype=query_xyz.dtype),
     }
     if cond_xyz is not None:
         query_batch['cond_xyz'] = cond_xyz
@@ -2237,48 +2237,14 @@ def _sample_actions_with_memory_tokens(
     if query_valid is not None:
         query_batch['query_valid'] = query_valid
 
-    query_tokens, query_mask = _query_tokens_from_batch(policy, query_batch)
-    support_tokens = adapted_support_tokens.to(device=device, dtype=query_tokens.dtype)
-    support_mask = (
-        adapted_support_token_mask.to(device=device, dtype=torch.bool)
-        if adapted_support_token_mask is not None
-        else None
+    return _generic_sample_actions_with_memory_tokens(
+        policy,
+        query_batch,
+        memory_tokens=adapted_support_tokens,
+        memory_token_mask=adapted_support_token_mask,
+        inference_steps=(int(inference_steps) if inference_steps is not None and int(inference_steps) > 0 else None),
+        eta=float(eta),
     )
-
-    scheduler = policy.noise_scheduler
-    total_T = int(scheduler.config.num_train_timesteps)
-    steps = policy.num_inference_steps if inference_steps is None else int(inference_steps)
-    steps = max(1, min(steps, total_T))
-
-    try:
-        scheduler.set_timesteps(steps, device=device)
-    except TypeError:
-        scheduler.set_timesteps(steps)
-
-    x_t = torch.randn(B, H, A, device=device)
-    step_sig = inspect.signature(scheduler.step).parameters
-    for t_now in scheduler.timesteps:
-        t_int = int(t_now.item() if torch.is_tensor(t_now) else t_now)
-        t_batch = torch.full((B,), t_int, device=device, dtype=torch.long)
-        model_out = _predict_model_output_from_tokens(
-            policy,
-            x_t=x_t,
-            t=t_batch,
-            query_tokens=query_tokens,
-            query_mask=query_mask,
-            support_tokens=support_tokens,
-            support_mask=support_mask,
-            num_support_demos=_infer_num_support_demos_from_batch(query_batch),
-        )
-        step_kwargs: Dict[str, Any] = {}
-        if 'eta' in step_sig:
-            step_kwargs['eta'] = float(eta)
-        step_out = scheduler.step(model_out, t_now, x_t, **step_kwargs)
-        if isinstance(step_out, tuple):
-            x_t = step_out[0]
-        else:
-            x_t = step_out.prev_sample
-    return x_t
 
 
 def _run_eval_episode(
@@ -2286,7 +2252,7 @@ def _run_eval_episode(
     episode_index: int,
     task_env: Any,
     variation: int,
-    model: Policy,
+    model: torch.nn.Module,
     device: torch.device,
     dataset_cfg: ICILConfig,
     support_cond: Optional[Dict[str, Any]],
@@ -2518,7 +2484,7 @@ def evaluate(cfg: ConfigDict) -> None:
     if ignore_demos:
         raise ValueError('Memory TTT eval requires a checkpoint whose model conditions on support demos (ignore_demos=False).')
 
-    model = build_policy(
+    model = _build_model(
         model_cfg,
         state_dim=state_dim,
         action_dim=action_dim,
@@ -2686,7 +2652,7 @@ def evaluate(cfg: ConfigDict) -> None:
                     rng=rng,
                     torch_generator=torch_gen,
                     device=device,
-                    num_train_timesteps=int(model.noise_scheduler.config.num_train_timesteps),
+                    num_train_timesteps=_num_train_timesteps_for_model(model),
                     action_dim=int(action_dim),
                     use_rgb=_as_bool(cfg.conditioning.use_rgb),
                     use_mask_id=use_mask_id,

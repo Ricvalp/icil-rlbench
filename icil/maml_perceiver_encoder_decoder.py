@@ -18,7 +18,6 @@ from torch.utils.data import DataLoader
 
 from icil.action_representation import decode_action_chunk, decode_action_trace
 from icil.datasets.in_context_imitation_learning.icil_datasets import ICILConfig
-from icil.models import build_policy
 from icil.models.maml import (
     ICILMAMLTaskBatchIterable,
     MAMLConfig,
@@ -47,11 +46,13 @@ from icil.models.maml.inner_lr import (
     resolved_inner_lr_values,
 )
 from icil.models.maml.train_utils import (
+    build_model as _build_model,
     build_model_cfg as _build_model_cfg,
     build_optional_store as _build_optional_store,
     build_store as _build_store,
     count_parameters as _count_parameters,
     infer_dims as _infer_dims,
+    num_train_timesteps_for_model as _num_train_timesteps_for_model,
     maybe_init_wandb as _maybe_init_wandb,
     normalize_task_list as _normalize_task_list,
     plot_denoising_trace_3d as _plot_denoising_trace_3d,
@@ -414,7 +415,7 @@ def _sample_adapted_queries_for_tasks(
             task_builder=task_builder,
             cfg=maml_cfg,
             device=device,
-            num_train_timesteps=int(policy.noise_scheduler.config.num_train_timesteps),
+            num_train_timesteps=_num_train_timesteps_for_model(policy),
             action_dim=int(policy.action_dim),
             use_mask_id=use_mask_id,
             rng=np_rng,
@@ -716,7 +717,7 @@ def train(cfg: ConfigDict) -> None:
             else None
         )
 
-        policy = build_policy(
+        policy = _build_model(
             model_cfg,
             state_dim=state_dim,
             action_dim=action_dim,
@@ -980,7 +981,7 @@ def train(cfg: ConfigDict) -> None:
                 task_builder=task_builder,
                 cfg=maml_cfg,
                 device=device,
-                num_train_timesteps=int(policy.noise_scheduler.config.num_train_timesteps),
+                num_train_timesteps=_num_train_timesteps_for_model(policy),
                 action_dim=int(action_dim),
                 use_mask_id=use_mask_id,
                 rng=np_rng,

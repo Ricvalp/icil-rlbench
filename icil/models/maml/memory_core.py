@@ -15,7 +15,14 @@ from icil.models.maml.inner_lr import (
     normalize_inner_lr_mode,
 )
 from icil.models.maml.tasks import MAMLTaskBuilder, MAMLTaskSpec
-from icil.models.policies.policy import Policy
+
+
+def _is_diffusion_policy(model: torch.nn.Module) -> bool:
+    return hasattr(model, 'noise_scheduler') and hasattr(model, 'predict_model_output')
+
+
+def _is_direct_regression_policy(model: torch.nn.Module) -> bool:
+    return hasattr(model, 'decoder') and hasattr(model, 'forward_actions')
 
 
 @dataclass
@@ -347,7 +354,7 @@ def prepare_outer_batch_for_memory_meta_step(
     ]
 
 
-def _encode_context(policy: Policy, batch: Dict[str, torch.Tensor]) -> Any:
+def _encode_context(policy: torch.nn.Module, batch: Dict[str, torch.Tensor]) -> Any:
     ctx_out = policy.context_encoder(
         query_xyz=batch['query_xyz'],
         query_state=batch['query_state'],
@@ -366,7 +373,7 @@ def _encode_context(policy: Policy, batch: Dict[str, torch.Tensor]) -> Any:
 
 
 def init_memory_tokens_from_batch(
-    policy: Policy,
+    policy: torch.nn.Module,
     batch: Dict[str, Any],
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
     ctx = _encode_context(policy, batch)
@@ -384,7 +391,7 @@ def init_memory_tokens_from_batch(
 
 
 def query_tokens_from_batch(
-    policy: Policy,
+    policy: torch.nn.Module,
     batch: Dict[str, torch.Tensor],
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
     ctx = _encode_context(policy, batch)
@@ -394,7 +401,9 @@ def query_tokens_from_batch(
     return ctx.query_tokens, query_mask
 
 
-def _resolve_batch_timesteps(policy: Policy, batch: Dict[str, torch.Tensor]) -> torch.Tensor:
+def _resolve_batch_timesteps(policy: torch.nn.Module, batch: Dict[str, torch.Tensor]) -> torch.Tensor:
+    if not _is_diffusion_policy(policy):
+        raise TypeError('_resolve_batch_timesteps is only valid for diffusion policies.')
     x0 = batch['target_action']
     B = int(x0.shape[0])
     provided = batch.get('timesteps', None)
@@ -433,12 +442,14 @@ def _resolve_batch_noise(batch: Dict[str, torch.Tensor]) -> torch.Tensor:
 
 
 def diffusion_training_target(
-    policy: Policy,
+    policy: torch.nn.Module,
     *,
     x0: torch.Tensor,
     noise: torch.Tensor,
     t: torch.Tensor,
 ) -> torch.Tensor:
+    if not _is_diffusion_policy(policy):
+        raise TypeError('diffusion_training_target is only valid for diffusion policies.')
     pred_type = str(policy.noise_scheduler.config.prediction_type)
     if pred_type == 'epsilon':
         return noise
@@ -482,7 +493,7 @@ def _infer_num_support_demos_from_batch(batch: Dict[str, Any]) -> Optional[int]:
 
 
 def _traj_support_token_count(
-    policy: Policy,
+    policy: torch.nn.Module,
     support_tokens: Optional[torch.Tensor],
     *,
     num_support_demos: Optional[int],
@@ -502,7 +513,7 @@ def _traj_support_token_count(
 
 
 def _single_context_from_memory_tokens(
-    policy: Policy,
+    policy: torch.nn.Module,
     *,
     support_tokens: Optional[torch.Tensor],
     support_mask: Optional[torch.Tensor],
@@ -528,7 +539,7 @@ def _single_context_from_memory_tokens(
 
 
 def predict_model_output_from_tokens(
-    policy: Policy,
+    policy: torch.nn.Module,
     *,
     x_t: torch.Tensor,
     t: torch.Tensor,
@@ -538,6 +549,8 @@ def predict_model_output_from_tokens(
     support_mask: Optional[torch.Tensor],
     num_support_demos: Optional[int] = None,
 ) -> torch.Tensor:
+    if not _is_diffusion_policy(policy):
+        raise TypeError('predict_model_output_from_tokens is only valid for diffusion policies.')
     B, H, _ = x_t.shape
     d = int(policy.cfg.d_model)
 
@@ -594,30 +607,135 @@ def predict_model_output_from_tokens(
     return policy.action_out(h)
 
 
+def predict_direct_actions_from_tokens(
+    policy: torch.nn.Module,
+    *,
+    query_tokens: torch.Tensor,
+    query_mask: Optional[torch.Tensor],
+    support_tokens: Optional[torch.Tensor],
+    support_mask: Optional[torch.Tensor],
+    action_horizon: int,
+    num_support_demos: Optional[int] = None,
+) -> torch.Tensor:
+    if not _is_direct_regression_policy(policy):
+        raise TypeError('predict_direct_actions_from_tokens is only valid for direct-regression policies.')
+    policy._check_action_horizon(int(action_horizon))
+    B = int(query_tokens.shape[0])
+    d = int(policy.cfg.d_model)
+
+    query_tokens = _expand_tokens_for_batch(query_tokens, B)
+    query_mask = _expand_mask_for_batch(
+        query_mask.to(device=query_tokens.device, dtype=torch.bool) if query_mask is not None else None,
+        B,
+    )
+    if support_tokens is not None:
+        support_tokens = _expand_tokens_for_batch(
+            support_tokens.to(device=query_tokens.device, dtype=query_tokens.dtype),
+            B,
+        )
+    support_mask = _expand_mask_for_batch(
+        support_mask.to(device=query_tokens.device, dtype=torch.bool) if support_mask is not None else None,
+        B,
+    )
+
+    tokens = None
+    token_mask = None
+    if str(policy.context_attention_mode) == 'single':
+        tokens, token_mask = _single_context_from_memory_tokens(
+            policy,
+            support_tokens=support_tokens,
+            support_mask=support_mask,
+            query_tokens=query_tokens,
+            query_mask=query_mask,
+            num_support_demos=num_support_demos,
+        )
+        if tokens is None:
+            raise RuntimeError('Memory-token direct decoder received no context tokens.')
+
+    cond_vec = policy.context_conditioner(
+        tokens=tokens,
+        token_mask=token_mask,
+        support_tokens=support_tokens,
+        support_token_mask=support_mask,
+        query_tokens=query_tokens,
+        query_token_mask=query_mask,
+    )
+    h = policy.action_queries.unsqueeze(0).expand(B, -1, -1)
+    h = h + policy.action_slot_embed.unsqueeze(0)
+    use_decoder_ckpt = bool(
+        policy.training and policy.cfg.grad_checkpoint_decoder and torch.is_grad_enabled()
+    )
+
+    if str(policy.context_attention_mode) == 'single':
+        for blk in policy.decoder:
+            h = policy._apply_single_context_block(
+                blk,
+                h,
+                cond_vec,
+                tokens,
+                token_mask,
+                use_checkpoint=use_decoder_ckpt,
+            )
+    else:
+        for blk in policy.decoder:
+            h = policy._apply_two_context_block(
+                blk,
+                h,
+                cond_vec,
+                query_tokens,
+                query_mask,
+                support_tokens,
+                support_mask,
+                use_checkpoint=use_decoder_ckpt,
+            )
+    return policy.action_out(h)
+
+
 def memory_diffusion_loss(
-    policy: Policy,
+    policy: torch.nn.Module,
     batch: Dict[str, Any],
     *,
     memory_tokens: torch.Tensor,
     memory_token_mask: Optional[torch.Tensor],
 ) -> torch.Tensor:
-    x0 = batch['target_action']
-    t = _resolve_batch_timesteps(policy, batch)
-    noise = _resolve_batch_noise(batch)
-    x_t = policy.noise_scheduler.add_noise(x0, noise, t)
     query_tokens, query_mask = query_tokens_from_batch(policy, batch)
-    model_out = predict_model_output_from_tokens(
-        policy,
-        x_t=x_t,
-        t=t,
-        query_tokens=query_tokens,
-        query_mask=query_mask,
-        support_tokens=memory_tokens,
-        support_mask=memory_token_mask,
-        num_support_demos=_infer_num_support_demos_from_batch(batch),
-    )
-    target = diffusion_training_target(policy, x0=x0, noise=noise, t=t)
-    return F.mse_loss(model_out, target)
+    if _is_diffusion_policy(policy):
+        x0 = batch['target_action']
+        t = _resolve_batch_timesteps(policy, batch)
+        noise = _resolve_batch_noise(batch)
+        x_t = policy.noise_scheduler.add_noise(x0, noise, t)
+        model_out = predict_model_output_from_tokens(
+            policy,
+            x_t=x_t,
+            t=t,
+            query_tokens=query_tokens,
+            query_mask=query_mask,
+            support_tokens=memory_tokens,
+            support_mask=memory_token_mask,
+            num_support_demos=_infer_num_support_demos_from_batch(batch),
+        )
+        target = diffusion_training_target(policy, x0=x0, noise=noise, t=t)
+        return F.mse_loss(model_out, target)
+
+    if _is_direct_regression_policy(policy):
+        pred = predict_direct_actions_from_tokens(
+            policy,
+            query_tokens=query_tokens,
+            query_mask=query_mask,
+            support_tokens=memory_tokens,
+            support_mask=memory_token_mask,
+            action_horizon=int(batch['target_action'].shape[1]),
+            num_support_demos=_infer_num_support_demos_from_batch(batch),
+        )
+        target = batch['target_action']
+        loss_type = str(policy.cfg.loss_type).lower()
+        if loss_type == 'mse':
+            return F.mse_loss(pred, target)
+        if loss_type == 'l1':
+            return F.l1_loss(pred, target)
+        raise ValueError(f'Unsupported loss_type={policy.cfg.loss_type!r}.')
+
+    raise TypeError('Unsupported policy type for memory-token MAML loss.')
 
 
 def _grad_global_norm(grads: Sequence[Optional[torch.Tensor]]) -> torch.Tensor:
@@ -674,7 +792,7 @@ def _iter_microbatches(batch: Dict[str, Any], grad_accum_steps: int):
 
 
 def adapt_memory_tokens_for_prepared_task(
-    policy: Policy,
+    policy: torch.nn.Module,
     prepared_task: Dict[str, Any],
     *,
     cfg: MemoryMAMLConfig,
@@ -751,7 +869,7 @@ def adapt_memory_tokens_for_prepared_task(
 
 
 def memory_maml_step_with_stats(
-    policy: Policy,
+    policy: torch.nn.Module,
     prepared_tasks: Sequence[Dict[str, Any]],
     *,
     cfg: MemoryMAMLConfig,
@@ -789,7 +907,7 @@ def memory_maml_step_with_stats(
 
 @torch.no_grad()
 def sample_actions_with_memory_tokens(
-    policy: Policy,
+    policy: torch.nn.Module,
     batch: Dict[str, Any],
     *,
     memory_tokens: torch.Tensor,
@@ -804,6 +922,21 @@ def sample_actions_with_memory_tokens(
     query_tokens, query_mask = query_tokens_from_batch(policy, batch)
     support_tokens = memory_tokens.to(device=x0.device, dtype=query_tokens.dtype)
     support_mask = memory_token_mask.to(device=x0.device, dtype=torch.bool) if memory_token_mask is not None else None
+
+    if _is_direct_regression_policy(policy):
+        del B, A  # kept only for parity with the diffusion branch.
+        return predict_direct_actions_from_tokens(
+            policy,
+            query_tokens=query_tokens,
+            query_mask=query_mask,
+            support_tokens=support_tokens,
+            support_mask=support_mask,
+            action_horizon=int(H),
+            num_support_demos=_infer_num_support_demos_from_batch(batch),
+        )
+
+    if not _is_diffusion_policy(policy):
+        raise TypeError('Unsupported policy type for memory-token action sampling.')
 
     scheduler = policy.noise_scheduler
     total_T = int(scheduler.config.num_train_timesteps)

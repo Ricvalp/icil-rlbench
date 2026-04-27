@@ -31,6 +31,7 @@ from icil.models.policies.policy import Policy, PolicyConfig
 
 @dataclass
 class PolicyBuilderConfig:
+    model_family: str = "diffusion"  # "diffusion" | "direct_regression"
     policy: PolicyConfig = field(default_factory=PolicyConfig)
     direct_regression: DirectRegressionPolicyConfig = field(default_factory=DirectRegressionPolicyConfig)
     encoder_name: str = "perceiver_demo_query"

@@ -1,12 +1,14 @@
 from __future__ import annotations
 
-from typing import Dict
+from typing import Any, Dict
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from icil.models.policies.policy import Policy
+
+def _is_diffusion_policy(model: nn.Module) -> bool:
+    return hasattr(model, "noise_scheduler") and hasattr(model, "predict_model_output")
 
 
 def _resolve_timesteps(
@@ -59,9 +61,24 @@ def _resolve_noise(batch: Dict[str, torch.Tensor]) -> torch.Tensor:
 
 
 def compute_policy_loss(
-    policy: Policy,
+    policy: nn.Module,
     batch: Dict[str, torch.Tensor],
 ) -> Dict[str, torch.Tensor]:
+    if not _is_diffusion_policy(policy):
+        out = policy.forward_loss(batch)
+        if not isinstance(out, dict) or "loss" not in out:
+            raise TypeError(
+                "Non-diffusion policy.forward_loss(batch) must return a dict containing 'loss'."
+            )
+        loss = out["loss"]
+        if not torch.is_tensor(loss):
+            raise TypeError("policy.forward_loss(batch)['loss'] must be a tensor.")
+        result = dict(out)
+        result["loss"] = loss
+        if "mse" not in result:
+            result["mse"] = F.mse_loss(result.get("pred_action", batch["target_action"]), batch["target_action"]).detach()
+        return result
+
     x0 = batch["target_action"]
     t = _resolve_timesteps(
         batch=batch,
@@ -113,7 +130,7 @@ def compute_policy_loss(
 
 
 class PolicyLossWrapper(nn.Module):
-    def __init__(self, policy: Policy):
+    def __init__(self, policy: nn.Module):
         super().__init__()
         self.policy = policy
 

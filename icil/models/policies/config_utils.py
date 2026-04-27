@@ -343,6 +343,7 @@ def build_policy_builder_config_from_configdict(
     )
 
     return PolicyBuilderConfig(
+        model_family="diffusion",
         policy=policy_cfg,
         encoder_name=str(cfg.encoder_name),
         conv3d_demo_query=conv3d_cfg,
@@ -413,5 +414,6 @@ def build_direct_regression_builder_config_from_configdict(
         traj_supernode_perceiver_v2=_get(cfg, "traj_supernode_perceiver_v2", _none_config()),
     )
     builder_cfg = build_policy_builder_config_from_configdict(shadow_cfg, as_bool=as_bool)
+    builder_cfg.model_family = "direct_regression"
     builder_cfg.direct_regression = direct_cfg
     return builder_cfg

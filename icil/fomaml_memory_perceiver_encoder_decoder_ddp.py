@@ -16,7 +16,6 @@ from ml_collections.config_flags import config_flags
 from torch.utils.data import DataLoader
 
 import icil.models.maml.memory_train as memory_train_lib
-from icil.models import build_policy
 from icil.models.maml.diagnostics import (
     memory_inner_loop_query_curves,
     plot_scalar_curve,
@@ -233,7 +232,7 @@ def train(cfg: ConfigDict) -> None:
             else None
         )
 
-        policy = build_policy(model_cfg, state_dim=state_dim, action_dim=action_dim).to(device)
+        policy = memory_train_lib._build_model(model_cfg, state_dim=state_dim, action_dim=action_dim).to(device)
         if resume_state_dict is not None:
             policy.load_state_dict(resume_state_dict, strict=True)
             logging.info('Resumed model weights from %s', resume_path)
@@ -458,7 +457,7 @@ def train(cfg: ConfigDict) -> None:
                 task_builder=task_builder,
                 cfg=memory_cfg,
                 device=device,
-                num_train_timesteps=int(policy.noise_scheduler.config.num_train_timesteps),
+                num_train_timesteps=memory_train_lib._num_train_timesteps_for_model(policy),
                 action_dim=int(action_dim),
                 use_mask_id=use_mask_id,
                 rng=np_rng,

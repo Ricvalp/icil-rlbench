@@ -32,10 +32,8 @@ from icil.datasets.in_context_imitation_learning.variation_store import (
     build_variation_keys,
 )
 from icil.models import (
-    Policy,
     PolicyBuilderConfig,
     PolicyConfig,
-    build_policy,
 )
 from icil.models.policies.config_utils import inherit_missing_encoder_attention_backend
 from icil.models.maml import (
@@ -52,6 +50,11 @@ from icil.models.maml.inner_lr import (
     infer_inner_lr_mode,
     inner_lr_tensor_for_step,
     resolved_inner_lr_values,
+)
+from icil.models.maml.train_utils import (
+    build_model as _build_model,
+    build_model_cfg as _shared_build_model_cfg,
+    num_train_timesteps_for_model as _num_train_timesteps_for_model,
 )
 
 _CONFIG = config_flags.DEFINE_config_file(
@@ -237,13 +240,12 @@ def _model_config_from_checkpoint_or_default(ckpt: Dict[str, Any]) -> PolicyBuil
     if isinstance(ckpt.get('config', None), dict):
         model_from_ckpt = ckpt['config'].get('model', {}) or {}
 
-    defaults = PolicyBuilderConfig()
     if not isinstance(model_from_ckpt, dict) or not model_from_ckpt:
-        return defaults
-    if 'policy' not in model_from_ckpt:
+        return PolicyBuilderConfig()
+    if 'policy' not in model_from_ckpt and 'direct_regression' not in model_from_ckpt:
         model_from_ckpt = _legacy_flat_model_cfg_to_nested(model_from_ckpt)
     model_from_ckpt = inherit_missing_encoder_attention_backend(model_from_ckpt)
-    return _dataclass_from_dict(defaults, model_from_ckpt)
+    return _shared_build_model_cfg(ConfigDict(model_from_ckpt))
 
 
 
@@ -867,7 +869,7 @@ def _build_rlbench_env(cfg: ConfigDict, task_name: str):
 
 
 def _resolve_maml_fast_param_names(
-    model: Policy,
+    model: torch.nn.Module,
     ckpt: Dict[str, Any],
     maml_cfg: MAMLConfig,
 ) -> List[str]:
@@ -903,7 +905,7 @@ def _resolve_maml_fast_param_names(
 
 
 
-def _count_params_by_name(model: Policy, names: Sequence[str]) -> int:
+def _count_params_by_name(model: torch.nn.Module, names: Sequence[str]) -> int:
     name_set = set(names)
     return sum(int(param.numel()) for name, param in model.named_parameters() if name in name_set)
 
@@ -1128,7 +1130,7 @@ def _build_query_batch_at_t0s(
 
 @torch.no_grad()
 def _sample_actions_from_batch(
-    policy: Policy,
+    policy: torch.nn.Module,
     batch: Dict[str, Any],
     *,
     use_mask_id: bool,
@@ -1161,7 +1163,7 @@ def _sample_actions_from_batch(
 
 
 def _query_sample_mse_from_batch(
-    policy: Policy,
+    policy: torch.nn.Module,
     batch: Dict[str, Any],
     *,
     use_mask_id: bool,
@@ -1551,7 +1553,7 @@ def _adapt_fast_params_with_stats(
 
 def _apply_maml_adaptation_in_place(
     *,
-    policy: Policy,
+    policy: torch.nn.Module,
     base_state_dict: Dict[str, torch.Tensor],
     support_package: Dict[str, Any],
     fast_names: Sequence[str],
@@ -1785,7 +1787,7 @@ def _run_eval_episode(
     episode_index: int,
     task_env: Any,
     variation: int,
-    model: Policy,
+    model: torch.nn.Module,
     device: torch.device,
     dataset_cfg: ICILConfig,
     support_cond: Optional[Dict[str, Any]],
@@ -2009,7 +2011,7 @@ def evaluate(cfg: ConfigDict) -> None:
             'MAML eval requires a checkpoint whose model conditions on support demos (ignore_demos=False).'
         )
 
-    model = build_policy(
+    model = _build_model(
         model_cfg,
         state_dim=state_dim,
         action_dim=action_dim,
@@ -2190,7 +2192,7 @@ def evaluate(cfg: ConfigDict) -> None:
                     rng=rng,
                     torch_generator=torch_gen,
                     device=device,
-                    num_train_timesteps=int(model.noise_scheduler.config.num_train_timesteps),
+                    num_train_timesteps=_num_train_timesteps_for_model(model),
                     action_dim=int(action_dim),
                     use_rgb=_as_bool(cfg.conditioning.use_rgb),
                     use_mask_id=use_mask_id,

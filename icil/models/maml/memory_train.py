@@ -16,7 +16,6 @@ from torch.utils.data import DataLoader
 
 from icil.action_representation import decode_action_chunk
 from icil.datasets.in_context_imitation_learning.icil_datasets import ICILConfig
-from icil.models import build_policy
 from icil.models.maml.diagnostics import (
     memory_inner_loop_query_curves,
     plot_scalar_curve,
@@ -39,11 +38,13 @@ from icil.models.maml.memory_core import (
 from icil.models.maml.params import count_params_by_name, get_outer_param_names, set_outer_trainable_params
 from icil.models.maml.tasks import ICILMAMLTaskBatchIterable, MAMLTaskBuilder, MAMLTaskSpec
 from icil.models.maml.train_utils import (
+    build_model as _build_model,
     build_model_cfg as _build_model_cfg,
     build_optional_store as _build_optional_store,
     build_store as _build_store,
     count_parameters as _count_parameters,
     infer_dims as _infer_dims,
+    num_train_timesteps_for_model as _num_train_timesteps_for_model,
     maybe_init_wandb as _maybe_init_wandb,
     normalize_task_list as _normalize_task_list,
     plot_pred_vs_gt_3d as _plot_pred_vs_gt_3d,
@@ -392,7 +393,7 @@ def _sample_adapted_queries_for_tasks(
                 task_builder=task_builder,
                 cfg=memory_cfg,
                 device=device,
-                num_train_timesteps=int(policy.noise_scheduler.config.num_train_timesteps),
+                num_train_timesteps=_num_train_timesteps_for_model(policy),
                 action_dim=int(policy.action_dim),
                 use_mask_id=use_mask_id,
                 rng=np_rng,
@@ -636,7 +637,7 @@ def train_memory_maml(cfg: ConfigDict) -> None:
             else None
         )
 
-        policy = build_policy(model_cfg, state_dim=state_dim, action_dim=action_dim).to(device)
+        policy = _build_model(model_cfg, state_dim=state_dim, action_dim=action_dim).to(device)
         if resume_state_dict is not None:
             policy.load_state_dict(resume_state_dict, strict=True)
             logging.info('Resumed model weights from %s', resume_path)
@@ -847,7 +848,7 @@ def train_memory_maml(cfg: ConfigDict) -> None:
                 task_builder=task_builder,
                 cfg=memory_cfg,
                 device=device,
-                num_train_timesteps=int(policy.noise_scheduler.config.num_train_timesteps),
+                num_train_timesteps=_num_train_timesteps_for_model(policy),
                 action_dim=int(action_dim),
                 use_mask_id=use_mask_id,
                 rng=np_rng,

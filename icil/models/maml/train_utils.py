@@ -12,8 +12,17 @@ from icil.datasets.in_context_imitation_learning.variation_store import (
     VariationStore,
     build_variation_keys,
 )
-from icil.models import PolicyBuilderConfig
-from icil.models.policies.config_utils import build_policy_builder_config_from_configdict
+from icil.models import (
+    DirectRegressionPolicy,
+    Policy,
+    PolicyBuilderConfig,
+    build_direct_regression_policy,
+    build_policy,
+)
+from icil.models.policies.config_utils import (
+    build_direct_regression_builder_config_from_configdict,
+    build_policy_builder_config_from_configdict,
+)
 
 
 
@@ -142,7 +151,47 @@ def infer_dims(store: VariationStore) -> Tuple[int, int]:
 
 
 def build_model_cfg(cfg: ConfigDict) -> PolicyBuilderConfig:
+    if is_direct_regression_model_cfg(cfg):
+        return build_direct_regression_builder_config_from_configdict(cfg, as_bool=as_bool)
     return build_policy_builder_config_from_configdict(cfg, as_bool=as_bool)
+
+
+def is_direct_regression_model_cfg(cfg: Any) -> bool:
+    if cfg is None:
+        return False
+    model_family = getattr(cfg, 'model_family', None)
+    if model_family is not None:
+        return str(model_family) == 'direct_regression'
+    return hasattr(cfg, 'direct_regression')
+
+
+def is_direct_regression_builder_cfg(cfg: PolicyBuilderConfig) -> bool:
+    return str(getattr(cfg, 'model_family', 'diffusion')) == 'direct_regression'
+
+
+def build_model(
+    cfg: PolicyBuilderConfig,
+    *,
+    state_dim: int,
+    action_dim: int,
+) -> Policy | DirectRegressionPolicy:
+    if is_direct_regression_builder_cfg(cfg):
+        return build_direct_regression_policy(cfg, state_dim=state_dim, action_dim=action_dim)
+    return build_policy(cfg, state_dim=state_dim, action_dim=action_dim)
+
+
+def model_family_label(model: torch.nn.Module) -> str:
+    if hasattr(model, 'noise_scheduler'):
+        return 'diffusion'
+    if hasattr(model, 'forward_actions') and hasattr(model, 'decoder'):
+        return 'direct_regression'
+    return 'unknown'
+
+
+def num_train_timesteps_for_model(model: torch.nn.Module) -> int:
+    if hasattr(model, 'noise_scheduler'):
+        return int(model.noise_scheduler.config.num_train_timesteps)
+    return 1
 
 
 def resolve_use_mask_id(model_cfg: ConfigDict) -> bool:
