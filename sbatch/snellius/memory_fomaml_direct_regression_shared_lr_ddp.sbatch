@@ -15,8 +15,10 @@ if [ ! -f "${PRETRAINED_CHECKPOINT}" ]; then
   exit 1
 fi
 
+set +u
 source ~/miniforge3/bin/activate
 conda activate icil-rlbench
+set -u
 
 cd /gpfs/home1/rvalperga/icil-rlbench
 
