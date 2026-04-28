@@ -40,7 +40,7 @@ def get_config():
     cfg.conditioning.use_rgb = True
     # Fallback for checkpoints that do not store mask-id usage in model config.
     cfg.conditioning.use_mask_id = False
-    cfg.conditioning.num_points = 4096
+    cfg.conditioning.num_points = 1024
 
     cfg.sim = ConfigDict()
     cfg.sim.headless = True
