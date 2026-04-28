@@ -32,6 +32,7 @@ from icil.models.maml import (
     count_params_by_name,
     get_fast_param_names,
     get_outer_param_names,
+    maml_step_with_stats,
     prefix_param_names,
     set_outer_trainable_params,
 )
@@ -64,7 +65,7 @@ from icil.models.maml.train_utils import (
 
 _CONFIG = config_flags.DEFINE_config_file(
     'config',
-    default='configs/fomaml_perceiver_encoder_decoder.py',
+    default='configs/maml_perceiver_encoder_decoder.py',
     help_string='Path to a ml_collections config file.',
 )
 
@@ -1099,7 +1100,7 @@ def train(cfg: ConfigDict) -> None:
             f'{n_inner_lr:,}',
         )
         logging.info(
-            'Resolved FOMAML setup: model_source=%s | data.K=%d | outer_context_size=%d | '
+            'Resolved MAML DDP setup: model_source=%s | data.K=%d | outer_context_size=%d | '
             'fast_param_tensors=%d | outer_param_tensors=%d | outer_param_count=%s | encoder_trainable=%s | '
             'inner_lr_mode=%s | inner_lrs=%s',
             model_cfg_source,
@@ -1130,9 +1131,9 @@ def train(cfg: ConfigDict) -> None:
         config_payload['dataset']['stride'] = int(dataset_cfg.stride)
         config_payload['data']['tasks'] = list(tasks)
         config_payload['data']['exclude_tasks'] = list(exclude_tasks)
-        config_payload['algorithm'] = 'fomaml'
+        config_payload['algorithm'] = 'maml_ddp'
         config_payload['maml']['outer_context_size'] = int(resolved_outer_context_size)
-        config_payload['maml']['first_order'] = True
+        config_payload['maml']['first_order'] = False
         config_payload['maml']['inner_lr_mode'] = str(maml_cfg.inner_lr_mode)
         config_payload['runtime'] = {
             'run_id': run_id,
@@ -1238,13 +1239,15 @@ def train(cfg: ConfigDict) -> None:
             )
 
             optimizer.zero_grad(set_to_none=True)
-            loss_value_local, avg_inner_fast_grad_norm_local = fomaml_backward_with_stats(
+            meta_loss, avg_inner_fast_grad_norm_local = maml_step_with_stats(
                 loss_wrapper,
                 prepared_tasks,
                 fast_names=fast_names_wrapped,
                 cfg=maml_cfg,
                 inner_lr_schedule=inner_lr_schedule,
             )
+            meta_loss.backward()
+            loss_value_local = float(meta_loss.detach().cpu())
             _all_reduce_outer_grads(outer_params + inner_lr_params, device)
             loss_value = _distributed_mean(loss_value_local, device)
             avg_inner_fast_grad_norm = _distributed_mean(avg_inner_fast_grad_norm_local, device)
