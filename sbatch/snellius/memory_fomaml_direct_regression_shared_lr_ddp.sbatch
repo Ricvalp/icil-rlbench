@@ -3,12 +3,12 @@
 #SBATCH --output=/gpfs/home1/rvalperga/icil-rlbench/.smanager/scripts/icil.fomaml_memory_perceiver_encoder_decoder_ddp/logs/memory_fomaml_direct_shared.%j.out
 #SBATCH --error=/gpfs/home1/rvalperga/icil-rlbench/.smanager/scripts/icil.fomaml_memory_perceiver_encoder_decoder_ddp/logs/memory_fomaml_direct_shared.%j.err
 #SBATCH --partition=gpu_h100
-#SBATCH --gres=gpu:4
-#SBATCH --time=72:00:00
+#SBATCH --gres=gpu:2
+#SBATCH --time=00:10:00
 
 set -euo pipefail
 
-PRETRAINED_CHECKPOINT="/gpfs/home1/rvalperga/icil-rlbench/REPLACE_WITH_PRETRAINED_CHECKPOINT.pt"
+PRETRAINED_CHECKPOINT="/projects/prjs1905/robotics/rlbench/icil_runs/checkpoints/vb51tt3o/step_0444000.pt"
 
 if [ ! -f "${PRETRAINED_CHECKPOINT}" ]; then
   echo "PRETRAINED_CHECKPOINT does not exist: ${PRETRAINED_CHECKPOINT}" >&2
@@ -57,9 +57,9 @@ torchrun --standalone --nproc_per_node=4 \
   --config.maml.reuse_diffusion_noise=False \
   --config.maml.grad_accum_steps=4 \
   --config.outer.train_encoder=True \
-  --config.outer.train_decoder=False \
+  --config.outer.train_decoder=True \
   --config.outer.train_input_projections=False \
-  --config.outer.train_output_head=False \
+  --config.outer.train_output_head=True \
   --config.outer.train_diffusion_conditioning=False \
   --config.wandb.enable=True \
   --config.wandb.n_loss_steps=1
