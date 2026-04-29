@@ -376,6 +376,14 @@ def init_memory_tokens_from_batch(
     policy: torch.nn.Module,
     batch: Dict[str, Any],
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+    if hasattr(policy, 'init_learned_memory_tokens'):
+        tokens, mask = policy.init_learned_memory_tokens(
+            batch_size=1,
+            device=batch['query_xyz'].device,
+            dtype=batch['query_xyz'].dtype,
+            clone=True,
+        )
+        return tokens, mask
     ctx = _encode_context(policy, batch)
     if ctx.support_tokens is None:
         raise RuntimeError('Context encoder did not return support_tokens; memory-token MAML requires split support tokens.')

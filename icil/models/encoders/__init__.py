@@ -32,6 +32,14 @@ from icil.models.encoders.traj_conv3d import (
     TrajConv3DConfig,
     TrajectoryConv3DEncoder,
 )
+from icil.models.encoders.simple_query_point_encoder import (
+    SimpleQueryPointEncoder,
+    SimpleQueryPointEncoderConfig,
+)
+from icil.models.encoders.dp3_query_frame_encoder import (
+    DP3QueryFrameEncoder,
+    DP3QueryFrameEncoderConfig,
+)
 
 __all__ = [
     "ContextEncoder",
@@ -53,4 +61,8 @@ __all__ = [
     "TrajectoryPerceiverEncoderV2",
     "TrajectorySupernodePerceiverEncoderV2",
     "TrajectoryOnlyPerceiverEncoder",
+    "SimpleQueryPointEncoder",
+    "SimpleQueryPointEncoderConfig",
+    "DP3QueryFrameEncoder",
+    "DP3QueryFrameEncoderConfig",
 ]
