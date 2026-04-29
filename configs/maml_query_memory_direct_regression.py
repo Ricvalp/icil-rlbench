@@ -90,6 +90,8 @@ def get_config():
     cfg.train.log_every = 10
     cfg.train.ckpt_every = 500
     cfg.train.resume_path = ''
+    cfg.train.use_amp = False
+    cfg.train.amp_dtype = 'bf16'
     cfg.train.checkpoint_parent_dir = os.environ.get(
         'ICIL_CHECKPOINT_PARENT_DIR',
         os.path.join(
