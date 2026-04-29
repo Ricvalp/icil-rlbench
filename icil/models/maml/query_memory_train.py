@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import time
+from contextlib import nullcontext
 from dataclasses import asdict, replace
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
@@ -25,6 +26,7 @@ from icil.models import (
 )
 from icil.models.maml.memory_core import memory_maml_step_with_stats
 from icil.models.maml.query_memory_tasks import (
+    PreparedQueryMemoryTaskBatchIterable,
     QueryMemoryTaskBatchIterable,
     QueryMemoryTaskBuilder,
     prepare_query_memory_task_for_meta_step,
@@ -197,6 +199,18 @@ def _build_model(
     action_dim: int,
 ):
     return build_query_memory_direct_regression_policy(cfg, state_dim=state_dim, action_dim=action_dim)
+
+
+def _nested_to_device(value: Any, device: torch.device) -> Any:
+    if torch.is_tensor(value):
+        return value.to(device, non_blocking=True)
+    if isinstance(value, dict):
+        return {key: _nested_to_device(item, device) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_nested_to_device(item, device) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_nested_to_device(item, device) for item in value)
+    return value
 
 
 def _plot_pred_vs_gt_3d(
@@ -443,14 +457,37 @@ def train(cfg: ConfigDict) -> None:
         if distributed:
             dist.barrier()
 
+        use_mask_id = _resolve_use_mask_id(model_cfg)
+        use_rgb = _resolve_use_rgb(model_cfg)
+        memory_cfg = memory_train_lib._build_memory_cfg(cfg)
+        resolved_inner_lr_mode = memory_train_lib._resolve_inner_lr_mode(
+            cfg,
+            resume_checkpoint=resume_checkpoint,
+            pretrained_checkpoint=None,
+            resume_config=resume_config,
+            pretrained_config=None,
+        )
+        memory_cfg.inner_lr_mode = str(resolved_inner_lr_mode)
+        inner_lr_schedule = memory_train_lib._build_inner_lr_schedule_wrapper(memory_cfg)
+        if inner_lr_schedule is not None:
+            inner_lr_schedule = inner_lr_schedule.to(device)
+        memory_train_lib._load_inner_lr_schedule_state(
+            inner_lr_schedule,
+            checkpoint=resume_checkpoint,
+            checkpoint_path=resume_path,
+        )
+
         state_dim, action_dim = _infer_dims(store)
-        task_dataset = QueryMemoryTaskBatchIterable(
+        task_dataset = PreparedQueryMemoryTaskBatchIterable(
             store=store,
             cfg=dataset_cfg,
+            memory_cfg=memory_cfg,
             task_batch_size_B=int(cfg.train.batch_size),
             num_batches=int(cfg.train.num_steps),
             seed=data_seed,
             num_tries_per_item=int(cfg.dataset.num_tries_per_item),
+            use_mask_id=use_mask_id,
+            load_rgb=use_rgb,
         )
         num_workers = int(cfg.data.num_workers)
         pin_memory = memory_train_lib._as_bool(cfg.data.pin_memory) and device.type == 'cuda'
@@ -474,26 +511,6 @@ def train(cfg: ConfigDict) -> None:
         if resume_state_dict is not None:
             policy.load_state_dict(resume_state_dict, strict=True)
             logging.info('Resumed model weights from %s', resume_path)
-
-        use_mask_id = _resolve_use_mask_id(model_cfg)
-        use_rgb = _resolve_use_rgb(model_cfg)
-        memory_cfg = memory_train_lib._build_memory_cfg(cfg)
-        resolved_inner_lr_mode = memory_train_lib._resolve_inner_lr_mode(
-            cfg,
-            resume_checkpoint=resume_checkpoint,
-            pretrained_checkpoint=None,
-            resume_config=resume_config,
-            pretrained_config=None,
-        )
-        memory_cfg.inner_lr_mode = str(resolved_inner_lr_mode)
-        inner_lr_schedule = memory_train_lib._build_inner_lr_schedule_wrapper(memory_cfg)
-        if inner_lr_schedule is not None:
-            inner_lr_schedule = inner_lr_schedule.to(device)
-        memory_train_lib._load_inner_lr_schedule_state(
-            inner_lr_schedule,
-            checkpoint=resume_checkpoint,
-            checkpoint_path=resume_path,
-        )
 
         outer_params = list(policy.parameters())
         inner_lr_params = list(inner_lr_schedule.parameters()) if inner_lr_schedule is not None else []
@@ -615,6 +632,14 @@ def train(cfg: ConfigDict) -> None:
             if wandb_run is not None
             else 2048
         )
+        use_amp = memory_train_lib._as_bool(getattr(cfg.train, 'use_amp', False)) and device.type == 'cuda'
+        amp_dtype_name = str(getattr(cfg.train, 'amp_dtype', 'bf16')).lower()
+        if amp_dtype_name not in ('bf16', 'bfloat16'):
+            raise ValueError(
+                f"Unsupported train.amp_dtype={amp_dtype_name!r} for query-memory training. "
+                "Only 'bf16' is supported currently."
+            )
+        amp_dtype = torch.bfloat16
 
         policy.train()
         log_loss = 0.0
@@ -625,29 +650,26 @@ def train(cfg: ConfigDict) -> None:
         wb_count = 0
         window_start = time.time()
 
-        for tasks_batch in task_loader:
+        for prepared_tasks_cpu in task_loader:
             if global_step >= int(cfg.train.num_steps):
                 break
 
-            np_rng = np.random.default_rng(data_seed + 1_000_003 + global_step)
-            prepared_tasks = prepare_outer_batch_for_query_memory_meta_step(
-                tasks_batch,
-                task_builder=task_builder,
-                cfg=memory_cfg,
-                device=device,
-                use_mask_id=use_mask_id,
-                rng=np_rng,
-                load_rgb=use_rgb,
-            )
+            prepared_tasks = _nested_to_device(prepared_tasks_cpu, device)
 
             optimizer.zero_grad(set_to_none=True)
-            meta_loss, avg_inner_memory_grad_norm_local, avg_inner_loss_local = memory_maml_step_with_stats(
-                policy,
-                prepared_tasks,
-                cfg=memory_cfg,
-                first_order=first_order,
-                inner_lr_schedule=inner_lr_schedule,
+            amp_ctx = (
+                torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=use_amp)
+                if use_amp
+                else nullcontext()
             )
+            with amp_ctx:
+                meta_loss, avg_inner_memory_grad_norm_local, avg_inner_loss_local = memory_maml_step_with_stats(
+                    policy,
+                    prepared_tasks,
+                    cfg=memory_cfg,
+                    first_order=first_order,
+                    inner_lr_schedule=inner_lr_schedule,
+                )
             meta_loss.backward()
             _all_reduce_grads(outer_params + inner_lr_params, device)
             loss_value = _distributed_mean(float(meta_loss.detach().cpu()), device)

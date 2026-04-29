@@ -24,5 +24,7 @@ def get_config():
         ),
     )
     cfg.maml.first_order = True
+    cfg.train.use_amp = True
+    cfg.train.amp_dtype = 'bf16'
     cfg.wandb.project = os.environ.get('WANDB_PROJECT', 'icil-query-memory-direct-fomaml')
     return cfg

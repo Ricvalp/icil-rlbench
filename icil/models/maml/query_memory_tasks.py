@@ -76,6 +76,92 @@ class QueryMemoryTaskBatchIterable(ICILSamplerCore, IterableDataset):
             yield tasks
 
 
+class PreparedQueryMemoryTaskBatchIterable(ICILSamplerCore, IterableDataset):
+    def __init__(
+        self,
+        store,
+        *,
+        cfg: ICILConfig,
+        memory_cfg: MemoryMAMLConfig,
+        task_batch_size_B: int,
+        num_batches: int = 100_000,
+        seed: int = 0,
+        num_tries_per_item: int = 50,
+        use_mask_id: bool = True,
+        load_rgb: bool = True,
+    ):
+        if int(cfg.K) < 1:
+            raise ValueError('Query-memory MAML requires cfg.K >= 1 support episodes.')
+        IterableDataset.__init__(self)
+        ICILSamplerCore.__init__(
+            self,
+            store,
+            cfg=cfg,
+            seed=seed,
+            num_tries_per_item=num_tries_per_item,
+        )
+        self.memory_cfg = memory_cfg
+        self.B = int(task_batch_size_B)
+        self.num_batches = int(num_batches)
+        self.use_mask_id = bool(use_mask_id)
+        self.load_rgb = bool(load_rgb)
+        if self.B < 1:
+            raise ValueError('task_batch_size_B must be >= 1.')
+        if self.num_batches < 1:
+            raise ValueError('num_batches must be >= 1.')
+
+    def _build_task_spec(self, rng: np.random.Generator) -> Optional[MAMLTaskSpec]:
+        vidx = self._sample_vidx(rng)
+        if vidx is None:
+            return None
+        episode_ids = self.store.list_episode_ids(vidx)
+        if episode_ids.shape[0] < self.cfg.K + 1:
+            return None
+        chosen = rng.choice(episode_ids, size=self.cfg.K + 1, replace=False).astype(np.int64)
+        return MAMLTaskSpec(
+            vidx=int(vidx),
+            support_episode_ids=tuple(int(ep_id) for ep_id in chosen[: self.cfg.K]),
+            query_episode_id=int(chosen[self.cfg.K]),
+        )
+
+    def __iter__(self):
+        self._iter_counter += 1
+        rng = self._rng()
+        start, end = self._worker_batch_range(self.num_batches)
+        target_batches = max(0, end - start)
+        task_builder = QueryMemoryTaskBuilder(
+            self.store,
+            cfg=self.cfg,
+            seed=self.seed,
+            num_tries_per_item=self.num_tries_per_item,
+        )
+        cpu_device = torch.device('cpu')
+
+        for batch_idx in range(target_batches):
+            tasks: List[MAMLTaskSpec] = []
+            tries = 0
+            while len(tasks) < self.B and tries < self.num_tries_per_item * self.B:
+                task = self._build_task_spec(rng)
+                tries += 1
+                if task is None:
+                    continue
+                tasks.append(task)
+            if len(tasks) < self.B:
+                raise RuntimeError(
+                    f'Could not assemble a full prepared query-memory task batch (worker_batch_idx={batch_idx}, '
+                    f'need={self.B}, got={len(tasks)}).'
+                )
+            yield prepare_outer_batch_for_query_memory_meta_step(
+                tasks,
+                task_builder=task_builder,
+                cfg=self.memory_cfg,
+                device=cpu_device,
+                use_mask_id=self.use_mask_id,
+                rng=rng,
+                load_rgb=self.load_rgb,
+            )
+
+
 class QueryMemoryTaskBuilder(ICILSamplerCore):
     def __init__(
         self,
