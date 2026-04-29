@@ -965,6 +965,7 @@ def train(cfg: ConfigDict) -> None:
         log_count = 0
         wb_loss_sum = 0.0
         wb_inner_fast_grad_norm_sum = 0.0
+        wb_inner_loss_sum = 0.0
         wb_count = 0
         window_start = time.time()
 
@@ -989,7 +990,7 @@ def train(cfg: ConfigDict) -> None:
             )
 
             optimizer.zero_grad(set_to_none=True)
-            meta_loss, avg_inner_fast_grad_norm = maml_step_with_stats(
+            meta_loss, avg_inner_fast_grad_norm, avg_inner_loss = maml_step_with_stats(
                 loss_wrapper,
                 prepared_tasks,
                 fast_names=fast_names_wrapped,
@@ -1008,6 +1009,7 @@ def train(cfg: ConfigDict) -> None:
             log_count += 1
             wb_loss_sum += loss_value
             wb_inner_fast_grad_norm_sum += float(avg_inner_fast_grad_norm)
+            wb_inner_loss_sum += float(avg_inner_loss)
             wb_count += 1
 
             if log_every > 0 and (global_step % log_every == 0 or global_step == 1):
@@ -1015,10 +1017,11 @@ def train(cfg: ConfigDict) -> None:
                 steps_per_sec = log_count / elapsed
                 avg_loss = log_loss / max(1, log_count)
                 logging.info(
-                    'step %d/%d | meta_loss %.6f | outer_lr %.3e | inner_lr_mean %.3e | %.2f step/s',
+                    'step %d/%d | meta_loss %.6f | inner_loss %.6f | outer_lr %.3e | inner_lr_mean %.3e | %.2f step/s',
                     global_step,
                     int(cfg.train.num_steps),
                     avg_loss,
+                    float(avg_inner_loss),
                     float(optimizer.param_groups[0]['lr']),
                     _inner_lr_log_dict(schedule=inner_lr_schedule, cfg=maml_cfg).get('train/inner_lr_mean', float(maml_cfg.inner_lr)),
                     steps_per_sec,
@@ -1033,6 +1036,7 @@ def train(cfg: ConfigDict) -> None:
                         'train/meta_loss': wb_loss_sum / max(1, wb_count),
                         'train/outer_loss': wb_loss_sum / max(1, wb_count),
                         'train/inner_fast_grad_norm': wb_inner_fast_grad_norm_sum / max(1, wb_count),
+                        'train/inner_support_loss': wb_inner_loss_sum / max(1, wb_count),
                         'train/lr': float(optimizer.param_groups[0]['lr']),
                         'train/step': global_step,
                         **_inner_lr_log_dict(schedule=inner_lr_schedule, cfg=maml_cfg),
@@ -1041,6 +1045,7 @@ def train(cfg: ConfigDict) -> None:
                 )
                 wb_loss_sum = 0.0
                 wb_inner_fast_grad_norm_sum = 0.0
+                wb_inner_loss_sum = 0.0
                 wb_count = 0
 
             if (

@@ -199,6 +199,7 @@ def adapt_fast_params_for_prepared_task(
     base_params: Optional[Dict[str, torch.Tensor]] = None,
     buffers: Optional[Dict[str, torch.Tensor]] = None,
     inner_grad_norms_out: Optional[List[torch.Tensor]] = None,
+    inner_losses_out: Optional[List[torch.Tensor]] = None,
 ) -> Dict[str, torch.Tensor]:
     adapted_params = base_params if base_params is not None else dict(model.named_parameters())
     model_buffers = buffers if buffers is not None else dict(model.named_buffers())
@@ -206,6 +207,8 @@ def adapt_fast_params_for_prepared_task(
 
     for step_idx, support_batch in enumerate(prepared_task["support_batches"]):
         support_loss = functional_call(model, (adapted_params, model_buffers), (support_batch,))
+        if inner_losses_out is not None:
+            inner_losses_out.append(support_loss.detach())
         fast_tensors = [adapted_params[name] for name in fast_names]
         grads = torch.autograd.grad(
             support_loss,
@@ -291,11 +294,12 @@ def maml_step_with_stats(
     fast_names: Sequence[str],
     cfg: MAMLConfig,
     inner_lr_schedule: Optional[PositiveInnerLRSchedule] = None,
-) -> tuple[torch.Tensor, float]:
+) -> tuple[torch.Tensor, float, float]:
     base_params = dict(model.named_parameters())
     buffers = dict(model.named_buffers())
     losses: List[torch.Tensor] = []
     inner_grad_norms: List[torch.Tensor] = []
+    inner_losses: List[torch.Tensor] = []
     for prepared_task in prepared_tasks:
         adapted_params = adapt_fast_params_for_prepared_task(
             model,
@@ -307,13 +311,15 @@ def maml_step_with_stats(
             base_params=base_params,
             buffers=buffers,
             inner_grad_norms_out=inner_grad_norms,
+            inner_losses_out=inner_losses,
         )
         losses.append(functional_call(model, (adapted_params, buffers), (prepared_task["query_batch"],)))
     meta_loss = torch.stack(losses).mean()
     avg_inner_grad_norm = (
         float(torch.stack(inner_grad_norms).mean().item()) if inner_grad_norms else 0.0
     )
-    return meta_loss, avg_inner_grad_norm
+    avg_inner_loss = float(torch.stack(inner_losses).mean().item()) if inner_losses else 0.0
+    return meta_loss, avg_inner_grad_norm, avg_inner_loss
 
 
 def copy_fast_params_into_policy(

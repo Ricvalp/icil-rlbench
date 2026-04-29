@@ -400,10 +400,11 @@ def fomaml_backward_with_stats(
     fast_names: Sequence[str],
     cfg: MAMLConfig,
     inner_lr_schedule: Optional[PositiveInnerLRSchedule] = None,
-) -> Tuple[float, float]:
+) -> Tuple[float, float, float]:
     base_params = dict(model.named_parameters())
     buffers = dict(model.named_buffers())
     inner_grad_norms: List[torch.Tensor] = []
+    inner_losses: List[torch.Tensor] = []
     loss_sum = 0.0
     num_tasks = len(prepared_tasks)
     if num_tasks < 1:
@@ -420,6 +421,7 @@ def fomaml_backward_with_stats(
             base_params=base_params,
             buffers=buffers,
             inner_grad_norms_out=inner_grad_norms,
+            inner_losses_out=inner_losses,
         )
         task_loss = functional_call(model, (adapted_params, buffers), (prepared_task['query_batch'],))
         loss_sum += float(task_loss.detach().cpu())
@@ -428,7 +430,8 @@ def fomaml_backward_with_stats(
     avg_inner_grad_norm = (
         float(torch.stack(inner_grad_norms).mean().item()) if inner_grad_norms else 0.0
     )
-    return loss_sum / float(num_tasks), avg_inner_grad_norm
+    avg_inner_loss = float(torch.stack(inner_losses).mean().item()) if inner_losses else 0.0
+    return loss_sum / float(num_tasks), avg_inner_grad_norm, avg_inner_loss
 
 
 def _to_device_batch(batch: Dict[str, Any], device: torch.device) -> Dict[str, Any]:
@@ -1214,6 +1217,7 @@ def train(cfg: ConfigDict) -> None:
         log_count = 0
         wb_loss_sum = 0.0
         wb_inner_fast_grad_norm_sum = 0.0
+        wb_inner_loss_sum = 0.0
         wb_count = 0
         window_start = time.time()
 
@@ -1238,7 +1242,7 @@ def train(cfg: ConfigDict) -> None:
             )
 
             optimizer.zero_grad(set_to_none=True)
-            loss_value_local, avg_inner_fast_grad_norm_local = fomaml_backward_with_stats(
+            loss_value_local, avg_inner_fast_grad_norm_local, avg_inner_loss_local = fomaml_backward_with_stats(
                 loss_wrapper,
                 prepared_tasks,
                 fast_names=fast_names_wrapped,
@@ -1248,6 +1252,7 @@ def train(cfg: ConfigDict) -> None:
             _all_reduce_outer_grads(outer_params + inner_lr_params, device)
             loss_value = _distributed_mean(loss_value_local, device)
             avg_inner_fast_grad_norm = _distributed_mean(avg_inner_fast_grad_norm_local, device)
+            avg_inner_loss = _distributed_mean(avg_inner_loss_local, device)
             if float(maml_cfg.max_grad_norm) > 0.0:
                 torch.nn.utils.clip_grad_norm_(outer_params + inner_lr_params, float(maml_cfg.max_grad_norm))
             optimizer.step()
@@ -1257,6 +1262,7 @@ def train(cfg: ConfigDict) -> None:
             log_count += 1
             wb_loss_sum += loss_value
             wb_inner_fast_grad_norm_sum += float(avg_inner_fast_grad_norm)
+            wb_inner_loss_sum += float(avg_inner_loss)
             wb_count += 1
 
             if is_main and log_every > 0 and (global_step % log_every == 0 or global_step == 1):
@@ -1264,10 +1270,11 @@ def train(cfg: ConfigDict) -> None:
                 steps_per_sec = log_count / elapsed
                 avg_loss = log_loss / max(1, log_count)
                 logging.info(
-                    'step %d/%d | meta_loss %.6f | outer_lr %.3e | inner_lr_mean %.3e | %.2f step/s',
+                    'step %d/%d | meta_loss %.6f | inner_loss %.6f | outer_lr %.3e | inner_lr_mean %.3e | %.2f step/s',
                     global_step,
                     int(cfg.train.num_steps),
                     avg_loss,
+                    float(avg_inner_loss),
                     float(optimizer.param_groups[0]['lr']),
                     _inner_lr_log_dict(schedule=inner_lr_schedule, cfg=maml_cfg).get('train/inner_lr_mean', float(maml_cfg.inner_lr)),
                     steps_per_sec,
@@ -1282,6 +1289,7 @@ def train(cfg: ConfigDict) -> None:
                         'train/meta_loss': wb_loss_sum / max(1, wb_count),
                         'train/outer_loss': wb_loss_sum / max(1, wb_count),
                         'train/inner_fast_grad_norm': wb_inner_fast_grad_norm_sum / max(1, wb_count),
+                        'train/inner_support_loss': wb_inner_loss_sum / max(1, wb_count),
                         'train/lr': float(optimizer.param_groups[0]['lr']),
                         'train/step': global_step,
                         **_inner_lr_log_dict(schedule=inner_lr_schedule, cfg=maml_cfg),
@@ -1290,6 +1298,7 @@ def train(cfg: ConfigDict) -> None:
                 )
                 wb_loss_sum = 0.0
                 wb_inner_fast_grad_norm_sum = 0.0
+                wb_inner_loss_sum = 0.0
                 wb_count = 0
 
             if (
