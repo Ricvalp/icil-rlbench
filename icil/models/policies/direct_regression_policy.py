@@ -264,7 +264,7 @@ class DirectRegressionPolicy(nn.Module):
                 f"but received action_horizon={int(action_horizon)}."
             )
 
-    def forward_actions(
+    def _encode_context(
         self,
         *,
         query_xyz: torch.Tensor,
@@ -279,11 +279,7 @@ class DirectRegressionPolicy(nn.Module):
         query_mask_id: Optional[torch.Tensor] = None,
         cond_valid: Optional[torch.Tensor] = None,
         query_valid: Optional[torch.Tensor] = None,
-        action_horizon: Optional[int] = None,
-    ) -> torch.Tensor:
-        if action_horizon is not None:
-            self._check_action_horizon(int(action_horizon))
-        B = int(query_xyz.shape[0])
+    ) -> ResolvedContext:
         ctx_out = self.context_encoder(
             query_xyz=query_xyz,
             query_state=query_state,
@@ -298,7 +294,15 @@ class DirectRegressionPolicy(nn.Module):
             cond_mask_id=cond_mask_id,
             cond_valid=cond_valid,
         )
-        ctx = self._resolve_context_output(ctx_out)
+        return self._resolve_context_output(ctx_out)
+
+    def _predict_actions_from_context(
+        self,
+        ctx: ResolvedContext,
+        *,
+        batch_size: int,
+    ) -> torch.Tensor:
+        B = int(batch_size)
         cond_vec = self.context_conditioner(
             tokens=ctx.tokens,
             token_mask=ctx.token_mask,
@@ -337,6 +341,41 @@ class DirectRegressionPolicy(nn.Module):
                     use_checkpoint=use_decoder_ckpt,
                 )
         return self.action_out(h)
+
+    def forward_actions(
+        self,
+        *,
+        query_xyz: torch.Tensor,
+        query_state: torch.Tensor,
+        cond_xyz: Optional[torch.Tensor] = None,
+        cond_state: Optional[torch.Tensor] = None,
+        cond_traj: Optional[torch.Tensor] = None,
+        cond_traj_mask: Optional[torch.Tensor] = None,
+        cond_rgb: Optional[torch.Tensor] = None,
+        query_rgb: Optional[torch.Tensor] = None,
+        cond_mask_id: Optional[torch.Tensor] = None,
+        query_mask_id: Optional[torch.Tensor] = None,
+        cond_valid: Optional[torch.Tensor] = None,
+        query_valid: Optional[torch.Tensor] = None,
+        action_horizon: Optional[int] = None,
+    ) -> torch.Tensor:
+        if action_horizon is not None:
+            self._check_action_horizon(int(action_horizon))
+        ctx = self._encode_context(
+            query_xyz=query_xyz,
+            query_state=query_state,
+            cond_xyz=cond_xyz,
+            cond_state=cond_state,
+            cond_traj=cond_traj,
+            cond_traj_mask=cond_traj_mask,
+            cond_rgb=cond_rgb,
+            query_rgb=query_rgb,
+            cond_mask_id=cond_mask_id,
+            query_mask_id=query_mask_id,
+            cond_valid=cond_valid,
+            query_valid=query_valid,
+        )
+        return self._predict_actions_from_context(ctx, batch_size=int(query_xyz.shape[0]))
 
     def forward_loss(self, batch: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
         target = batch["target_action"]
