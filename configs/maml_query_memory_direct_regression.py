@@ -123,7 +123,7 @@ def get_config():
     cfg.wandb.mode = os.environ.get('WANDB_MODE', 'online')
     cfg.wandb.tags = ()
     cfg.wandb.n_loss_steps = 1
-    cfg.wandb.n_sample_steps = 1000
+    cfg.wandb.n_sample_steps = 100
     cfg.wandb.sample_batch_items = 16
     cfg.wandb.include_query_pointcloud_in_x0_pred_vs_gt_3d = False
     cfg.wandb.query_pointcloud_max_points = 4096
