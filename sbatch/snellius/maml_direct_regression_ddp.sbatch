@@ -4,11 +4,11 @@
 #SBATCH --error=/gpfs/home1/rvalperga/icil-rlbench/.smanager/scripts/icil.maml_perceiver_encoder_decoder_ddp/logs/direct_reg_maml_ddp.%j.err
 #SBATCH --partition=gpu_h100
 #SBATCH --gres=gpu:4
-#SBATCH --time=72:00:00
+#SBATCH --time=05:00:00
 
 set -euo pipefail
 
-PRETRAINED_CHECKPOINT="/gpfs/home1/rvalperga/icil-rlbench/REPLACE_WITH_PRETRAINED_CHECKPOINT.pt"
+PRETRAINED_CHECKPOINT="/projects/prjs1905/robotics/rlbench/icil_runs/checkpoints/vb51tt3o/step_0444000.pt"
 
 if [ ! -f "${PRETRAINED_CHECKPOINT}" ]; then
   echo "PRETRAINED_CHECKPOINT does not exist: ${PRETRAINED_CHECKPOINT}" >&2
@@ -42,12 +42,12 @@ torchrun --standalone --nproc_per_node=4 \
   --config.data.task_sampling=variation_uniform \
   --config.data.task_sampling_alpha=0.5 \
   --config.train.num_steps=100000 \
-  --config.train.batch_size=2 \
+  --config.train.batch_size=4 \
   --config.train.weight_decay=1e-4 \
   --config.train.log_every=10 \
-  --config.train.ckpt_every=500 \
-  --config.maml.inner_steps=4 \
-  --config.maml.inner_lr=1e-4 \
+  --config.train.ckpt_every=100 \
+  --config.maml.inner_steps=2 \
+  --config.maml.inner_lr=1e-2 \
   --config.maml.inner_lr_mode=fixed \
   --config.maml.outer_lr=1e-4 \
   --config.maml.max_grad_norm=1.0 \
@@ -57,7 +57,7 @@ torchrun --standalone --nproc_per_node=4 \
   --config.maml.include_input_projections_fast=False \
   --config.maml.include_output_head_fast=False \
   --config.maml.include_diffusion_conditioning_fast=False \
-  --config.maml.num_loo_per_task=8 \
+  --config.maml.num_loo_per_task=16 \
   --config.maml.outer_context_size=0 \
   --config.maml.reuse_diffusion_noise=True \
   --config.outer.train_encoder=False \

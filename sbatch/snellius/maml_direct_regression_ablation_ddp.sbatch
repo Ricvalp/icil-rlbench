@@ -4,11 +4,11 @@
 #SBATCH --error=/gpfs/home1/rvalperga/icil-rlbench/.smanager/scripts/icil.maml_perceiver_encoder_decoder_ddp/logs/direct_reg_maml_ablation_ddp.%j.err
 #SBATCH --partition=gpu_h100
 #SBATCH --gres=gpu:4
-#SBATCH --time=72:00:00
+#SBATCH --time=24:00:00
 
 set -euo pipefail
 
-PRETRAINED_CHECKPOINT="/gpfs/home1/rvalperga/icil-rlbench/REPLACE_WITH_PRETRAINED_CHECKPOINT.pt"
+PRETRAINED_CHECKPOINT="/projects/prjs1905/robotics/rlbench/icil_runs/checkpoints/vb51tt3o/step_0444000.pt"
 
 if [ ! -f "${PRETRAINED_CHECKPOINT}" ]; then
   echo "PRETRAINED_CHECKPOINT does not exist: ${PRETRAINED_CHECKPOINT}" >&2
@@ -42,10 +42,10 @@ torchrun --standalone --nproc_per_node=4 \
   --config.data.task_sampling=variation_uniform \
   --config.data.task_sampling_alpha=0.5 \
   --config.train.num_steps=100000 \
-  --config.train.batch_size=2 \
+  --config.train.batch_size=8 \
   --config.train.weight_decay=1e-4 \
   --config.train.log_every=10 \
-  --config.train.ckpt_every=500 \
+  --config.train.ckpt_every=100 \
   --config.maml.inner_steps=4 \
   --config.maml.inner_lr=1e-2 \
   --config.maml.inner_lr_mode=fixed \
