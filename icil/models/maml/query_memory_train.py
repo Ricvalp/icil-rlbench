@@ -3,17 +3,19 @@ from __future__ import annotations
 import json
 import os
 import time
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
 import torch.distributed as dist
+import torch.nn.functional as F
 from absl import logging
 from ml_collections import ConfigDict
 from torch.utils.data import DataLoader
 
+from icil.action_representation import decode_action_chunk
 import icil.models.maml.memory_train as memory_train_lib
 from icil.datasets.in_context_imitation_learning.icil_datasets import ICILConfig
 from icil.models import (
@@ -25,6 +27,7 @@ from icil.models.maml.memory_core import memory_maml_step_with_stats
 from icil.models.maml.query_memory_tasks import (
     QueryMemoryTaskBatchIterable,
     QueryMemoryTaskBuilder,
+    prepare_query_memory_task_for_meta_step,
     prepare_outer_batch_for_query_memory_meta_step,
 )
 from icil.models.maml.train_utils import (
@@ -194,6 +197,180 @@ def _build_model(
     action_dim: int,
 ):
     return build_query_memory_direct_regression_policy(cfg, state_dim=state_dim, action_dim=action_dim)
+
+
+def _plot_pred_vs_gt_3d(
+    pred_x0: torch.Tensor,
+    gt_x0: torch.Tensor,
+    max_items: int = 4,
+    *,
+    include_query_pointcloud: bool = False,
+    query_xyz: Optional[torch.Tensor] = None,
+    query_valid: Optional[torch.Tensor] = None,
+    max_query_points: int = 2048,
+) -> Optional[Any]:
+    try:
+        import matplotlib.pyplot as plt
+    except ImportError:
+        return None
+
+    pred = pred_x0.detach().float().cpu().numpy()
+    gt = gt_x0.detach().float().cpu().numpy()
+    if pred.ndim != 3 or gt.ndim != 3:
+        return None
+    qxyz = query_xyz.detach().float().cpu().numpy() if query_xyz is not None else None
+    qvalid = query_valid.detach().bool().cpu().numpy() if query_valid is not None else None
+
+    B, H, A = pred.shape
+    n = int(max(1, min(B, max_items)))
+    cols = min(4, n)
+    rows = (n + cols - 1) // cols
+    fig = plt.figure(figsize=(5 * cols, 4 * rows))
+
+    def _xyz(arr: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        x = arr[:, 0] if A >= 1 else np.zeros((H,), dtype=np.float32)
+        y = arr[:, 1] if A >= 2 else np.zeros((H,), dtype=np.float32)
+        z = arr[:, 2] if A >= 3 else np.zeros((H,), dtype=np.float32)
+        return x, y, z
+
+    for i in range(n):
+        ax = fig.add_subplot(rows, cols, i + 1, projection='3d')
+        query_pts_for_limits: Optional[np.ndarray] = None
+        if include_query_pointcloud and qxyz is not None:
+            if qxyz.ndim == 4:
+                pts = qxyz[i, -1]
+                mask = qvalid[i, -1] if (qvalid is not None and qvalid.ndim == 3) else np.ones((pts.shape[0],), dtype=bool)
+            elif qxyz.ndim == 3:
+                pts = qxyz[i]
+                mask = qvalid[i] if (qvalid is not None and qvalid.ndim == 2) else np.ones((pts.shape[0],), dtype=bool)
+            else:
+                pts = None
+                mask = None
+            if pts is not None:
+                pts = pts[mask]
+                if pts.shape[0] > 0:
+                    pts = pts[np.isfinite(pts).all(axis=1)]
+                if pts.shape[0] > int(max_query_points) and int(max_query_points) > 0:
+                    idx = np.linspace(0, pts.shape[0] - 1, int(max_query_points), dtype=np.int64)
+                    pts = pts[idx]
+                if pts.shape[0] > 0:
+                    query_pts_for_limits = pts
+                    ax.scatter(
+                        pts[:, 0],
+                        pts[:, 1],
+                        pts[:, 2],
+                        color='lightgray',
+                        s=1.5,
+                        alpha=0.35,
+                        label='query_pc' if i == 0 else None,
+                    )
+
+        gx, gy, gz = _xyz(gt[i])
+        px, py, pz = _xyz(pred[i])
+        ax.plot(gx, gy, gz, color='tab:green', linewidth=2.0, label='gt')
+        ax.plot(px, py, pz, color='tab:orange', linewidth=2.0, linestyle='--', label='pred')
+        ax.scatter(gx[0], gy[0], gz[0], color='tab:green', s=18)
+        ax.scatter(px[0], py[0], pz[0], color='tab:orange', s=18)
+        ax.set_title(f'sample {i}')
+        if i == 0:
+            ax.legend(loc='upper right')
+        ax.set_xlabel('x')
+        ax.set_ylabel('y')
+        ax.set_zlabel('z')
+        all_pts = [
+            np.stack([gx, gy, gz], axis=1),
+            np.stack([px, py, pz], axis=1),
+        ]
+        if query_pts_for_limits is not None:
+            all_pts.append(query_pts_for_limits[:, :3])
+        pts_all = np.concatenate(all_pts, axis=0)
+        mins = pts_all.min(axis=0)
+        maxs = pts_all.max(axis=0)
+        center = 0.5 * (mins + maxs)
+        half_range = 0.5 * float(np.max(maxs - mins))
+        if half_range < 1e-6:
+            half_range = 1e-3
+        ax.set_xlim(center[0] - half_range, center[0] + half_range)
+        ax.set_ylim(center[1] - half_range, center[1] + half_range)
+        ax.set_zlim(center[2] - half_range, center[2] + half_range)
+
+    fig.tight_layout()
+    return fig
+
+
+def _sample_adapted_actions_for_logging(
+    *,
+    policy: torch.nn.Module,
+    task_spec: Any,
+    task_builder: QueryMemoryTaskBuilder,
+    memory_cfg: Any,
+    inner_lr_schedule: Optional[Any],
+    device: torch.device,
+    use_mask_id: bool,
+    load_rgb: bool,
+    sample_batch_items: int,
+    query_encoder_has_rgb: bool,
+    dataset_action_representation: str,
+    include_query_pointcloud: bool,
+    query_pointcloud_max_points: int,
+    rng: np.random.Generator,
+) -> Tuple[Optional[float], Optional[Any]]:
+    from icil.models.maml.memory_core import adapt_memory_tokens_for_prepared_task, sample_actions_with_memory_tokens
+
+    logging_cfg = replace(memory_cfg, num_query_loss_samples=max(1, int(sample_batch_items)))
+    prepared_task = prepare_query_memory_task_for_meta_step(
+        task_spec,
+        task_builder=task_builder,
+        cfg=logging_cfg,
+        device=device,
+        use_mask_id=use_mask_id,
+        rng=rng,
+        load_rgb=bool(load_rgb and query_encoder_has_rgb),
+    )
+
+    was_training = policy.training
+    policy.eval()
+    try:
+        with torch.enable_grad():
+            adapted_tokens, token_mask = adapt_memory_tokens_for_prepared_task(
+                policy,
+                prepared_task,
+                cfg=logging_cfg,
+                create_graph=False,
+                inner_lr_schedule=inner_lr_schedule,
+            )
+        with torch.no_grad():
+            pred_x0 = sample_actions_with_memory_tokens(
+                policy,
+                prepared_task['query_batch'],
+                memory_tokens=adapted_tokens,
+                memory_token_mask=token_mask,
+            )
+        target_action = prepared_task['query_batch']['target_action']
+        sample_mse = float(F.mse_loss(pred_x0, target_action).detach().cpu())
+        plot_pred_x0 = decode_action_chunk(
+            pred_x0,
+            query_state=prepared_task['query_batch']['query_state'],
+            representation=str(dataset_action_representation),
+        )
+        plot_gt_x0 = decode_action_chunk(
+            target_action,
+            query_state=prepared_task['query_batch']['query_state'],
+            representation=str(dataset_action_representation),
+        )
+        fig = _plot_pred_vs_gt_3d(
+            pred_x0=plot_pred_x0,
+            gt_x0=plot_gt_x0,
+            max_items=int(sample_batch_items),
+            include_query_pointcloud=bool(include_query_pointcloud),
+            query_xyz=prepared_task['query_batch'].get('query_xyz', None),
+            query_valid=prepared_task['query_batch'].get('query_valid', None),
+            max_query_points=int(query_pointcloud_max_points),
+        )
+        return sample_mse, fig
+    finally:
+        if was_training:
+            policy.train()
 
 
 
@@ -426,6 +603,18 @@ def train(cfg: ConfigDict) -> None:
         log_every = int(cfg.train.log_every)
         ckpt_every = int(cfg.train.ckpt_every)
         wandb_loss_every = int(getattr(cfg.wandb, 'n_loss_steps', 0)) if wandb_run is not None else 0
+        wandb_sample_every = int(getattr(cfg.wandb, 'n_sample_steps', 0)) if wandb_run is not None else 0
+        wandb_sample_batch = int(getattr(cfg.wandb, 'sample_batch_items', 4)) if wandb_run is not None else 0
+        wandb_include_query_pc = (
+            memory_train_lib._as_bool(getattr(cfg.wandb, 'include_query_pointcloud_in_x0_pred_vs_gt_3d', False))
+            if wandb_run is not None
+            else False
+        )
+        wandb_query_pc_max_points = (
+            int(getattr(cfg.wandb, 'query_pointcloud_max_points', 2048))
+            if wandb_run is not None
+            else 2048
+        )
 
         policy.train()
         log_loss = 0.0
@@ -512,6 +701,46 @@ def train(cfg: ConfigDict) -> None:
                 wb_inner_grad_norm_sum = 0.0
                 wb_inner_loss_sum = 0.0
                 wb_count = 0
+
+            if is_main and wandb_run is not None and wandb_sample_every > 0 and (global_step % wandb_sample_every == 0):
+                sample_mse = None
+                fig = None
+                try:
+                    logging_rng = np.random.default_rng(data_seed + 2_000_003 + global_step)
+                    sample_mse, fig = _sample_adapted_actions_for_logging(
+                        policy=policy,
+                        task_spec=prepared_tasks[0]['task'],
+                        task_builder=task_builder,
+                        memory_cfg=memory_cfg,
+                        inner_lr_schedule=inner_lr_schedule,
+                        device=device,
+                        use_mask_id=use_mask_id,
+                        load_rgb=use_rgb,
+                        sample_batch_items=wandb_sample_batch,
+                        query_encoder_has_rgb=use_rgb,
+                        dataset_action_representation=str(dataset_cfg.action_representation),
+                        include_query_pointcloud=wandb_include_query_pc,
+                        query_pointcloud_max_points=wandb_query_pc_max_points,
+                        rng=logging_rng,
+                    )
+                    log_dict: Dict[str, Any] = {
+                        'train/step': global_step,
+                    }
+                    if sample_mse is not None:
+                        log_dict['samples/action_chunk_mse'] = float(sample_mse)
+                    if fig is not None:
+                        import wandb
+
+                        log_dict['samples/action_chunk_pred_vs_gt_3d'] = wandb.Image(fig)
+                    wandb_run.log(log_dict, step=global_step)
+                finally:
+                    if fig is not None:
+                        try:
+                            import matplotlib.pyplot as plt
+
+                            plt.close(fig)
+                        except Exception:
+                            pass
 
             if is_main and ckpt_every > 0 and (global_step % ckpt_every == 0 or global_step == int(cfg.train.num_steps)):
                 checkpoint = {
