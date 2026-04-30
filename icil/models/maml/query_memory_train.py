@@ -619,17 +619,18 @@ def train(cfg: ConfigDict) -> None:
 
         log_every = int(cfg.train.log_every)
         ckpt_every = int(cfg.train.ckpt_every)
+        wandb_cfg_enabled = memory_train_lib._as_bool(getattr(cfg.wandb, 'enable', False))
         wandb_loss_every = int(getattr(cfg.wandb, 'n_loss_steps', 0)) if wandb_run is not None else 0
-        wandb_sample_every = int(getattr(cfg.wandb, 'n_sample_steps', 0)) if wandb_run is not None else 0
-        wandb_sample_batch = int(getattr(cfg.wandb, 'sample_batch_items', 4)) if wandb_run is not None else 0
+        wandb_sample_every = int(getattr(cfg.wandb, 'n_sample_steps', 0)) if wandb_cfg_enabled else 0
+        wandb_sample_batch = int(getattr(cfg.wandb, 'sample_batch_items', 4)) if wandb_cfg_enabled else 0
         wandb_include_query_pc = (
             memory_train_lib._as_bool(getattr(cfg.wandb, 'include_query_pointcloud_in_x0_pred_vs_gt_3d', False))
-            if wandb_run is not None
+            if wandb_cfg_enabled
             else False
         )
         wandb_query_pc_max_points = (
             int(getattr(cfg.wandb, 'query_pointcloud_max_points', 2048))
-            if wandb_run is not None
+            if wandb_cfg_enabled
             else 2048
         )
         use_amp = memory_train_lib._as_bool(getattr(cfg.train, 'use_amp', False)) and device.type == 'cuda'
@@ -724,7 +725,7 @@ def train(cfg: ConfigDict) -> None:
                 wb_inner_loss_sum = 0.0
                 wb_count = 0
 
-            if is_main and wandb_run is not None and wandb_sample_every > 0 and (global_step % wandb_sample_every == 0):
+            if wandb_sample_every > 0 and (global_step % wandb_sample_every == 0):
                 sample_mse = None
                 fig = None
                 try:
@@ -745,16 +746,17 @@ def train(cfg: ConfigDict) -> None:
                         query_pointcloud_max_points=wandb_query_pc_max_points,
                         rng=logging_rng,
                     )
-                    log_dict: Dict[str, Any] = {
-                        'train/step': global_step,
-                    }
-                    if sample_mse is not None:
-                        log_dict['samples/action_chunk_mse'] = float(sample_mse)
-                    if fig is not None:
-                        import wandb
+                    if is_main and wandb_run is not None:
+                        log_dict: Dict[str, Any] = {
+                            'train/step': global_step,
+                        }
+                        if sample_mse is not None:
+                            log_dict['samples/action_chunk_mse'] = float(sample_mse)
+                        if fig is not None:
+                            import wandb
 
-                        log_dict['samples/action_chunk_pred_vs_gt_3d'] = wandb.Image(fig)
-                    wandb_run.log(log_dict, step=global_step)
+                            log_dict['samples/action_chunk_pred_vs_gt_3d'] = wandb.Image(fig)
+                        wandb_run.log(log_dict, step=global_step)
                 finally:
                     if fig is not None:
                         try:
@@ -763,6 +765,8 @@ def train(cfg: ConfigDict) -> None:
                             plt.close(fig)
                         except Exception:
                             pass
+                if dist.is_initialized():
+                    dist.barrier()
 
             if is_main and ckpt_every > 0 and (global_step % ckpt_every == 0 or global_step == int(cfg.train.num_steps)):
                 checkpoint = {

@@ -1188,26 +1188,27 @@ def train(cfg: ConfigDict) -> None:
 
         log_every = int(cfg.train.log_every)
         ckpt_every = int(cfg.train.ckpt_every)
+        wandb_cfg_enabled = _as_bool(getattr(cfg.wandb, 'enable', False))
         wandb_loss_every = int(getattr(cfg.wandb, 'n_loss_steps', 0)) if wandb_run is not None else 0
-        wandb_sample_every = int(getattr(cfg.wandb, 'n_sample_steps', 0)) if wandb_run is not None else 0
-        wandb_inner_loss_every = int(getattr(cfg.wandb, 'n_inner_loss_steps', 0)) if wandb_run is not None else 0
-        wandb_sample_batch = int(getattr(cfg.wandb, 'sample_batch_items', 4)) if wandb_run is not None else 0
+        wandb_sample_every = int(getattr(cfg.wandb, 'n_sample_steps', 0)) if wandb_cfg_enabled else 0
+        wandb_inner_loss_every = int(getattr(cfg.wandb, 'n_inner_loss_steps', 0)) if wandb_cfg_enabled else 0
+        wandb_sample_batch = int(getattr(cfg.wandb, 'sample_batch_items', 4)) if wandb_cfg_enabled else 0
         wandb_sample_mse_items = (
-            int(getattr(cfg.wandb, 'sample_mse_items', wandb_sample_batch)) if wandb_run is not None else 0
+            int(getattr(cfg.wandb, 'sample_mse_items', wandb_sample_batch)) if wandb_cfg_enabled else 0
         )
         wandb_sample_inference_steps = (
-            int(getattr(cfg.wandb, 'sample_inference_steps', 0)) if wandb_run is not None else 0
+            int(getattr(cfg.wandb, 'sample_inference_steps', 0)) if wandb_cfg_enabled else 0
         )
-        wandb_sample_eta = float(getattr(cfg.wandb, 'sample_eta', 0.0)) if wandb_run is not None else 0.0
-        wandb_sample_trace_frames = int(getattr(cfg.wandb, 'sample_trace_frames', 8)) if wandb_run is not None else 0
+        wandb_sample_eta = float(getattr(cfg.wandb, 'sample_eta', 0.0)) if wandb_cfg_enabled else 0.0
+        wandb_sample_trace_frames = int(getattr(cfg.wandb, 'sample_trace_frames', 8)) if wandb_cfg_enabled else 0
         wandb_include_query_pc = (
             _as_bool(getattr(cfg.wandb, 'include_query_pointcloud_in_x0_pred_vs_gt_3d', False))
-            if wandb_run is not None
+            if wandb_cfg_enabled
             else False
         )
         wandb_query_pc_max_points = (
             int(getattr(cfg.wandb, 'query_pointcloud_max_points', 2048))
-            if wandb_run is not None
+            if wandb_cfg_enabled
             else 2048
         )
 
@@ -1301,12 +1302,7 @@ def train(cfg: ConfigDict) -> None:
                 wb_inner_loss_sum = 0.0
                 wb_count = 0
 
-            if (
-                is_main
-                and wandb_run is not None
-                and wandb_inner_loss_every > 0
-                and (global_step % wandb_inner_loss_every == 0 or global_step == 1)
-            ):
+            if wandb_inner_loss_every > 0 and (global_step % wandb_inner_loss_every == 0 or global_step == 1):
                 max_diag_tasks = max(1, min(len(prepared_tasks), max(1, wandb_sample_batch)))
                 query_diffusion_curve, query_sample_mse_curve = parameter_inner_loop_query_curves(
                     policy=policy,
@@ -1332,14 +1328,15 @@ def train(cfg: ConfigDict) -> None:
                     title='Query sampled action MSE vs inner step',
                     log_y=True,
                 )
-                log_dict: Dict[str, Any] = {'train/step': global_step}
-                import wandb
+                if is_main and wandb_run is not None:
+                    log_dict: Dict[str, Any] = {'train/step': global_step}
+                    import wandb
 
-                if fig_diff is not None:
-                    log_dict['inner_loop/query_diffusion_loss'] = wandb.Image(fig_diff)
-                if fig_mse is not None:
-                    log_dict['inner_loop/query_sample_mse'] = wandb.Image(fig_mse)
-                wandb_run.log(log_dict, step=global_step)
+                    if fig_diff is not None:
+                        log_dict['inner_loop/query_diffusion_loss'] = wandb.Image(fig_diff)
+                    if fig_mse is not None:
+                        log_dict['inner_loop/query_sample_mse'] = wandb.Image(fig_mse)
+                    wandb_run.log(log_dict, step=global_step)
                 if fig_diff is not None or fig_mse is not None:
                     try:
                         import matplotlib.pyplot as plt
@@ -1350,8 +1347,10 @@ def train(cfg: ConfigDict) -> None:
                             plt.close(fig_mse)
                     except Exception:
                         pass
+                if dist.is_initialized():
+                    dist.barrier()
 
-            if wandb_run is not None and wandb_sample_every > 0 and (global_step % wandb_sample_every == 0):
+            if wandb_sample_every > 0 and (global_step % wandb_sample_every == 0):
                 sample_tasks = list(tasks_batch[: max(0, min(len(tasks_batch), wandb_sample_batch))])
                 pred_x0 = None
                 gt_x0 = None
@@ -1515,25 +1514,26 @@ def train(cfg: ConfigDict) -> None:
                         max_items=max(1, min(2, wandb_sample_batch)),
                     )
 
-                log_dict: Dict[str, Any] = {
-                    'train/step': global_step,
-                }
-                if sample_mse is not None:
-                    log_dict['samples/x0_mse'] = float(sample_mse)
-                if sample_mse_excluded is not None:
-                    log_dict['samples_excluded/x0_mse'] = float(sample_mse_excluded)
-                if fig is not None or fig_trace is not None or fig_excluded is not None or fig_trace_excluded is not None:
-                    import wandb
+                if is_main and wandb_run is not None:
+                    log_dict: Dict[str, Any] = {
+                        'train/step': global_step,
+                    }
+                    if sample_mse is not None:
+                        log_dict['samples/x0_mse'] = float(sample_mse)
+                    if sample_mse_excluded is not None:
+                        log_dict['samples_excluded/x0_mse'] = float(sample_mse_excluded)
+                    if fig is not None or fig_trace is not None or fig_excluded is not None or fig_trace_excluded is not None:
+                        import wandb
 
-                    if fig is not None:
-                        log_dict['samples/x0_pred_vs_gt_3d'] = wandb.Image(fig)
-                    if fig_trace is not None:
-                        log_dict['samples/x0_denoising_trace_3d'] = wandb.Image(fig_trace)
-                    if fig_excluded is not None:
-                        log_dict['samples_excluded/x0_pred_vs_gt_3d'] = wandb.Image(fig_excluded)
-                    if fig_trace_excluded is not None:
-                        log_dict['samples_excluded/x0_denoising_trace_3d'] = wandb.Image(fig_trace_excluded)
-                wandb_run.log(log_dict, step=global_step)
+                        if fig is not None:
+                            log_dict['samples/x0_pred_vs_gt_3d'] = wandb.Image(fig)
+                        if fig_trace is not None:
+                            log_dict['samples/x0_denoising_trace_3d'] = wandb.Image(fig_trace)
+                        if fig_excluded is not None:
+                            log_dict['samples_excluded/x0_pred_vs_gt_3d'] = wandb.Image(fig_excluded)
+                        if fig_trace_excluded is not None:
+                            log_dict['samples_excluded/x0_denoising_trace_3d'] = wandb.Image(fig_trace_excluded)
+                    wandb_run.log(log_dict, step=global_step)
                 if fig is not None or fig_trace is not None or fig_excluded is not None or fig_trace_excluded is not None:
                     try:
                         import matplotlib.pyplot as plt
@@ -1548,6 +1548,8 @@ def train(cfg: ConfigDict) -> None:
                             plt.close(fig_trace_excluded)
                     except Exception:
                         pass
+                if dist.is_initialized():
+                    dist.barrier()
 
             if is_main and ckpt_every > 0 and global_step % ckpt_every == 0:
                 ckpt_path = checkpoint_dir / f'step_{global_step:07d}.pt'
