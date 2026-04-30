@@ -270,13 +270,21 @@ def train(cfg: ConfigDict) -> None:
     wandb_loss_every = int(getattr(cfg.wandb, 'n_loss_steps', 0)) if wandb_run is not None else 0
     global_step = int(start_step)
     log_metric_sums = {'meta_loss': 0.0, 'inner_support_loss': 0.0, 'inner_memory_grad_norm': 0.0}
+    log_timing_sums = {'data_wait_s': 0.0, 'train_step_s': 0.0}
     log_count = 0
     window_start = time.time()
+    loader_iter = iter(loader)
 
     try:
-        for prepared_tasks in loader:
+        while True:
             if global_step >= int(cfg.train.num_steps):
                 break
+            t_data_0 = time.time()
+            try:
+                prepared_tasks = next(loader_iter)
+            except StopIteration:
+                break
+            data_wait_s = time.time() - t_data_0
             sharded_batch = prepared_tasks_to_sharded_batch(
                 prepared_tasks,
                 inner_steps=int(memory_cfg.inner_steps),
@@ -288,19 +296,26 @@ def train(cfg: ConfigDict) -> None:
                 'inner': sharded_batch['inner'],
                 'query': sharded_batch['query'],
             }
+            t_step_0 = time.time()
             replicated_state, metrics = p_train_step(replicated_state, train_batch)
             global_step = int(jax.device_get(jax_utils.unreplicate(replicated_state.step)))
             metrics_host = {key: float(jax.device_get(jax_utils.unreplicate(value))) for key, value in metrics.items()}
+            train_step_s = time.time() - t_step_0
             for key, value in metrics_host.items():
                 log_metric_sums[key] += float(value)
+            log_timing_sums['data_wait_s'] += float(data_wait_s)
+            log_timing_sums['train_step_s'] += float(train_step_s)
             log_count += 1
 
             if log_every > 0 and (global_step % log_every == 0 or global_step == start_step + 1):
                 elapsed = max(1e-6, time.time() - window_start)
                 steps_per_sec = log_count / elapsed
                 avg_metrics = {key: value / max(1, log_count) for key, value in log_metric_sums.items()}
+                avg_timings = {key: value / max(1, log_count) for key, value in log_timing_sums.items()}
+                total_avg_step_s = max(1e-6, avg_timings['data_wait_s'] + avg_timings['train_step_s'])
+                data_wait_frac = avg_timings['data_wait_s'] / total_avg_step_s
                 logging.info(
-                    'step %d/%d | meta_loss %.6f | inner_loss %.6f | inner_grad %.6f | outer_lr %.3e | %.2f step/s',
+                    'step %d/%d | meta_loss %.6f | inner_loss %.6f | inner_grad %.6f | outer_lr %.3e | %.2f step/s | data_wait %.3fs | train_step %.3fs | data_wait_frac %.2f',
                     global_step,
                     int(cfg.train.num_steps),
                     avg_metrics['meta_loss'],
@@ -308,18 +323,26 @@ def train(cfg: ConfigDict) -> None:
                     avg_metrics['inner_memory_grad_norm'],
                     float(memory_cfg.outer_lr),
                     steps_per_sec,
+                    avg_timings['data_wait_s'],
+                    avg_timings['train_step_s'],
+                    data_wait_frac,
                 )
                 log_metric_sums = {k: 0.0 for k in log_metric_sums}
+                log_timing_sums = {k: 0.0 for k in log_timing_sums}
                 log_count = 0
                 window_start = time.time()
 
             if wandb_run is not None and wandb_loss_every > 0 and (global_step % wandb_loss_every == 0 or global_step == start_step + 1):
+                step_total_s = max(1e-6, float(data_wait_s) + float(train_step_s))
                 wandb_run.log(
                     {
                         'train/meta_loss': metrics_host['meta_loss'],
                         'train/outer_loss': metrics_host['meta_loss'],
                         'train/inner_support_loss': metrics_host['inner_support_loss'],
                         'train/inner_memory_grad_norm': metrics_host['inner_memory_grad_norm'],
+                        'train/data_wait_s': float(data_wait_s),
+                        'train/train_step_s': float(train_step_s),
+                        'train/data_wait_frac': float(data_wait_s) / step_total_s,
                         'train/lr': float(memory_cfg.outer_lr),
                         'train/step': int(global_step),
                     },
