@@ -4,9 +4,9 @@
 #SBATCH --job-name=direct_reg_maml_ablation_ddp
 #SBATCH --partition=defq
 #SBATCH --gres=gpu:4
-#SBATCH --mem=128G
-#SBATCH --cpus-per-task=32
-#SBATCH --time=2-00:00
+#SBATCH --mem=64G
+#SBATCH --cpus-per-task=8
+#SBATCH --time=1-00:00
 #SBATCH --output=/home/valperga/icil-rlbench/sbatch/das/logs/direct_reg_maml_ablation_ddp-%j.out
 #SBATCH --error=/home/valperga/icil-rlbench/sbatch/das/logs/direct_reg_maml_ablation_ddp-%j.err
 
