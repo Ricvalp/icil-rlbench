@@ -3,10 +3,10 @@
 #SBATCH --nodes=1
 #SBATCH --job-name=query_mem_direct_fomaml
 #SBATCH --partition=defq
-#SBATCH --gres=gpu:4
+#SBATCH --gres=gpu:2
 #SBATCH --mem=32G
 #SBATCH --cpus-per-task=8
-#SBATCH --time=00:10:00
+#SBATCH --time=24:00:00
 #SBATCH --output=/home/valperga/icil-rlbench/sbatch/das/logs/query_mem_direct_fomaml-%j.out
 #SBATCH --error=/home/valperga/icil-rlbench/sbatch/das/logs/query_mem_direct_fomaml-%j.err
 
@@ -42,7 +42,7 @@ export WANDB_MODE="online"
 
 export PYTHONPATH=/home/valperga/icil-rlbench
 
-torchrun --standalone --nproc_per_node=4 \
+torchrun --standalone --nproc_per_node=2 \
   icil/fomaml_query_memory_direct_regression_ddp.py \
   --config=configs/fomaml_query_memory_direct_regression.py \
   --config.data.task_sampling=variation_uniform \
