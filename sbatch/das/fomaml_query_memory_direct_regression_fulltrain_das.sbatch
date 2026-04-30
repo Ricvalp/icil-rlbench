@@ -4,7 +4,7 @@
 #SBATCH --job-name=query_mem_direct_fomaml
 #SBATCH --partition=defq
 #SBATCH --gres=gpu:4
-#SBATCH --mem=64G
+#SBATCH --mem=32G
 #SBATCH --cpus-per-task=8
 #SBATCH --time=00:10:00
 #SBATCH --output=/home/valperga/icil-rlbench/sbatch/das/logs/query_mem_direct_fomaml-%j.out
