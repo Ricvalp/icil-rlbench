@@ -4,7 +4,7 @@ import json
 import os
 import time
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Sequence, Tuple
 
 import jax
 import jax.numpy as jnp
@@ -12,9 +12,12 @@ import numpy as np
 from absl import logging
 from flax import jax_utils
 from ml_collections import ConfigDict
+import torch
 from torch.utils.data import DataLoader
 
 from icil.datasets.in_context_imitation_learning.icil_datasets import ICILConfig
+from icil.models.maml.memory_core import MemoryMAMLConfig as TorchMemoryMAMLConfig
+from icil.models.maml.query_memory_tasks import QueryMemoryTaskBuilder, prepare_query_memory_task_for_meta_step
 from icil.models.maml.query_memory_tasks import PreparedQueryMemoryTaskBatchIterable
 from icil.models.maml.train_utils import (
     build_store as _build_store,
@@ -25,7 +28,8 @@ from icil_jax_query_memory.data.adapter import prepared_tasks_to_sharded_batch
 from icil_jax_query_memory.models.config_utils import build_model_config_from_raw, resolve_dtype
 from icil_jax_query_memory.models.query_memory_direct_regression import QueryMemoryDirectRegressionModel
 from icil_jax_query_memory.train.config import QueryMemoryMetaConfig
-from icil_jax_query_memory.train.step import create_train_state, create_train_step
+from icil_jax_query_memory.train.step import create_adapt_fn, create_predict_fn, create_train_state, create_train_step
+from icil_jax_query_memory.utils.action_representation import decode_action_chunk_np
 from icil_jax_query_memory.utils.checkpoints import load_checkpoint, save_checkpoint
 
 
@@ -124,6 +128,153 @@ def _resolve_run_id(wandb_run: Optional[Any]) -> str:
     return time.strftime('local-%Y%m%d-%H%M%S')
 
 
+def _torch_batch_to_jax(batch: Dict[str, Any]) -> Dict[str, jnp.ndarray]:
+    out: Dict[str, jnp.ndarray] = {}
+    for key in ('query_xyz', 'query_state', 'query_valid', 'target_action', 'query_rgb', 'query_mask_id'):
+        if key in batch:
+            value = batch[key]
+            if torch.is_tensor(value):
+                out[key] = jnp.asarray(value.detach().cpu().numpy())
+            elif isinstance(value, np.ndarray):
+                out[key] = jnp.asarray(value)
+    return out
+
+
+def _plot_pred_vs_gt_3d_np(
+    pred_x0: np.ndarray,
+    gt_x0: np.ndarray,
+    *,
+    max_items: int,
+) -> Optional[Any]:
+    try:
+        import matplotlib.pyplot as plt
+    except ImportError:
+        return None
+
+    pred = np.asarray(pred_x0, dtype=np.float32)
+    gt = np.asarray(gt_x0, dtype=np.float32)
+    if pred.ndim != 3 or gt.ndim != 3:
+        return None
+
+    B, H, A = pred.shape
+    n = int(max(1, min(B, max_items)))
+    cols = min(4, n)
+    rows = (n + cols - 1) // cols
+    fig = plt.figure(figsize=(5 * cols, 4 * rows))
+
+    def _xyz(arr: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        x = arr[:, 0] if A >= 1 else np.zeros((H,), dtype=np.float32)
+        y = arr[:, 1] if A >= 2 else np.zeros((H,), dtype=np.float32)
+        z = arr[:, 2] if A >= 3 else np.zeros((H,), dtype=np.float32)
+        return x, y, z
+
+    for i in range(n):
+        ax = fig.add_subplot(rows, cols, i + 1, projection='3d')
+        gx, gy, gz = _xyz(gt[i])
+        px, py, pz = _xyz(pred[i])
+        ax.plot(gx, gy, gz, color='tab:green', linewidth=2.0, label='gt')
+        ax.plot(px, py, pz, color='tab:orange', linewidth=2.0, linestyle='--', label='pred')
+        ax.scatter(gx[0], gy[0], gz[0], color='tab:green', s=18)
+        ax.scatter(px[0], py[0], pz[0], color='tab:orange', s=18)
+        ax.set_title(f'sample {i}')
+        if i == 0:
+            ax.legend(loc='upper right')
+        ax.set_xlabel('x')
+        ax.set_ylabel('y')
+        ax.set_zlabel('z')
+        pts_all = np.concatenate(
+            [
+                np.stack([gx, gy, gz], axis=1),
+                np.stack([px, py, pz], axis=1),
+            ],
+            axis=0,
+        )
+        mins = pts_all.min(axis=0)
+        maxs = pts_all.max(axis=0)
+        center = 0.5 * (mins + maxs)
+        half_range = 0.5 * float(np.max(maxs - mins))
+        if half_range < 1e-6:
+            half_range = 1e-3
+        ax.set_xlim(center[0] - half_range, center[0] + half_range)
+        ax.set_ylim(center[1] - half_range, center[1] + half_range)
+        ax.set_zlim(center[2] - half_range, center[2] + half_range)
+
+    fig.tight_layout()
+    return fig
+
+
+def _sample_logging_artifacts(
+    *,
+    params: Any,
+    task_spec: Any,
+    task_builder: QueryMemoryTaskBuilder,
+    memory_cfg: QueryMemoryMetaConfig,
+    adapt_fn: Any,
+    predict_fn: Any,
+    dataset_cfg: ICILConfig,
+    use_mask_id: bool,
+    use_rgb: bool,
+    sample_batch_items: int,
+    rng: np.random.Generator,
+) -> Tuple[Optional[float], Optional[Any]]:
+    logging_cfg = TorchMemoryMAMLConfig(
+        inner_steps=int(memory_cfg.inner_steps),
+        inner_lr=float(memory_cfg.inner_lr),
+        inner_lr_mode=str(memory_cfg.inner_lr_mode),
+        outer_lr=float(memory_cfg.outer_lr),
+        weight_decay=float(memory_cfg.weight_decay),
+        max_grad_norm=float(memory_cfg.max_grad_norm),
+        num_queries_per_step=int(memory_cfg.num_queries_per_step),
+        num_inner_batches=int(memory_cfg.num_inner_batches),
+        num_query_loss_samples=max(1, int(sample_batch_items)),
+        holdout_index=int(memory_cfg.holdout_index),
+        reuse_diffusion_noise=bool(memory_cfg.reuse_diffusion_noise),
+        grad_accum_steps=int(memory_cfg.grad_accum_steps),
+    )
+    prepared_task = prepare_query_memory_task_for_meta_step(
+        task_spec,
+        task_builder=task_builder,
+        cfg=logging_cfg,
+        device=torch.device('cpu'),
+        use_mask_id=use_mask_id,
+        rng=rng,
+        load_rgb=use_rgb,
+    )
+    if not prepared_task['inner_batches']:
+        return None, None
+    inner_batch_np: Dict[str, np.ndarray] = {}
+    sample_keys = ('query_xyz', 'query_state', 'query_valid', 'target_action', 'query_rgb', 'query_mask_id')
+    for key in sample_keys:
+        if key in prepared_task['inner_batches'][0]:
+            inner_batch_np[key] = np.stack(
+                [batch[key].detach().cpu().numpy() for batch in prepared_task['inner_batches']],
+                axis=0,
+            )
+    inner_batch = _torch_batch_to_jax(inner_batch_np)
+    query_batch = _torch_batch_to_jax(prepared_task['query_batch'])
+    adapted_memory = adapt_fn(params, inner_batch)
+    pred = predict_fn(params, query_batch, adapted_memory)
+    pred_np = np.asarray(pred)
+    target_np = np.asarray(query_batch['target_action'])
+    sample_mse = float(np.mean(np.square(pred_np - target_np)))
+    plot_pred = decode_action_chunk_np(
+        pred_np,
+        query_state=np.asarray(query_batch['query_state']),
+        representation=str(dataset_cfg.action_representation),
+    )
+    plot_gt = decode_action_chunk_np(
+        target_np,
+        query_state=np.asarray(query_batch['query_state']),
+        representation=str(dataset_cfg.action_representation),
+    )
+    fig = _plot_pred_vs_gt_3d_np(
+        pred_x0=plot_pred,
+        gt_x0=plot_gt,
+        max_items=int(sample_batch_items),
+    )
+    return sample_mse, fig
+
+
 def train(cfg: ConfigDict) -> None:
     seed = int(cfg.seed)
     _set_seed(seed)
@@ -205,6 +356,20 @@ def train(cfg: ConfigDict) -> None:
         max_grad_norm=float(memory_cfg.max_grad_norm),
         first_order=bool(memory_cfg.first_order),
     )
+    adapt_fn = create_adapt_fn(
+        model=model,
+        inner_steps=int(memory_cfg.inner_steps),
+        inner_lr=float(memory_cfg.inner_lr),
+        max_grad_norm=float(memory_cfg.max_grad_norm),
+        first_order=bool(memory_cfg.first_order),
+    )
+    predict_fn = create_predict_fn(model=model)
+    logging_task_builder = QueryMemoryTaskBuilder(
+        store,
+        cfg=dataset_cfg,
+        seed=seed,
+        num_tries_per_item=int(getattr(cfg.dataset, 'num_tries_per_item', 100)),
+    )
 
     task_dataset = PreparedQueryMemoryTaskBatchIterable(
         store,
@@ -268,6 +433,8 @@ def train(cfg: ConfigDict) -> None:
     log_every = int(cfg.train.log_every)
     ckpt_every = int(cfg.train.ckpt_every)
     wandb_loss_every = int(getattr(cfg.wandb, 'n_loss_steps', 0)) if wandb_run is not None else 0
+    wandb_sample_every = int(getattr(cfg.wandb, 'n_sample_steps', 0)) if wandb_run is not None else 0
+    wandb_sample_batch = int(getattr(cfg.wandb, 'sample_batch_items', 4)) if wandb_run is not None else 0
     global_step = int(start_step)
     log_metric_sums = {'meta_loss': 0.0, 'inner_support_loss': 0.0, 'inner_memory_grad_norm': 0.0}
     log_timing_sums = {'data_wait_s': 0.0, 'train_step_s': 0.0}
@@ -348,6 +515,42 @@ def train(cfg: ConfigDict) -> None:
                     },
                     step=int(global_step),
                 )
+
+            if wandb_run is not None and wandb_sample_every > 0 and (global_step % wandb_sample_every == 0):
+                fig = None
+                try:
+                    params_for_logging = jax_utils.unreplicate(replicated_state).params
+                    sample_mse, fig = _sample_logging_artifacts(
+                        params=params_for_logging,
+                        task_spec=prepared_tasks[0]['task'],
+                        task_builder=logging_task_builder,
+                        memory_cfg=memory_cfg,
+                        adapt_fn=adapt_fn,
+                        predict_fn=predict_fn,
+                        dataset_cfg=dataset_cfg,
+                        use_mask_id=use_mask_id,
+                        use_rgb=use_rgb,
+                        sample_batch_items=max(1, int(wandb_sample_batch)),
+                        rng=np.random.default_rng(seed + 1_000_003 + global_step),
+                    )
+                    log_dict: Dict[str, Any] = {
+                        'train/step': int(global_step),
+                    }
+                    if sample_mse is not None:
+                        log_dict['samples/action_chunk_mse'] = float(sample_mse)
+                    if fig is not None:
+                        import wandb
+
+                        log_dict['samples/action_chunk_pred_vs_gt_3d'] = wandb.Image(fig)
+                    wandb_run.log(log_dict, step=int(global_step))
+                finally:
+                    if fig is not None:
+                        try:
+                            import matplotlib.pyplot as plt
+
+                            plt.close(fig)
+                        except Exception:
+                            pass
 
             if ckpt_every > 0 and global_step % ckpt_every == 0:
                 host_state = jax_utils.unreplicate(replicated_state)

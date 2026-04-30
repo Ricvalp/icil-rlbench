@@ -94,5 +94,7 @@ def get_config():
     cfg.wandb.mode = os.environ.get('WANDB_MODE', 'online')
     cfg.wandb.tags = ()
     cfg.wandb.n_loss_steps = 1
+    cfg.wandb.n_sample_steps = 500
+    cfg.wandb.sample_batch_items = 64
 
     return cfg
