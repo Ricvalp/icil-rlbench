@@ -3,14 +3,15 @@
 #SBATCH --nodes=1
 #SBATCH --job-name=query_mem_direct_maml
 #SBATCH --partition=defq
-#SBATCH --gres=gpu:2
+#SBATCH --gres=gpu:1
 #SBATCH --mem=64G
 #SBATCH --cpus-per-task=8
-#SBATCH --time=00:10:00
+#SBATCH --time=24:00:00
 #SBATCH --output=/home/valperga/icil-rlbench/sbatch/das/logs/query_mem_direct_maml-%j.out
 #SBATCH --error=/home/valperga/icil-rlbench/sbatch/das/logs/query_mem_direct_maml-%j.err
 
 set -euo pipefail
+ulimit -n 4096 || true
 
 module load cuda12.6/toolkit
 
@@ -52,8 +53,8 @@ torchrun --standalone --nproc_per_node=1 \
   --config.train.weight_decay=1e-4 \
   --config.train.log_every=10 \
   --config.train.ckpt_every=100 \
-  --config.data.num_workers=4 \
-  --config.data.pin_memory=True \
+  --config.data.num_workers=2 \
+  --config.data.pin_memory=False \
   --config.data.persistent_workers=True \
   --config.maml.first_order=False \
   --config.maml.inner_steps=2 \
