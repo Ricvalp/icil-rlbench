@@ -618,10 +618,11 @@ def _sample_adapted_queries_for_tasks(
     Optional[torch.Tensor],
     Optional[torch.Tensor],
     Optional[torch.Tensor],
+    Optional[torch.Tensor],
     Optional[Dict[str, torch.Tensor]],
 ]:
     if not tasks:
-        return None, None, None, None, None
+        return None, None, None, None, None, None
 
     base_params = dict(loss_wrapper.named_parameters())
     buffers = dict(loss_wrapper.named_buffers())
@@ -634,6 +635,7 @@ def _sample_adapted_queries_for_tasks(
     gt_x0_items: List[torch.Tensor] = []
     query_xyz_items: List[torch.Tensor] = []
     query_valid_items: List[torch.Tensor] = []
+    query_state_items: List[torch.Tensor] = []
     trace_items: List[torch.Tensor] = []
     trace_timesteps: Optional[torch.Tensor] = None
 
@@ -700,6 +702,7 @@ def _sample_adapted_queries_for_tasks(
         gt_x0_items.append(query_batch['target_action'])
         query_xyz_items.append(query_batch['query_xyz'])
         query_valid_items.append(query_batch['query_valid'])
+        query_state_items.append(query_batch['query_state'])
         if denoise_trace is not None:
             trace_items.append(denoise_trace['x0_hat'])
             if trace_timesteps is None:
@@ -709,6 +712,7 @@ def _sample_adapted_queries_for_tasks(
     gt_x0_batch = torch.cat(gt_x0_items, dim=0)
     query_xyz_batch = torch.cat(query_xyz_items, dim=0)
     query_valid_batch = torch.cat(query_valid_items, dim=0)
+    query_state_batch = torch.cat(query_state_items, dim=0)
 
     trace_out = None
     if trace_items and trace_timesteps is not None:
@@ -716,7 +720,7 @@ def _sample_adapted_queries_for_tasks(
             'x0_hat': torch.cat(trace_items, dim=1),
             'timesteps': trace_timesteps,
         }
-    return pred_x0_batch, gt_x0_batch, query_xyz_batch, query_valid_batch, trace_out
+    return pred_x0_batch, gt_x0_batch, query_xyz_batch, query_valid_batch, query_state_batch, trace_out
 
 
 @torch.no_grad()
@@ -759,7 +763,7 @@ def _estimate_adapted_x0_mse(
         seed_cursor += 1
         if not task_batch:
             break
-        pred_x0, gt_x0, _, _, _ = _sample_adapted_queries_for_tasks(
+        pred_x0, gt_x0, _, _, _, _ = _sample_adapted_queries_for_tasks(
             policy=policy,
             loss_wrapper=loss_wrapper,
             tasks=task_batch,
@@ -1366,7 +1370,7 @@ def train(cfg: ConfigDict) -> None:
                 sample_mse_excluded = None
 
                 if sample_tasks:
-                    pred_x0, gt_x0, query_xyz, query_valid, denoise_trace = _sample_adapted_queries_for_tasks(
+                    pred_x0, gt_x0, query_xyz, query_valid, query_state, denoise_trace = _sample_adapted_queries_for_tasks(
                         policy=policy,
                         loss_wrapper=loss_wrapper,
                         tasks=sample_tasks,
@@ -1413,6 +1417,7 @@ def train(cfg: ConfigDict) -> None:
                         gt_x0_excluded,
                         query_xyz_excluded,
                         query_valid_excluded,
+                        query_state_excluded,
                         denoise_trace_excluded,
                     ) = _sample_adapted_queries_for_tasks(
                         policy=policy,
