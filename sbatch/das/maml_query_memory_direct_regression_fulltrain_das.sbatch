@@ -1,14 +1,14 @@
 #!/bin/bash
 #SBATCH --ntasks=1
 #SBATCH --nodes=1
-#SBATCH --job-name=query_mem_direct_fomaml
+#SBATCH --job-name=query_mem_direct_maml
 #SBATCH --partition=defq
-#SBATCH --gres=gpu:1
+#SBATCH --gres=gpu:2
 #SBATCH --mem=64G
 #SBATCH --cpus-per-task=8
-#SBATCH --time=2-00:00
-#SBATCH --output=/home/valperga/icil-rlbench/sbatch/das/logs/query_mem_direct_fomaml-%j.out
-#SBATCH --error=/home/valperga/icil-rlbench/sbatch/das/logs/query_mem_direct_fomaml-%j.err
+#SBATCH --time=00:10:00
+#SBATCH --output=/home/valperga/icil-rlbench/sbatch/das/logs/query_mem_direct_maml-%j.out
+#SBATCH --error=/home/valperga/icil-rlbench/sbatch/das/logs/query_mem_direct_maml-%j.err
 
 set -euo pipefail
 
@@ -29,26 +29,26 @@ cd /home/valperga/icil-rlbench
 
 source env_das.sh
 
-export WANDB_PROJECT="icil-query-memory-direct-fomaml"
+export WANDB_PROJECT="icil-query-memory-direct-maml"
 export WANDB_ENTITY="ricvalp"
 export WANDB_MODE="online"
 
 export PYTHONPATH=/home/valperga/icil-rlbench
 
 torchrun --standalone --nproc_per_node=1 \
-  icil/fomaml_query_memory_direct_regression_ddp.py \
-  --config=configs/fomaml_query_memory_direct_regression.py \
+  icil/maml_query_memory_direct_regression_ddp.py \
+  --config=configs/maml_query_memory_direct_regression.py \
   --config.data.task_sampling=variation_uniform \
   --config.data.task_sampling_alpha=0.5 \
   --config.train.num_steps=100000 \
-  --config.train.batch_size=2 \
+  --config.train.batch_size=8 \
   --config.train.weight_decay=1e-4 \
   --config.train.log_every=10 \
-  --config.train.ckpt_every=500 \
+  --config.train.ckpt_every=100 \
   --config.data.num_workers=4 \
   --config.data.pin_memory=True \
   --config.data.persistent_workers=True \
-  --config.maml.first_order=True \
+  --config.maml.first_order=False \
   --config.maml.inner_steps=2 \
   --config.maml.inner_lr=1e-2 \
   --config.maml.inner_lr_mode=fixed \
