@@ -109,19 +109,10 @@ def prepared_tasks_to_sharded_batch(
     per_device_batch: int,
     devices: Sequence[jax.Device],
 ) -> Any:
+    del devices
     host_batch = prepared_tasks_to_host_batch(prepared_tasks, inner_steps=inner_steps)
     host_batch = _reshape_for_devices(host_batch, int(num_devices), int(per_device_batch))
-
-    def _maybe_shard(x: Any) -> Any:
-        if not hasattr(x, 'shape'):
-            return x
-        if len(x.shape) < 2:
-            return x
-        if x.shape[:2] != (int(num_devices), int(per_device_batch)):
-            return x
-        return jax.device_put_sharded([x[i] for i in range(int(num_devices))], devices)
-
-    return jax.tree_util.tree_map(
-        _maybe_shard,
-        host_batch,
-    )
+    # pmap can consume host numpy arrays with a leading device axis directly.
+    # Keeping this as host data avoids deprecated device_put_sharded APIs and
+    # keeps the adapter version-agnostic across recent JAX releases.
+    return host_batch

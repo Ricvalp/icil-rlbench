@@ -19,6 +19,7 @@ def get_config():
     cfg.data.num_workers = 8
     cfg.data.pin_memory = False
     cfg.data.persistent_workers = True
+    cfg.data.prefetch_factor = 2
     cfg.data.task_sampling = 'variation_uniform'
     cfg.data.task_sampling_alpha = 0.5
 

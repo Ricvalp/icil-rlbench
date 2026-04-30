@@ -159,6 +159,9 @@ def train(cfg: ConfigDict) -> None:
 
     state_dim, action_dim = _infer_dims(store)
     num_points = _infer_num_points(store, use_rgb=use_rgb, use_mask_id=use_mask_id)
+    # Metadata probing may have opened h5py handles on the main process store.
+    # Clear them before the store is captured by spawned DataLoader workers.
+    store.close()
     compute_dtype = resolve_dtype(cfg.train.amp_dtype if _as_bool(getattr(cfg.train, 'use_amp', False)) else 'float32')
     model_cfg = build_model_config_from_raw(model_cfg_raw, state_dim=state_dim, action_dim=action_dim, compute_dtype=compute_dtype)
     model = QueryMemoryDirectRegressionModel(cfg=model_cfg)
@@ -214,12 +217,25 @@ def train(cfg: ConfigDict) -> None:
         use_mask_id=use_mask_id,
         load_rgb=use_rgb,
     )
+    num_workers = int(getattr(cfg.data, 'num_workers', 0))
+    persistent_workers = bool(getattr(cfg.data, 'persistent_workers', False)) and num_workers > 0
+    loader_kwargs: Dict[str, Any] = {
+        'batch_size': None,
+        'num_workers': num_workers,
+        'pin_memory': bool(getattr(cfg.data, 'pin_memory', False)),
+        'persistent_workers': persistent_workers,
+    }
+    if num_workers > 0:
+        # JAX is multithreaded; avoid forking worker processes after the runtime
+        # has initialized.
+        loader_kwargs['multiprocessing_context'] = 'spawn'
+        prefetch_factor = int(getattr(cfg.data, 'prefetch_factor', 2))
+        if prefetch_factor < 1:
+            raise ValueError(f'data.prefetch_factor must be >= 1 when num_workers > 0, got {prefetch_factor}.')
+        loader_kwargs['prefetch_factor'] = prefetch_factor
     loader = DataLoader(
         task_dataset,
-        batch_size=None,
-        num_workers=int(getattr(cfg.data, 'num_workers', 0)),
-        pin_memory=bool(getattr(cfg.data, 'pin_memory', False)),
-        persistent_workers=bool(getattr(cfg.data, 'persistent_workers', False)),
+        **loader_kwargs,
     )
 
     run_root = Path(str(cfg.output_parent_dir)).expanduser()
