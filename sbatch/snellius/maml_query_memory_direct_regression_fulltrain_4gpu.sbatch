@@ -4,7 +4,7 @@
 #SBATCH --error=/gpfs/home1/rvalperga/icil-rlbench/sbatch/snellius/logs/query_mem_direct_maml_4gpu.%j.err
 #SBATCH --partition=gpu_h100
 #SBATCH --gres=gpu:4
-#SBATCH --time=72:00:00
+#SBATCH --time=24:00:00
 
 set -euo pipefail
 
@@ -31,16 +31,16 @@ torchrun --standalone --nproc_per_node=4 \
   --config.data.task_sampling=variation_uniform \
   --config.data.task_sampling_alpha=0.5 \
   --config.train.num_steps=100000 \
-  --config.train.batch_size=2 \
+  --config.train.batch_size=8 \
   --config.train.weight_decay=1e-4 \
   --config.train.log_every=10 \
-  --config.train.ckpt_every=500 \
+  --config.train.ckpt_every=100 \
   --config.data.num_workers=4 \
   --config.data.pin_memory=True \
   --config.data.persistent_workers=True \
   --config.maml.first_order=False \
   --config.maml.inner_steps=2 \
-  --config.maml.inner_lr=1e-2 \
+  --config.maml.inner_lr=1e-1 \
   --config.maml.inner_lr_mode=fixed \
   --config.maml.outer_lr=1e-4 \
   --config.maml.max_grad_norm=1.0 \
