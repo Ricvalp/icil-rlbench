@@ -14,16 +14,23 @@ set -euo pipefail
 
 module load cuda12.6/toolkit
 
-if [ -f "${HOME}/miniconda3/bin/activate" ]; then
-  source "${HOME}/miniconda3/bin/activate"
-elif [ -f "${HOME}/miniforge3/bin/activate" ]; then
-  source "${HOME}/miniforge3/bin/activate"
+set +u
+if command -v conda >/dev/null 2>&1; then
+  eval "$(conda shell.bash hook)"
+elif [ -f "${HOME}/miniconda3/etc/profile.d/conda.sh" ]; then
+  source "${HOME}/miniconda3/etc/profile.d/conda.sh"
+elif [ -f "${HOME}/miniforge3/etc/profile.d/conda.sh" ]; then
+  source "${HOME}/miniforge3/etc/profile.d/conda.sh"
+elif [ -f "/home/valperga/miniconda3/etc/profile.d/conda.sh" ]; then
+  source "/home/valperga/miniconda3/etc/profile.d/conda.sh"
+elif [ -f "/home/valperga/miniforge3/etc/profile.d/conda.sh" ]; then
+  source "/home/valperga/miniforge3/etc/profile.d/conda.sh"
 else
-  echo "Could not find a conda activation script under ${HOME}/miniconda3 or ${HOME}/miniforge3." >&2
+  echo "Could not initialize conda. Checked PATH, ${HOME}/miniconda3, ${HOME}/miniforge3, /home/valperga/miniconda3, and /home/valperga/miniforge3." >&2
   exit 1
 fi
-
 conda activate icil-rlbench
+set -u
 
 cd /home/valperga/icil-rlbench
 
@@ -35,7 +42,7 @@ export WANDB_MODE="online"
 
 export PYTHONPATH=/home/valperga/icil-rlbench
 
-torchrun --standalone --nproc_per_node=1 \
+torchrun --standalone --nproc_per_node=2 \
   icil/fomaml_query_memory_direct_regression_ddp.py \
   --config=configs/fomaml_query_memory_direct_regression.py \
   --config.data.task_sampling=variation_uniform \
@@ -44,7 +51,7 @@ torchrun --standalone --nproc_per_node=1 \
   --config.train.batch_size=8 \
   --config.train.weight_decay=1e-4 \
   --config.train.log_every=10 \
-  --config.train.ckpt_every=500 \
+  --config.train.ckpt_every=100 \
   --config.data.num_workers=4 \
   --config.data.pin_memory=True \
   --config.data.persistent_workers=True \
