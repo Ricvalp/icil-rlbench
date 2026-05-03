@@ -1,0 +1,704 @@
+
+CODEx IMPLEMENTATION BRIEF
+==========================
+
+Repository: Ricvalp/icil-rlbench
+Target subpackage: icil_jax_query_memory
+Feature name: GradMem-style WRITE/READ decoder with shared decoder backbone and mode flag
+Output: implement in the existing repository, preserving the current dataset/dataloader and training structure as much as possible.
+
+Context
+-------
+This repo already contains a JAX/Flax GradMem-style query-memory experiment under:
+
+    icil_jax_query_memory/
+
+The current code has:
+- a learned memory token initialization (`memory_token_init`);
+- a query point-cloud encoder;
+- a direct regression decoder;
+- MAML/FOMAML inner-loop adaptation of memory tokens using an imitation learning loss;
+- train scripts:
+    icil_jax_query_memory/maml_query_memory_direct_regression.py
+    icil_jax_query_memory/fomaml_query_memory_direct_regression.py
+
+The current architecture in the PyTorch ICIL codebase uses a two-context decoder:
+- query/current-observation tokens;
+- support/demo tokens;
+- action decoder blocks with:
+    action self-attention
+    query cross-attention
+    support/memory cross-attention
+    MLP.
+
+For this new implementation, keep the same conceptual interface:
+    ctx_query   = query/current observation tokens OR WRITE query tokens
+    ctx_support = memory tokens
+    decoder     = shared decoder backbone
+
+But change the GradMem-style training so that WRITE and READ are explicitly different modes.
+
+High-level goal
+---------------
+Implement a GradMem-style policy where memory tokens are written by gradient descent from support demonstrations.
+
+The key idea is:
+
+WRITE phase:
+    learned memory tokens M
+    + dummy/demo-time WRITE query tokens
+    -> reconstruct support action chunks
+    -> update M by gradient descent on L1/Huber action loss
+
+READ phase:
+    adapted memory tokens M'
+    + real query/current point-cloud tokens
+    -> predict query action chunk
+    -> outer/meta loss
+
+Crucial constraint:
+    During WRITE, the model must NOT see support point-cloud tokens through the query/current-observation encoder.
+    The WRITE loss must force memory to store support information.
+    Do not allow the decoder to solve WRITE from support observations.
+
+Recommended architecture:
+    Use one shared decoder backbone for both WRITE and READ.
+    Use a mode flag: mode = "write" or mode = "read".
+    Start with separate output heads:
+        write_action_out
+        read_action_out
+    but keep all transformer decoder blocks shared.
+
+Rationale:
+    - Sharing the decoder backbone teaches memory tokens to live in the same representation space used at READ time.
+    - Separate heads make training more stable because the WRITE objective is a reconstruction proxy, while READ is the actual control objective.
+    - A completely separate WRITE decoder is not recommended, because memory may become useful for WRITE but not READ.
+
+Implementation scope
+--------------------
+Implement this in JAX/Flax under icil_jax_query_memory.
+
+Do not implement a new dataset from scratch.
+Reuse the existing dataset and dataloader. The data pipeline already produces inner/support batches and query batches for MAML/FOMAML. Extend it only if necessary to include demo/time metadata for WRITE query tokens.
+
+Do not modify unrelated PyTorch code unless needed for parity/configs.
+
+Do not change the RLBench cache format unless strictly necessary.
+
+Files to inspect first
+----------------------
+Inspect and reuse the following files:
+
+1. icil_jax_query_memory/models/query_memory_direct_regression.py
+   Current model wrapper:
+   - encodes real query point clouds;
+   - initializes/broadcasts learned memory tokens;
+   - calls DirectDecoderCore.
+
+2. icil_jax_query_memory/models/direct_decoder.py
+   Current decoder:
+   - DirectDecoderConfig
+   - DirectDecoderCore
+   - DirectChunkBlockTwoCtx
+   - query/support cross-attention
+   - current single action_out head.
+
+3. icil_jax_query_memory/train/step.py
+   Current MAML/FOMAML training:
+   - _batch_loss
+   - _adapt_one_task
+   - _task_meta_objective
+   - create_train_step
+   - create_adapt_fn
+   - create_predict_fn.
+
+4. icil_jax_query_memory/train/config.py
+   Current meta config:
+   - inner_steps
+   - inner_lr
+   - first_order
+   - max_grad_norm.
+
+5. icil_jax_query_memory/data/*
+   Existing support/query batch construction. Reuse as much as possible.
+
+Architecture to implement
+=========================
+
+1. Extend DirectDecoderConfig
+-----------------------------
+Add config fields to icil_jax_query_memory/models/direct_decoder.py.
+
+Suggested fields:
+
+    separate_write_read_heads: bool = True
+    shared_write_read_head: bool = False
+
+    # WRITE query token construction
+    write_num_query_tokens: int = 4
+    write_use_demo_id_embed: bool = True
+    write_use_time_embed: bool = True
+    write_max_demo_id: int = 16
+    write_max_time_bins: int = 512
+    write_time_embed_type: str = "continuous_sinusoidal"  # or "learned"
+    write_query_mlp_mult: int = 2
+
+    # Mode embeddings
+    use_decoder_mode_embed: bool = True
+
+    # Memory stabilization
+    memory_layer_norm_after_update: bool = True
+    memory_update_clip_norm: float = 1.0
+
+    # Loss weights
+    action_loss_type: str = "l1"  # "l1", "mse", "huber"
+    position_loss_weight: float = 1.0
+    rotation_loss_weight: float = 1.0
+    gripper_loss_weight: float = 1.0
+    chunk_decay: float = 0.0  # 0 means uniform over horizon
+
+Do not remove the old fields. Preserve backwards compatibility.
+
+2. Add WRITE query token module
+-------------------------------
+In direct_decoder.py, implement a small module that creates WRITE query tokens.
+
+Suggested class:
+
+    class WriteQueryTokenBuilder(nn.Module):
+        cfg: DirectDecoderConfig
+
+        def __call__(
+            self,
+            *,
+            batch_size: int,
+            demo_id: Optional[jnp.ndarray],      # [B] or [B, Q]
+            chunk_start: Optional[jnp.ndarray],  # [B] or [B, Q]
+            train: bool,
+        ) -> tuple[jnp.ndarray, jnp.ndarray]:
+            ...
+            return write_query_tokens, write_query_mask
+
+Output:
+    write_query_tokens: [B, write_num_query_tokens, d_model]
+    write_query_mask:   [B, write_num_query_tokens] bool
+
+Token content:
+    - learned base WRITE query tokens: [write_num_query_tokens, d_model]
+    - optional demo-id embedding, broadcast/add to all WRITE query tokens
+    - optional time/chunk-start embedding, broadcast/add to all WRITE query tokens
+    - optional mode embedding for "write"
+
+If demo_id/chunk_start are missing, the module should still work by using zeros.
+This is important for backward compatibility and for quick debugging.
+
+Continuous time embedding:
+    If chunk_start is continuous or integer, normalize or bucket it.
+    Use a simple sinusoidal embedding followed by an MLP, similar to the existing trajectory time embedding style where available.
+    Keep implementation robust to missing metadata.
+
+Important:
+    WRITE query tokens are abstract index/time tokens.
+    They are not support point-cloud tokens.
+    They are the only ctx_query given to the decoder in WRITE mode.
+
+3. Modify DirectDecoderCore to support mode
+-------------------------------------------
+Current DirectDecoderCore signature roughly:
+
+    __call__(
+        query_tokens,
+        query_mask,
+        support_tokens,
+        support_mask,
+        train,
+    ) -> action_pred
+
+Change to:
+
+    __call__(
+        *,
+        query_tokens: Optional[jnp.ndarray],
+        query_mask: Optional[jnp.ndarray],
+        support_tokens: jnp.ndarray,
+        support_mask: Optional[jnp.ndarray],
+        train: bool,
+        mode: str = "read",
+        write_demo_id: Optional[jnp.ndarray] = None,
+        write_chunk_start: Optional[jnp.ndarray] = None,
+    ) -> jnp.ndarray
+
+Behavior:
+
+    if mode == "read":
+        - query_tokens must be real query/current-observation tokens.
+        - query_mask is real query mask.
+        - support_tokens are memory tokens M or M'.
+        - run shared decoder blocks.
+        - output with read_action_out unless shared_write_read_head=True.
+
+    if mode == "write":
+        - ignore real query point tokens.
+        - build query_tokens internally with WriteQueryTokenBuilder.
+        - query_tokens = write_query_tokens.
+        - query_mask = write_query_mask.
+        - support_tokens are memory tokens M.
+        - run the SAME shared decoder blocks.
+        - output with write_action_out unless shared_write_read_head=True.
+
+Do not create separate WRITE decoder blocks.
+The transformer blocks must be shared.
+
+Output heads:
+    If separate_write_read_heads=True:
+        mode == "read"  -> Dense(action_dim, name="read_action_out")
+        mode == "write" -> Dense(action_dim, name="write_action_out")
+    If separate_write_read_heads=False or shared_write_read_head=True:
+        use a single Dense(action_dim, name="action_out") for both.
+
+Use a mode embedding:
+    If use_decoder_mode_embed=True, add a learned mode embedding to the context conditioner or action queries.
+    Minimal safe version:
+        - learn mode_embed_write: [d]
+        - learn mode_embed_read: [d]
+        - add chosen mode embedding to cond_vec returned by PooledContextConditioner.
+    This helps the shared decoder distinguish WRITE reconstruction from READ control.
+
+4. Modify QueryMemoryDirectRegressionModel
+------------------------------------------
+In query_memory_direct_regression.py, extend __call__ with mode support.
+
+Suggested signature:
+
+    def __call__(
+        self,
+        *,
+        query_xyz: Optional[jnp.ndarray] = None,
+        query_state: Optional[jnp.ndarray] = None,
+        query_valid: Optional[jnp.ndarray] = None,
+        query_rgb: Optional[jnp.ndarray] = None,
+        query_mask_id: Optional[jnp.ndarray] = None,
+        memory_tokens: Optional[jnp.ndarray] = None,
+        mode: str = "read",
+        write_demo_id: Optional[jnp.ndarray] = None,
+        write_chunk_start: Optional[jnp.ndarray] = None,
+        train: bool = False,
+    ) -> jnp.ndarray:
+
+Behavior:
+
+    READ:
+        - require query_xyz and query_state.
+        - encode query point cloud with SimpleQueryPointEncoder.
+        - pass real query tokens to decoder with mode="read".
+
+    WRITE:
+        - do not encode support point clouds.
+        - do not require query_xyz/query_state.
+        - pass query_tokens=None to decoder.
+        - decoder builds WRITE query tokens from write_demo_id / write_chunk_start.
+        - pass memory tokens as support_tokens.
+        - call decoder with mode="write".
+
+Memory:
+    Keep existing learned memory_token_init.
+    If memory_tokens is None:
+        broadcast memory_token_init to batch size.
+    In WRITE mode, infer batch size from:
+        - memory_tokens if provided;
+        - write_demo_id if provided;
+        - write_chunk_start if provided;
+        - else default to 1 or raise a clear error.
+    In READ mode, infer batch size from query_xyz.
+
+Support/memory mask:
+    support_mask = ones([B, M_mem], bool)
+
+Important:
+    In WRITE mode, do not pass any support/demo point-cloud observations through SimpleQueryPointEncoder.
+    The WRITE loss must update memory from reconstruction only.
+
+5. Add loss functions: read_loss and write_loss
+===============================================
+
+Modify icil_jax_query_memory/train/step.py.
+
+Current _batch_loss calls the model once and computes L1/MSE against batch["target_action"].
+Replace or extend it with separate functions.
+
+5.1 READ loss
+-------------
+Implement:
+
+    def _read_loss(params, *, model, batch, memory_tokens, train):
+        pred = model.apply(
+            {'params': params},
+            query_xyz=batch['query_xyz'],
+            query_state=batch['query_state'],
+            query_valid=batch.get('query_valid', None),
+            query_rgb=batch.get('query_rgb', None),
+            query_mask_id=batch.get('query_mask_id', None),
+            memory_tokens=memory_tokens,
+            mode='read',
+            train=train,
+        )
+        return action_chunk_loss(pred, batch['target_action'], cfg)
+
+READ uses real query/current observation.
+
+5.2 WRITE loss
+--------------
+Implement:
+
+    def _write_loss(params, *, model, batch, memory_tokens, train):
+        pred = model.apply(
+            {'params': params},
+            memory_tokens=memory_tokens,
+            mode='write',
+            write_demo_id=batch.get('demo_id', batch.get('support_demo_id', None)),
+            write_chunk_start=batch.get('chunk_start', batch.get('support_chunk_start', None)),
+            train=train,
+        )
+        return action_chunk_loss(pred, batch['target_action'], cfg)
+
+WRITE does NOT use query_xyz/query_state/query_rgb.
+It only uses:
+    - memory tokens;
+    - optional demo/time metadata;
+    - target support action chunk.
+
+If the existing inner/support batch only has fields:
+    query_xyz, query_state, target_action
+then ignore query_xyz/query_state in WRITE and use target_action as the reconstruction target.
+If demo/time metadata is absent, use zero/default demo/time embeddings.
+
+5.3 Weighted action-chunk loss
+------------------------------
+Implement a shared helper:
+
+    def _action_chunk_loss(pred, target, *, loss_type, position_weight, rotation_weight, gripper_weight, chunk_decay):
+
+Action dimension is usually 8.
+Use robust defaults:
+    - if action_dim >= 3: first 3 dims = xyz position
+    - if action_dim > 4: middle dims = rotation / continuous controls
+    - last dim may be gripper if applicable
+But do not hard-code in a way that breaks arbitrary action_dim. If unsure, implement uniform L1 first and leave per-dim weighting optional.
+
+Chunk weighting:
+    If chunk_decay > 0:
+        weights[h] = exp(-chunk_decay * h)
+        normalize by mean/total
+    Else uniform.
+
+Loss types:
+    l1:    mean(abs(pred-target))
+    mse:   mean(square(pred-target))
+    huber: optax.huber_loss or manual smooth L1.
+
+6. Modify inner adaptation
+==========================
+
+Current _adapt_one_task adapts memory using _batch_loss on task_inner.
+
+Change it so inner adaptation always uses WRITE loss:
+
+    support_loss_fn(mem):
+        return _write_loss(params, model=model, batch=step_batch, memory_tokens=mem, train=True)
+
+Then:
+    grad = grad_M support_loss
+    if first_order: grad = stop_gradient(grad)
+    clip grad
+    M_next = M - inner_lr * grad
+    optionally apply LayerNorm to M_next
+    scan over inner steps
+
+Memory LayerNorm:
+    Add helper:
+
+        _memory_layer_norm(mem, eps=1e-5)
+
+    It can be parameter-free:
+        mean = mem.mean(axis=-1, keepdims=True)
+        var = ((mem-mean)**2).mean(axis=-1, keepdims=True)
+        mem = (mem-mean) / sqrt(var+eps)
+
+    Apply after each memory update if cfg says so.
+    Do not introduce learnable LayerNorm params inside the train step.
+
+FOMAML detail:
+    Current code stops gradient on grad for first_order. Keep that.
+    Do NOT detach/stop-gradient the updated memory itself.
+    Correct:
+        grad = stop_gradient(grad)
+        M_next = M - lr * grad
+    Incorrect:
+        M_next = stop_gradient(M - lr * grad)
+
+MAML detail:
+    For full MAML, do not stop-gradient grad. Let outer loss backprop through the WRITE update.
+
+7. Modify meta objective
+========================
+
+Current _task_meta_objective:
+    adapt on task_inner
+    compute meta_loss on task_query
+
+Keep this structure, but:
+    - adapt with WRITE loss;
+    - compute query/meta loss with READ loss.
+
+Pseudo-code:
+
+    adapted_memory, inner_loss_mean, inner_grad_mean, write_before, write_after = _adapt_one_task(...)
+
+    read_loss_before = _read_loss(params, model, batch=task_query, memory_tokens=params['memory_token_init'], train=True)
+    read_loss_after  = _read_loss(params, model, batch=task_query, memory_tokens=adapted_memory, train=True)
+
+    meta_loss = read_loss_after
+
+Optional:
+    If cfg.use_read_improvement_margin:
+        margin_loss = max(0, margin + read_loss_after - read_loss_before)
+        meta_loss = meta_loss + margin_weight * margin_loss
+
+Do not enable margin by default. Add config, but default false.
+
+8. Diagnostics and logging
+==========================
+
+Add the following metrics in create_train_step:
+
+Required:
+    meta_loss
+    read_loss_after
+    read_loss_before
+    inner_write_loss_mean
+    inner_memory_grad_norm
+    memory_delta_norm
+    memory_relative_delta_norm
+
+Strongly recommended:
+    write_loss_before_first_step
+    write_loss_after_last_step
+    read_improvement = read_loss_before - read_loss_after
+    action_output_delta = mean(abs(pred_read_after - pred_read_before))
+
+To compute action_output_delta, optionally call the model twice:
+    pred_before = READ with M0
+    pred_after  = READ with M'
+    output_delta = mean(abs(pred_after - pred_before))
+
+If this is too expensive, guard by config:
+    log_output_delta: bool = False
+
+Acceptance criteria:
+    - write_loss_after should be lower than write_loss_before after adaptation.
+    - memory_delta_norm should not be zero.
+    - read_loss_after should eventually become lower than read_loss_before.
+    - output_delta should be nonzero if memory influences the policy.
+
+9. Adapt and predict functions
+==============================
+
+Update create_adapt_fn:
+    - use WRITE loss.
+    - input inner_batch is support WRITE batch.
+    - return adapted memory.
+
+Update create_adapt_with_stats_fn:
+    - report write losses and grad norms per step.
+
+Update create_predict_fn:
+    - use READ mode.
+    - same as existing predict, but pass mode='read'.
+
+Add optional create_write_predict_fn for debugging:
+    - mode='write'
+    - predict support action chunks from memory and write metadata.
+
+10. Dataset/dataloader requirements
+===================================
+
+The dataset/dataloader already exists. Do not rewrite it.
+
+But for WRITE query tokens, add metadata if available:
+    - support_demo_id / demo_id: integer in [0, K)
+    - support_chunk_start / chunk_start: integer or float
+    - optional normalized time tau
+
+If adding this is simple, do it. If not, implement model and train step robustly with missing metadata:
+    - demo_id defaults to zero
+    - chunk_start defaults to zero
+
+Inner/support batch:
+    Must include:
+        target_action: [B_inner, H, action_dim]
+    May include:
+        demo_id
+        chunk_start
+        query_xyz/query_state/query_rgb
+    WRITE must ignore support query_xyz/query_state.
+
+Query/read batch:
+    Must include:
+        query_xyz
+        query_state
+        query_valid
+        query_rgb optionally
+        target_action
+
+11. Config files and scripts
+============================
+
+Add new config files rather than overwriting old ones.
+
+Suggested configs:
+    configs/jax_maml_query_memory_write_read_direct_regression.py
+    configs/jax_fomaml_query_memory_write_read_direct_regression.py
+
+Suggested scripts:
+    icil_jax_query_memory/maml_query_memory_write_read_direct_regression.py
+    icil_jax_query_memory/fomaml_query_memory_write_read_direct_regression.py
+
+These scripts should mirror the existing direct regression scripts but point to the new configs.
+
+New config defaults:
+    inner_steps = 1
+    inner_lr = 1e-3 or 3e-3 for memory tokens
+    first_order = false for MAML script, true for FOMAML script
+    max_grad_norm = 1.0
+    decoder.separate_write_read_heads = true
+    decoder.use_decoder_mode_embed = true
+    decoder.memory_num_tokens = 64 or 128
+    decoder.write_num_query_tokens = 4
+    decoder.loss_type / action_loss_type = "l1"
+    decoder.chunk_decay = 0.0 initially
+    memory_layer_norm_after_update = true
+
+Keep old configs working.
+
+12. Tests to add
+================
+
+Add lightweight tests or debug scripts if the repo has testing infrastructure.
+
+Minimum checks:
+    1. Model initializes in READ mode.
+    2. Model initializes in WRITE mode without query_xyz/query_state.
+    3. WRITE output shape is [B, H, action_dim].
+    4. READ output shape is [B, H, action_dim].
+    5. One train_step runs with pmap or jit on a small synthetic batch.
+    6. FOMAML update does not stop-gradient the updated memory.
+    7. Missing demo_id/chunk_start does not crash.
+    8. Existing old direct-regression MAML/FOMAML configs still run.
+
+Suggested synthetic batch:
+    task_inner:
+        target_action: [num_inner_steps, B_inner, H, action_dim]
+        demo_id: [num_inner_steps, B_inner] optional
+        chunk_start: [num_inner_steps, B_inner] optional
+    task_query:
+        query_xyz: [...]
+        query_state: [...]
+        query_valid: [...]
+        target_action: [B_query, H, action_dim]
+
+13. Debugging protocol to support
+=================================
+
+After implementation, user should be able to run:
+
+A. 0 vs 1 vs 5 WRITE steps:
+    inner_steps = 0, 1, 5
+
+B. Memory gradient diagnostics:
+    log inner_memory_grad_norm, memory_delta_norm, read_before/read_after.
+
+C. WRITE-only sanity:
+    Check whether WRITE loss decreases on support reconstruction.
+
+D. READ sensitivity:
+    Compare READ with M0 and M' on the same query.
+
+E. Correct vs wrong memory:
+    Optional later:
+        write M+ from correct support
+        write M- from wrong support
+        compare read loss/action outputs.
+    Do not implement this unless easy; leave as future diagnostic hook.
+
+14. Important failure modes to avoid
+====================================
+
+1. Do not let WRITE see support point clouds.
+   WRITE mode must not call SimpleQueryPointEncoder on support observations.
+
+2. Do not use separate decoder blocks for WRITE and READ.
+   Use one shared decoder backbone. Only heads can differ.
+
+3. Do not detach the adapted memory in FOMAML.
+   Stop-gradient the inner gradient if first_order=True, not the memory update result.
+
+4. Do not break old scripts/configs.
+
+5. Do not assume demo_id/chunk_start exist.
+   Make metadata optional.
+
+6. Do not use diffusion in this implementation.
+   This feature is direct action chunk regression only.
+
+7. Do not change the data loading contract more than necessary.
+
+15. Expected model behavior
+===========================
+
+This implementation is successful if:
+    - WRITE loss decreases after inner adaptation.
+    - Memory gradients are nonzero and not exploding.
+    - READ output changes after memory update.
+    - READ loss after update can become lower than before update.
+    - The implementation can reproduce existing no-encoder memory MAML/FOMAML behavior when mode='read' is used only, but now has a more GradMem-like WRITE/READ split.
+
+Research interpretation:
+    This is not meant to replace the existing encoder-based ICIL model.
+    It is a diagnostic and experimental GradMem-style pathway:
+        support demos -> gradient descent writes memory
+        query observation + written memory -> action chunk
+
+Summary of the desired computation
+==================================
+
+For each task in a meta-batch:
+
+    M0 = learned memory_token_init
+
+    for inner step:
+        write_batch = support chunks
+        pred_support = model(mode="write", memory_tokens=M, demo_id, chunk_start)
+        L_write = L1(pred_support, support_action_chunk)
+        M = M - inner_lr * grad_M L_write
+        M = optional_layer_norm(M)
+
+    read_batch = held-out query
+    pred_query = model(mode="read", query_xyz, query_state, memory_tokens=M)
+    L_read = L1(pred_query, query_action_chunk)
+
+    outer optimizer updates:
+        - decoder parameters
+        - query encoder parameters
+        - memory_token_init
+        - WRITE/READ heads
+        - write query token embeddings
+        - mode embeddings
+        - all other trainable model parameters
+
+At test time:
+    - freeze model parameters
+    - initialize M0
+    - run WRITE updates on support demos
+    - run READ prediction on query observations with adapted M
+
+End of prompt.

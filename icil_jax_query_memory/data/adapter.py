@@ -8,7 +8,14 @@ import torch
 
 
 _MANDATORY_QUERY_KEYS = ('query_xyz', 'query_state', 'query_valid', 'target_action')
-_OPTIONAL_QUERY_KEYS = ('query_rgb', 'query_mask_id')
+_OPTIONAL_QUERY_KEYS = (
+    'query_rgb',
+    'query_mask_id',
+    'demo_id',
+    'support_demo_id',
+    'chunk_start',
+    'support_chunk_start',
+)
 
 
 def _to_numpy(value: Any) -> Any:

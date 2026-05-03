@@ -1,0 +1,619 @@
+Codex prompt: implement Meta-World imitation-learning data generation and loading in icil-rlbench
+============================================================================================
+
+Context
+-------
+You are working in the repository `Ricvalp/icil-rlbench`.
+
+The repository already contains two relevant code paths:
+
+1. The main PyTorch ICIL/RLBench path under `icil/`.
+   Relevant existing modules include:
+   - `icil/datasets/in_context_imitation_learning/icil_datasets.py`
+   - `icil/models/maml/query_memory_tasks.py`
+   - `icil/models/maml/memory_core.py`
+   - `icil/pretrain_*`, `icil/maml_*`, `icil/fomaml_*` scripts.
+
+2. The JAX query-memory path under `icil_jax_query_memory/`.
+   This is the first intended consumer for the new Meta-World data pipeline.
+   Relevant existing modules include:
+   - `icil_jax_query_memory/data/adapter.py`
+   - `icil_jax_query_memory/models/query_memory_direct_regression.py`
+   - `icil_jax_query_memory/models/direct_decoder.py`
+   - `icil_jax_query_memory/train/runner.py`
+   - `icil_jax_query_memory/train/step.py`
+   - `icil_jax_query_memory/fomaml_query_memory_direct_regression.py`
+   - `icil_jax_query_memory/maml_query_memory_direct_regression.py`
+
+Important existing behavior
+---------------------------
+The JAX runner currently relies on the RLBench cached dataset infrastructure. It builds tasks using:
+
+    QueryMemoryTaskBuilder
+    PreparedQueryMemoryTaskBatchIterable
+
+from:
+
+    icil.models.maml.query_memory_tasks
+
+The prepared JAX host batch expected by `icil_jax_query_memory/data/adapter.py` currently contains:
+
+    inner:
+        query_xyz
+        query_state
+        query_valid
+        target_action
+        optional query_rgb
+        optional query_mask_id
+
+    query:
+        query_xyz
+        query_state
+        query_valid
+        target_action
+        optional query_rgb
+        optional query_mask_id
+
+    meta:
+        support_ids
+        query_episode_id
+        vidx
+
+For Meta-World we will not use point clouds. The first goal is to test GradMem-style and MAML/FOMAML-style memory adaptation in a low-dimensional state setting. This should remove RLBench perception and point-cloud tokenization from the problem.
+
+High-level goal
+---------------
+Implement a Meta-World data generation and loading pipeline for imitation learning and in-context/meta-learning experiments.
+
+For now, implement only:
+
+1. Expert demonstration generation for Meta-World.
+2. HDF5 cache writing.
+3. HDF5 cache reading.
+4. Dataset/task sampling compatible with the existing query-memory training style.
+5. Basic inspection/debug scripts.
+
+Do not implement a new training method yet. The training setup will reuse the existing JAX query-memory GradMem/MAML/FOMAML path first, then later a PyTorch encoder-based path.
+
+Scientific purpose
+------------------
+This Meta-World pipeline is a diagnostic benchmark for the following question:
+
+    Can gradient descent write useful task information into memory tokens from support trajectories?
+
+This is different from the RLBench point-cloud work. In RLBench, the model has to solve point-cloud perception, object localization, task inference, and action prediction. In Meta-World, we want a low-dimensional control setting where we can test GradMem-style memory writing with fewer confounders.
+
+Meta-World observations
+-----------------------
+Use low-dimensional Meta-World observations, not images and not point clouds.
+
+Store the raw environment observation, but expose filtered variants for the model.
+
+Required stored arrays per episode:
+
+    obs_raw:        [T, obs_raw_dim]
+    obs_model:      [T, obs_model_dim]
+    actions:        [T, action_dim]
+    rewards:        [T]
+    success:        [T] or [T, 1]
+    done:           [T]
+    trunc:          [T]
+    task_name:      string metadata
+    task_index:     int metadata
+    env_id:         string metadata
+    seed:           int metadata
+    episode_id:     int metadata
+
+Recommended observation variants to store or derive:
+
+    obs_raw
+        The exact observation returned by Meta-World.
+
+    obs_no_task
+        Observation with any one-hot task id removed.
+
+    obs_no_task_no_goal
+        Observation with task id and explicit goal position removed.
+        This should be the default `model_obs` for GradMem/ICIL experiments.
+
+    obs_positions_only_no_goal
+        A stricter diagnostic variant. Keep end-effector/object state fields needed for control, but remove explicit goal/task fields.
+
+Why remove goals and task IDs?
+------------------------------
+The purpose is to make the support demonstrations define the task. If the query observation contains a task ID or explicit goal vector, the query can solve the task without support. That defeats the point of GradMem-style memory writing.
+
+Use Meta-World ML-style benchmarks when possible
+-----------------------------------------------
+Prefer ML-style Meta-World benchmarks over MT-style benchmarks for the memory-learning diagnostic.
+
+Rationale:
+- MT10/MT50 style settings can include explicit task IDs.
+- ML1/ML10/ML45 style settings are closer to meta-learning and adaptation.
+
+Implementation must still be configurable:
+
+    benchmark = "ML1" | "ML10" | "ML45" | "MT10" | "MT50" | "custom"
+    task_names = optional list[str]
+    train_or_test = "train" | "test" where applicable
+    remove_task_id = True by default
+    remove_goal = True by default
+
+If task IDs are present in a Meta-World observation, store them only as metadata and do not include them in `model_obs` unless the config explicitly requests it.
+
+Directory structure to add
+--------------------------
+Add a Meta-World data package. Suggested structure:
+
+    icil_metaworld/
+        __init__.py
+        data/
+            __init__.py
+            generate_metaworld_expert_cache.py
+            metaworld_cache.py
+            metaworld_task_builder.py
+            metaworld_jax_adapter.py
+            inspect_metaworld_cache.py
+            observation_filter.py
+            scripted_policies.py
+        configs/
+            generate_metaworld_cache.py
+            jax_metaworld_fomaml_query_memory_direct_regression.py
+            jax_metaworld_maml_query_memory_direct_regression.py
+
+Alternatively, if you prefer to keep everything under existing namespaces:
+
+    icil_jax_query_memory/data/metaworld_*.py
+    icil/datasets/metaworld_*.py
+
+But keep the implementation clean and reusable. The pipeline should be usable by both the JAX no-support-encoder path and the future PyTorch encoder-based path.
+
+Data generation script
+----------------------
+Implement:
+
+    python -m icil_metaworld.data.generate_metaworld_expert_cache \
+        --config=icil_metaworld/configs/generate_metaworld_cache.py
+
+or the equivalent module path if using `icil_jax_query_memory/data`.
+
+The generator must:
+
+1. Instantiate Meta-World benchmark/task(s).
+2. Load the corresponding scripted policy when available.
+3. Roll out episodes.
+4. Keep successful demonstrations by default.
+5. Save to an HDF5 cache.
+6. Write an index JSON for quick lookup.
+7. Be deterministic under a seed.
+8. Support multiple tasks and task instances.
+9. Support per-task/per-variation episode counts.
+10. Store enough metadata to reconstruct task splits and sample support/query episodes.
+
+Required generator config fields
+--------------------------------
+Use ml_collections ConfigDict if consistent with the rest of the repo.
+
+Suggested fields:
+
+    cfg.seed: int
+    cfg.output.cache_root: str
+    cfg.output.overwrite: bool
+
+    cfg.metaworld.benchmark: str       # ML1, ML10, ML45, MT10, MT50, custom
+    cfg.metaworld.task_names: tuple[str, ...]
+    cfg.metaworld.train_or_test: str   # train/test where applicable
+    cfg.metaworld.num_task_instances_per_task: int
+    cfg.metaworld.num_successful_episodes_per_instance: int
+    cfg.metaworld.max_attempts_per_instance: int
+    cfg.metaworld.max_path_length: int
+    cfg.metaworld.render: bool = False
+
+    cfg.obs.remove_task_id: bool = True
+    cfg.obs.remove_goal: bool = True
+    cfg.obs.variant: str = "no_task_no_goal"
+    cfg.obs.normalize: bool = False
+
+    cfg.action.store_raw_action: bool = True
+    cfg.action.clip: bool = False
+
+    cfg.debug.limit_tasks: int = 0
+    cfg.debug.limit_instances: int = 0
+    cfg.debug.limit_episodes: int = 0
+
+Scripted policies
+-----------------
+Use Meta-World's scripted policies if available. Implement a small wrapper that maps task names to the correct policy class.
+
+The code should handle both old and current Meta-World APIs:
+
+    obs, info = env.reset(...)
+    obs, reward, terminated, truncated, info = env.step(action)
+
+and older gym-style APIs if necessary.
+
+If a scripted policy is missing for a task, the generator should either:
+- skip that task with a clear warning, or
+- raise if `cfg.require_scripted_policy=True`.
+
+HDF5 layout
+-----------
+Use one HDF5 file per cache or one file per task. Prefer a simple global file first.
+
+Suggested HDF5 layout:
+
+    /episodes/{global_episode_id}/obs_raw          float32 [T, obs_raw_dim]
+    /episodes/{global_episode_id}/obs_model        float32 [T, obs_model_dim]
+    /episodes/{global_episode_id}/actions          float32 [T, action_dim]
+    /episodes/{global_episode_id}/rewards          float32 [T]
+    /episodes/{global_episode_id}/success          bool or uint8 [T]
+    /episodes/{global_episode_id}/terminated       bool or uint8 [T]
+    /episodes/{global_episode_id}/truncated        bool or uint8 [T]
+
+Attributes per episode:
+
+    task_name
+    task_index
+    task_instance_id
+    seed
+    success_final
+    length
+    env_name
+    benchmark
+
+Global metadata:
+
+    obs_raw_dim
+    obs_model_dim
+    action_dim
+    observation_variant
+    remove_task_id
+    remove_goal
+    metaworld_version if available
+    generated_at
+
+Index JSON
+----------
+Write:
+
+    index.json
+
+with at least:
+
+    {
+      "tasks": {
+        "button-press-v2": {
+          "task_index": 0,
+          "instances": {
+            "0": [episode_ids...],
+            "1": [episode_ids...]
+          }
+        }
+      },
+      "episodes": {
+        "0": {
+          "task_name": "...",
+          "task_index": 0,
+          "task_instance_id": 0,
+          "length": 123,
+          "success_final": true
+        }
+      }
+    }
+
+Cache reader
+------------
+Implement a class analogous in spirit to the RLBench cache store used by the current repo.
+
+Suggested class:
+
+    MetaWorldEpisodeStore
+
+Required methods:
+
+    list_task_ids() -> np.ndarray or list[int]
+    list_task_names() -> list[str]
+    list_episode_ids(task_id_or_name, task_instance_id=None) -> np.ndarray
+    episode_length(task_id_or_name, episode_id) -> int
+    infer_dims() -> tuple[obs_dim, action_dim]
+    load_episode_slices(task_id_or_name, episode_id, t_idx, load_full_traj=False) -> dict
+    close()
+
+`load_episode_slices` should return:
+
+    obs_model: [len(t_idx), obs_dim]
+    action:    [len(t_idx), action_dim]
+    success:   [len(t_idx)] optional
+
+If `load_full_traj=True`, return full arrays for the episode.
+
+Task builder for query-memory MAML/FOMAML
+-----------------------------------------
+Implement a Meta-World analogue of `QueryMemoryTaskBuilder`.
+
+Suggested classes:
+
+    MetaWorldICILConfig
+    MetaWorldMAMLTaskSpec
+    MetaWorldQueryMemoryTaskBuilder
+    PreparedMetaWorldQueryMemoryTaskBatchIterable
+
+The builder should produce the same conceptual structure as the RLBench query-memory task builder:
+
+    prepared_task = {
+        "task": task_spec,
+        "support_ids": [...],
+        "query_episode_id": int,
+        "inner_batches": [...],
+        "query_batch": {...},
+    }
+
+For JAX compatibility, the inner/query batch dictionaries should contain keys compatible with `icil_jax_query_memory/data/adapter.py`.
+
+Because Meta-World is low-dimensional, there are two possible compatibility modes:
+
+Mode A: state-only canonical mode
+---------------------------------
+Preferred long-term. Add a JAX adapter/model config option that consumes:
+
+    query_state:    [B, T_obs, obs_dim]
+    target_action:  [B, H, action_dim]
+
+without requiring point-cloud keys.
+
+This may require a small model-side change: add a state-only query encoder to `icil_jax_query_memory/models/`, e.g.
+
+    StateOnlyQueryEncoder
+
+and allow `QueryMemoryDirectRegressionModel` to use it when `cfg.model.query_encoder_name = "state_only"`.
+
+Mode B: compatibility shim
+--------------------------
+For immediate compatibility with the existing JAX adapter, create dummy point-cloud fields:
+
+    query_xyz:   zeros [B, T_obs, 1, 3]
+    query_valid: ones  [B, T_obs, 1]
+
+and put the actual Meta-World observation into:
+
+    query_state: [B, T_obs, obs_dim]
+
+This allows existing code that expects `query_xyz`, `query_valid`, `query_state`, and `target_action` to run with minimal changes.
+
+Implement Mode B first if it avoids modifying training code. Also add Mode A if easy, but do not block the data pipeline on it.
+
+Target/action chunk construction
+--------------------------------
+Use the same high-level convention as RLBench ICIL:
+
+    T_obs: number of query observation frames
+    H: action chunk horizon
+    stride: spacing between query observation frames and action targets
+
+For a sampled starting time t0:
+
+    query_obs_indices = [t0 - (T_obs-1)*stride, ..., t0]
+    action_indices    = [t0 + 1, t0 + 2, ..., t0 + H]
+
+or, if you want strict compatibility with the current RLBench stride convention, implement both:
+
+    action_stride = 1 by default
+    obs_stride = cfg.stride
+
+Important: Do not repeat the earlier RLBench mismatch where action targets were stride-2 but eval executed them consecutively. For Meta-World direct-regression diagnostics, default to consecutive future actions:
+
+    action_indices = t0 + 1 ... t0 + H
+
+If an episode is too short, either reject the sample or pad the final action with the last valid action, controlled by config:
+
+    cfg.dataset.pad_short_chunks: bool = False by default
+
+Batch keys for JAX no-encoder GradMem path
+------------------------------------------
+For each inner/support batch:
+
+    query_state:    [Q, T_obs, obs_dim]
+    target_action:  [Q, H, action_dim]
+    query_xyz:      [Q, T_obs, 1, 3] dummy zeros if compatibility mode
+    query_valid:    [Q, T_obs, 1] dummy true if compatibility mode
+
+For each query/read batch:
+
+    query_state:    [Q_read, T_obs, obs_dim]
+    target_action:  [Q_read, H, action_dim]
+    query_xyz:      [Q_read, T_obs, 1, 3]
+    query_valid:    [Q_read, T_obs, 1]
+
+Prepared task batch iterable should support:
+
+    K: number of support episodes
+    num_queries_per_step: support chunks per WRITE step
+    num_query_loss_samples: query chunks per READ/meta-loss
+    inner_steps
+    num_inner_batches
+
+The first consumer is `icil_jax_query_memory/train/runner.py`, whose current adapter expands `inner_batches` according to `inner_steps` and stacks mandatory keys `query_xyz`, `query_state`, `query_valid`, and `target_action`.
+
+Sampling strategy
+-----------------
+A task spec should sample:
+
+    one task_name or task_instance
+    K support episodes
+    one distinct query episode
+
+Default:
+
+    support and query come from same task_name and same task_instance if task_instance_id exists.
+
+Add config options:
+
+    sample_same_task_name: bool = True
+    sample_same_task_instance: bool = True
+    allow_support_query_same_episode: bool = False
+
+For early diagnostics, same task instance is useful. Later, allow same task name but different task instance to test generalization.
+
+Wrong-support diagnostics support
+---------------------------------
+Implement dataset/debug helpers to produce correct-support and wrong-support task batches.
+
+Suggested script:
+
+    python -m icil_metaworld.data.diagnose_wrong_support \
+        --cache-root ... \
+        --target-task ... \
+        --wrong-support-task ... \
+        --num-batches ...
+
+For now this can just validate data construction and print shapes/metadata. Later it can be used with trained models.
+
+Inspection script
+-----------------
+Implement:
+
+    python -m icil_metaworld.data.inspect_metaworld_cache \
+        --cache-root ... \
+        --num-episodes 5
+
+It should print:
+
+    tasks
+    number of task instances
+    episodes per task/instance
+    obs_raw_dim
+    obs_model_dim
+    action_dim
+    length statistics
+    success statistics
+    example batch shapes
+
+Also optionally plot:
+
+    end-effector trajectory
+    action trajectory
+    object/goal coordinates if present in raw obs
+
+Normalization
+-------------
+Do not silently normalize by default. Store raw values.
+
+Optionally implement a stats computation script:
+
+    compute_metaworld_stats.py
+
+that writes:
+
+    obs_mean
+    obs_std
+    action_mean
+    action_std
+
+Use config-controlled normalization later. For now, keep raw data and let the model/training config decide.
+
+Action representation
+---------------------
+Store raw Meta-World actions. These are usually low-dimensional continuous controls.
+
+Do not convert to RLBench absolute end-effector pose format.
+
+For chunk prediction:
+
+    target_action: [B, H, action_dim]
+
+No gripper thresholding is needed unless Meta-World action semantics require it for a specific environment.
+
+Configs to add
+--------------
+Add at least:
+
+    configs/metaworld_generate_cache.py
+    configs/jax_metaworld_fomaml_query_memory_direct_regression.py
+    configs/jax_metaworld_maml_query_memory_direct_regression.py
+
+The JAX configs should mirror existing:
+
+    configs/jax_fomaml_query_memory_direct_regression.py
+    configs/jax_maml_query_memory_direct_regression.py
+
+but switch the data source to Meta-World and use state-only/dummy-point compatibility.
+
+Expected training integration changes
+-------------------------------------
+Minimal acceptable approach:
+
+1. Add `cfg.data.source = "rlbench" | "metaworld"`.
+2. In `icil_jax_query_memory/train/runner.py`, branch data construction:
+
+    if cfg.data.source == "rlbench":
+        existing RLBench store/task builder
+    elif cfg.data.source == "metaworld":
+        MetaWorldEpisodeStore + PreparedMetaWorldQueryMemoryTaskBatchIterable
+
+3. Keep the rest of the JAX training loop unchanged.
+
+This is technically touching training, but only to select the data source. Do not modify the MAML/FOMAML optimization logic in this implementation pass.
+
+Tests / smoke tests
+-------------------
+Add pytest or simple script-level tests if test infrastructure is minimal.
+
+Required smoke tests:
+
+1. Generate a tiny cache:
+
+    one task
+    one task instance
+    two successful episodes
+    max_path_length small if possible
+
+2. Inspect cache.
+
+3. Load cache with MetaWorldEpisodeStore.
+
+4. Build one prepared task batch with:
+
+    K=1
+    T_obs=1 or 2
+    H=4
+    inner_steps=1
+    num_queries_per_step=2
+    num_query_loss_samples=2
+
+5. Convert to JAX host/sharded batch using the existing adapter or MetaWorld adapter.
+
+6. Verify shapes:
+
+    inner/query keys exist
+    query_state shape correct
+    target_action shape correct
+    dummy query_xyz/query_valid shape correct if using compatibility mode
+
+7. Run one CPU/JAX debug step if feasible.
+
+Do not over-engineer
+-------------------
+Keep this pass focused on data generation and loading.
+
+Do not implement:
+- point clouds for Meta-World
+- image rendering
+- RLBench integration changes beyond the data-source branch
+- new GradMem algorithms
+- new READ architectures
+- evaluation rollouts
+
+The goal is to have a clean Meta-World cache and a task batch iterable that can be consumed by the existing JAX query-memory MAML/FOMAML code.
+
+Acceptance criteria
+-------------------
+This implementation is complete when:
+
+1. A Meta-World expert cache can be generated for at least one task.
+2. The cache stores raw observations, filtered model observations, actions, success flags, and metadata.
+3. The loader can sample K support episodes and one query episode from a task.
+4. The loader can create inner/write batches and query/read batches with action chunks.
+5. The batch keys are compatible with `icil_jax_query_memory/data/adapter.py` or a clearly documented MetaWorld-specific adapter.
+6. The existing JAX MAML/FOMAML scripts can be pointed at the Meta-World cache with minimal config changes.
+7. There is an inspection script that makes it easy to verify that task IDs/goals are not leaked into `model_obs`.
+

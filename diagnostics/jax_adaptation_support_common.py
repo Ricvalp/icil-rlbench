@@ -428,6 +428,21 @@ def resolve_memory_cfg(cfg: ConfigDict, ckpt: Dict[str, Any]) -> QueryMemoryMeta
     inner_lr_mode = str(ckpt_maml.get('inner_lr_mode', getattr(cfg.memory_ttt, 'inner_lr_mode', 'fixed')))
     if inner_lr_mode != 'fixed':
         raise ValueError(f'JAX query-memory diagnostics only support fixed inner_lr_mode, got {inner_lr_mode!r}.')
+    inner_loss_mode = str(ckpt_maml.get('inner_loss_mode', getattr(cfg.memory_ttt, 'inner_loss_mode', 'read'))).lower()
+    if inner_loss_mode not in ('read', 'write'):
+        raise ValueError("memory_ttt/ckpt maml inner_loss_mode must be one of: 'read', 'write'.")
+    model_cfg = ckpt.get('config', {}).get('model', {}) if isinstance(ckpt.get('config', None), dict) else {}
+    decoder_cfg = model_cfg.get('query_memory_direct_regression', {}) if isinstance(model_cfg, dict) else {}
+    memory_layer_norm_after_update = bool(
+        ckpt_maml.get(
+            'memory_layer_norm_after_update',
+            getattr(
+                cfg.memory_ttt,
+                'memory_layer_norm_after_update',
+                decoder_cfg.get('memory_layer_norm_after_update', False) if isinstance(decoder_cfg, dict) else False,
+            ),
+        )
+    )
     first_order = bool(ckpt_maml.get('first_order', True))
     if hasattr(cfg.memory_ttt, 'first_order'):
         first_order = bool(cfg.memory_ttt.first_order)
@@ -445,6 +460,8 @@ def resolve_memory_cfg(cfg: ConfigDict, ckpt: Dict[str, Any]) -> QueryMemoryMeta
         first_order=first_order,
         reuse_diffusion_noise=False,
         grad_accum_steps=1,
+        inner_loss_mode=inner_loss_mode,
+        memory_layer_norm_after_update=memory_layer_norm_after_update,
     )
 
 
@@ -496,12 +513,26 @@ def torch_batch_to_numpy(batch: Dict[str, Any], *, use_mask_id: bool, use_rgb: b
         out['query_mask_id'] = batch['query_mask_id'].detach().cpu().numpy()
     if use_rgb and 'query_rgb' in batch:
         out['query_rgb'] = batch['query_rgb'].detach().cpu().numpy()
+    for key in ('demo_id', 'support_demo_id', 'chunk_start', 'support_chunk_start'):
+        if key in batch:
+            out[key] = batch[key].detach().cpu().numpy()
     return out
 
 
 def numpy_batch_to_jax(batch: Dict[str, Any]) -> Dict[str, jnp.ndarray]:
     out: Dict[str, jnp.ndarray] = {}
-    for key in ('query_xyz', 'query_state', 'query_valid', 'target_action', 'query_rgb', 'query_mask_id'):
+    for key in (
+        'query_xyz',
+        'query_state',
+        'query_valid',
+        'target_action',
+        'query_rgb',
+        'query_mask_id',
+        'demo_id',
+        'support_demo_id',
+        'chunk_start',
+        'support_chunk_start',
+    ):
         if key in batch:
             out[key] = jnp.asarray(batch[key])
     return out
@@ -547,6 +578,9 @@ def prepare_support_inner_batches(
         out['query_mask_id'] = np.stack([batch['query_mask_id'] for batch in expanded], axis=0)
     if use_rgb and all('query_rgb' in batch for batch in expanded):
         out['query_rgb'] = np.stack([batch['query_rgb'] for batch in expanded], axis=0)
+    for key in ('demo_id', 'support_demo_id', 'chunk_start', 'support_chunk_start'):
+        if all(key in batch for batch in expanded):
+            out[key] = np.stack([batch[key] for batch in expanded], axis=0)
     return out
 
 
@@ -609,6 +643,8 @@ def load_policy_components(cfg: ConfigDict) -> Dict[str, Any]:
         inner_lr=float(memory_cfg.inner_lr),
         max_grad_norm=float(memory_cfg.max_grad_norm),
         first_order=bool(memory_cfg.first_order),
+        inner_loss_mode=str(memory_cfg.inner_loss_mode),
+        memory_layer_norm_after_update=bool(memory_cfg.memory_layer_norm_after_update),
     )
     predict_fn = create_predict_fn(model=model)
     return {

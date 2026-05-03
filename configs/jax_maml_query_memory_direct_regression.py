@@ -16,7 +16,7 @@ def get_config():
     cfg.data.tasks = ()
     cfg.data.exclude_tasks = ()
     cfg.data.keep_open_per_worker = True
-    cfg.data.num_workers = 8
+    cfg.data.num_workers = 16
     cfg.data.pin_memory = False
     cfg.data.persistent_workers = True
     cfg.data.prefetch_factor = 2
@@ -59,7 +59,7 @@ def get_config():
 
     cfg.train = ConfigDict()
     cfg.train.num_steps = 100000
-    cfg.train.batch_size = 4  # per-device task batch size
+    cfg.train.batch_size = 8  # per-device task batch size
     cfg.train.weight_decay = 1e-4
     cfg.train.log_every = 10
     cfg.train.ckpt_every = 500
@@ -78,7 +78,7 @@ def get_config():
     cfg.maml.inner_lr_mode = 'fixed'
     cfg.maml.outer_lr = 1e-4
     cfg.maml.max_grad_norm = 1.0
-    cfg.maml.num_queries_per_step = 32
+    cfg.maml.num_queries_per_step = 16
     cfg.maml.num_inner_batches = 0
     cfg.maml.num_query_loss_samples = 1
     cfg.maml.holdout_index = -1
@@ -94,7 +94,7 @@ def get_config():
     cfg.wandb.mode = os.environ.get('WANDB_MODE', 'online')
     cfg.wandb.tags = ()
     cfg.wandb.n_loss_steps = 1
-    cfg.wandb.n_sample_steps = 500
+    cfg.wandb.n_sample_steps = 200
     cfg.wandb.sample_batch_items = 32
 
     return cfg

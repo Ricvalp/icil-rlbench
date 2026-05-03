@@ -51,6 +51,23 @@ def build_model_config_from_raw(raw_model_cfg: Any, *, state_dim: int, action_di
         conditioner_dropout=float(getattr(decoder_raw, 'conditioner_dropout', 0.0)),
         context_attention_mode=str(getattr(decoder_raw, 'context_attention_mode', 'two_ctx')),
         memory_num_tokens=int(getattr(decoder_raw, 'memory_num_tokens', 128)),
+        separate_write_read_heads=bool(getattr(decoder_raw, 'separate_write_read_heads', False)),
+        shared_write_read_head=bool(getattr(decoder_raw, 'shared_write_read_head', False)),
+        write_num_query_tokens=int(getattr(decoder_raw, 'write_num_query_tokens', 4)),
+        write_use_demo_id_embed=bool(getattr(decoder_raw, 'write_use_demo_id_embed', True)),
+        write_use_time_embed=bool(getattr(decoder_raw, 'write_use_time_embed', True)),
+        write_max_demo_id=int(getattr(decoder_raw, 'write_max_demo_id', 16)),
+        write_max_time_bins=int(getattr(decoder_raw, 'write_max_time_bins', 512)),
+        write_time_embed_type=str(getattr(decoder_raw, 'write_time_embed_type', 'continuous_sinusoidal')),
+        write_query_mlp_mult=int(getattr(decoder_raw, 'write_query_mlp_mult', 2)),
+        use_decoder_mode_embed=bool(getattr(decoder_raw, 'use_decoder_mode_embed', False)),
+        memory_layer_norm_after_update=bool(getattr(decoder_raw, 'memory_layer_norm_after_update', False)),
+        memory_update_clip_norm=float(getattr(decoder_raw, 'memory_update_clip_norm', 0.0)),
+        action_loss_type=str(getattr(decoder_raw, 'action_loss_type', '')),
+        position_loss_weight=float(getattr(decoder_raw, 'position_loss_weight', 1.0)),
+        rotation_loss_weight=float(getattr(decoder_raw, 'rotation_loss_weight', 1.0)),
+        gripper_loss_weight=float(getattr(decoder_raw, 'gripper_loss_weight', 1.0)),
+        chunk_decay=float(getattr(decoder_raw, 'chunk_decay', 0.0)),
         dtype=compute_dtype,
         param_dtype=jnp.float32,
     )
@@ -65,6 +82,12 @@ def build_model_config_from_raw(raw_model_cfg: Any, *, state_dim: int, action_di
         )
     if decoder_cfg.horizon < 1:
         raise ValueError('decoder horizon must be >= 1.')
+    if decoder_cfg.write_num_query_tokens < 1:
+        raise ValueError('write_num_query_tokens must be >= 1.')
+    if decoder_cfg.write_max_demo_id < 1:
+        raise ValueError('write_max_demo_id must be >= 1.')
+    if decoder_cfg.write_max_time_bins < 1:
+        raise ValueError('write_max_time_bins must be >= 1.')
     return QueryMemoryDirectRegressionConfig(
         state_dim=int(state_dim),
         action_dim=int(action_dim),

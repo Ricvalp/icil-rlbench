@@ -268,6 +268,9 @@ class QueryMemoryTaskBuilder(ICILSamplerCore):
             batch['query_mask_id'] = torch.stack([sample['query_mask_id'] for sample in samples], 0)
         if all('query_rgb' in sample for sample in samples):
             batch['query_rgb'] = torch.stack([sample['query_rgb'] for sample in samples], 0)
+        for key in ('demo_id', 'support_demo_id', 'chunk_start', 'support_chunk_start'):
+            if all(key in sample for sample in samples):
+                batch[key] = torch.stack([sample[key] for sample in samples], 0)
         return batch
 
     def _num_valid_query_t0s(self, *, vidx: int, episode_id: int) -> int:
@@ -343,6 +346,7 @@ class QueryMemoryTaskBuilder(ICILSamplerCore):
 
         samples: List[Dict[str, Any]] = []
         for episode_id in episode_order:
+            demo_id = int(support_ids.index(int(episode_id)))
             num_valid = self._num_valid_query_t0s(vidx=int(task.vidx), episode_id=int(episode_id))
             if num_valid < 1:
                 raise RuntimeError(
@@ -356,10 +360,16 @@ class QueryMemoryTaskBuilder(ICILSamplerCore):
                 load_rgb=load_rgb,
                 load_mask_id=load_mask_id,
             )
+            sample['demo_id'] = torch.tensor(demo_id, dtype=torch.long)
+            sample['support_demo_id'] = torch.tensor(demo_id, dtype=torch.long)
+            sample['chunk_start'] = torch.tensor(float(t0), dtype=torch.float32)
+            sample['support_chunk_start'] = torch.tensor(float(t0), dtype=torch.float32)
             sample['meta'].update(
                 {
                     'support_episode': int(episode_id),
+                    'support_demo_id': int(demo_id),
                     'support_episodes': support_ids,
+                    'chunk_start': int(t0),
                     'task_query_episode': int(task.query_episode_id),
                 }
             )

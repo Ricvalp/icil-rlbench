@@ -449,6 +449,21 @@ def _resolve_memory_cfg(cfg: ConfigDict, ckpt: Dict[str, Any]) -> QueryMemoryMet
             'JAX query-memory v1 eval only supports fixed inner_lr_mode. '
             f'Got {inner_lr_mode!r}.'
         )
+    inner_loss_mode = str(ckpt_maml.get('inner_loss_mode', getattr(cfg.memory_ttt, 'inner_loss_mode', 'read'))).lower()
+    if inner_loss_mode not in ('read', 'write'):
+        raise ValueError("memory_ttt/ckpt maml inner_loss_mode must be one of: 'read', 'write'.")
+    model_cfg = ckpt.get('config', {}).get('model', {}) if isinstance(ckpt.get('config', None), dict) else {}
+    decoder_cfg = model_cfg.get('query_memory_direct_regression', {}) if isinstance(model_cfg, dict) else {}
+    memory_layer_norm_after_update = bool(
+        ckpt_maml.get(
+            'memory_layer_norm_after_update',
+            getattr(
+                cfg.memory_ttt,
+                'memory_layer_norm_after_update',
+                decoder_cfg.get('memory_layer_norm_after_update', False) if isinstance(decoder_cfg, dict) else False,
+            ),
+        )
+    )
     return QueryMemoryMetaConfig(
         inner_steps=_ival(getattr(cfg.memory_ttt, 'inner_steps', -1), 'inner_steps', 1),
         inner_lr=_fval(getattr(cfg.memory_ttt, 'inner_lr', -1.0), 'inner_lr', 1e-2),
@@ -463,6 +478,8 @@ def _resolve_memory_cfg(cfg: ConfigDict, ckpt: Dict[str, Any]) -> QueryMemoryMet
         first_order=bool(ckpt_maml.get('first_order', True)),
         reuse_diffusion_noise=False,
         grad_accum_steps=1,
+        inner_loss_mode=inner_loss_mode,
+        memory_layer_norm_after_update=memory_layer_norm_after_update,
     )
 
 
@@ -505,6 +522,9 @@ def _torch_batch_to_numpy(batch: Dict[str, Any], *, use_mask_id: bool, use_rgb: 
         out['query_mask_id'] = batch['query_mask_id'].cpu().numpy()
     if use_rgb and 'query_rgb' in batch:
         out['query_rgb'] = batch['query_rgb'].cpu().numpy()
+    for key in ('demo_id', 'support_demo_id', 'chunk_start', 'support_chunk_start'):
+        if key in batch:
+            out[key] = batch[key].cpu().numpy()
     return out
 
 
@@ -544,6 +564,9 @@ def _prepare_support_inner_batches(
         out['query_mask_id'] = np.stack([batch['query_mask_id'] for batch in expanded], axis=0)
     if use_rgb and all('query_rgb' in batch for batch in expanded):
         out['query_rgb'] = np.stack([batch['query_rgb'] for batch in expanded], axis=0)
+    for key in ('demo_id', 'support_demo_id', 'chunk_start', 'support_chunk_start'):
+        if all(key in batch for batch in expanded):
+            out[key] = np.stack([batch[key] for batch in expanded], axis=0)
     return out
 
 
@@ -667,6 +690,8 @@ def evaluate(cfg: ConfigDict) -> None:
         inner_lr=float(memory_cfg.inner_lr),
         max_grad_norm=float(memory_cfg.max_grad_norm),
         first_order=bool(memory_cfg.first_order),
+        inner_loss_mode=str(memory_cfg.inner_loss_mode),
+        memory_layer_norm_after_update=bool(memory_cfg.memory_layer_norm_after_update),
     )
     predict_fn = create_predict_fn(model=model)
 

@@ -36,6 +36,8 @@ def get_config():
     cfg.memory_ttt.max_grad_norm = -1.0
     cfg.memory_ttt.num_queries_per_step = -1
     cfg.memory_ttt.num_inner_batches = -1
+    cfg.memory_ttt.inner_loss_mode = 'read'  # checkpoint overrides when present
+    cfg.memory_ttt.memory_layer_norm_after_update = False
 
     cfg.sim = ConfigDict()
     cfg.sim.headless = True

@@ -68,6 +68,9 @@ def _resolve_memory_cfg(cfg: ConfigDict) -> QueryMemoryMetaConfig:
         raise ValueError('JAX query-memory v1 only supports maml.grad_accum_steps=1.')
     if bool(getattr(cfg.maml, 'reuse_diffusion_noise', False)):
         raise ValueError('JAX query-memory v1 does not use diffusion noise; set maml.reuse_diffusion_noise=False.')
+    inner_loss_mode = str(getattr(cfg.maml, 'inner_loss_mode', 'read')).lower()
+    if inner_loss_mode not in ('read', 'write'):
+        raise ValueError("maml.inner_loss_mode must be one of: 'read', 'write'.")
     return QueryMemoryMetaConfig(
         inner_steps=int(cfg.maml.inner_steps),
         inner_lr=float(cfg.maml.inner_lr),
@@ -82,6 +85,19 @@ def _resolve_memory_cfg(cfg: ConfigDict) -> QueryMemoryMetaConfig:
         first_order=bool(cfg.maml.first_order),
         reuse_diffusion_noise=False,
         grad_accum_steps=1,
+        inner_loss_mode=inner_loss_mode,
+        memory_layer_norm_after_update=bool(
+            getattr(
+                cfg.maml,
+                'memory_layer_norm_after_update',
+                getattr(cfg.model.query_memory_direct_regression, 'memory_layer_norm_after_update', False),
+            )
+        ),
+        use_read_improvement_margin=bool(getattr(cfg.maml, 'use_read_improvement_margin', False)),
+        read_improvement_margin=float(getattr(cfg.maml, 'read_improvement_margin', 0.0)),
+        read_improvement_margin_weight=float(getattr(cfg.maml, 'read_improvement_margin_weight', 0.0)),
+        log_output_delta=bool(getattr(cfg.maml, 'log_output_delta', False)),
+        training_mode_metrics_only=bool(getattr(cfg.maml, 'training_mode_metrics_only', False)),
     )
 
 
@@ -128,9 +144,23 @@ def _resolve_run_id(wandb_run: Optional[Any]) -> str:
     return time.strftime('local-%Y%m%d-%H%M%S')
 
 
+_JAX_BATCH_KEYS = (
+    'query_xyz',
+    'query_state',
+    'query_valid',
+    'target_action',
+    'query_rgb',
+    'query_mask_id',
+    'demo_id',
+    'support_demo_id',
+    'chunk_start',
+    'support_chunk_start',
+)
+
+
 def _torch_batch_to_jax(batch: Dict[str, Any]) -> Dict[str, jnp.ndarray]:
     out: Dict[str, jnp.ndarray] = {}
-    for key in ('query_xyz', 'query_state', 'query_valid', 'target_action', 'query_rgb', 'query_mask_id'):
+    for key in _JAX_BATCH_KEYS:
         if key in batch:
             value = batch[key]
             if torch.is_tensor(value):
@@ -243,7 +273,7 @@ def _sample_logging_artifacts(
     if not prepared_task['inner_batches']:
         return None, None
     inner_batch_np: Dict[str, np.ndarray] = {}
-    sample_keys = ('query_xyz', 'query_state', 'query_valid', 'target_action', 'query_rgb', 'query_mask_id')
+    sample_keys = _JAX_BATCH_KEYS
     for key in sample_keys:
         if key in prepared_task['inner_batches'][0]:
             inner_batch_np[key] = np.stack(
@@ -355,6 +385,13 @@ def train(cfg: ConfigDict) -> None:
         inner_lr=float(memory_cfg.inner_lr),
         max_grad_norm=float(memory_cfg.max_grad_norm),
         first_order=bool(memory_cfg.first_order),
+        inner_loss_mode=str(memory_cfg.inner_loss_mode),
+        memory_layer_norm_after_update=bool(memory_cfg.memory_layer_norm_after_update),
+        use_read_improvement_margin=bool(memory_cfg.use_read_improvement_margin),
+        read_improvement_margin=float(memory_cfg.read_improvement_margin),
+        read_improvement_margin_weight=float(memory_cfg.read_improvement_margin_weight),
+        log_output_delta=bool(memory_cfg.log_output_delta),
+        training_mode_metrics_only=bool(memory_cfg.training_mode_metrics_only),
     )
     adapt_fn = create_adapt_fn(
         model=model,
@@ -362,6 +399,8 @@ def train(cfg: ConfigDict) -> None:
         inner_lr=float(memory_cfg.inner_lr),
         max_grad_norm=float(memory_cfg.max_grad_norm),
         first_order=bool(memory_cfg.first_order),
+        inner_loss_mode=str(memory_cfg.inner_loss_mode),
+        memory_layer_norm_after_update=bool(memory_cfg.memory_layer_norm_after_update),
     )
     predict_fn = create_predict_fn(model=model)
     logging_task_builder = QueryMemoryTaskBuilder(
@@ -436,7 +475,7 @@ def train(cfg: ConfigDict) -> None:
     wandb_sample_every = int(getattr(cfg.wandb, 'n_sample_steps', 0)) if wandb_run is not None else 0
     wandb_sample_batch = int(getattr(cfg.wandb, 'sample_batch_items', 4)) if wandb_run is not None else 0
     global_step = int(start_step)
-    log_metric_sums = {'meta_loss': 0.0, 'inner_support_loss': 0.0, 'inner_memory_grad_norm': 0.0}
+    log_metric_sums: Dict[str, float] = {}
     log_timing_sums = {'data_wait_s': 0.0, 'train_step_s': 0.0}
     log_count = 0
     window_start = time.time()
@@ -469,6 +508,7 @@ def train(cfg: ConfigDict) -> None:
             metrics_host = {key: float(jax.device_get(jax_utils.unreplicate(value))) for key, value in metrics.items()}
             train_step_s = time.time() - t_step_0
             for key, value in metrics_host.items():
+                log_metric_sums.setdefault(key, 0.0)
                 log_metric_sums[key] += float(value)
             log_timing_sums['data_wait_s'] += float(data_wait_s)
             log_timing_sums['train_step_s'] += float(train_step_s)
@@ -482,12 +522,18 @@ def train(cfg: ConfigDict) -> None:
                 total_avg_step_s = max(1e-6, avg_timings['data_wait_s'] + avg_timings['train_step_s'])
                 data_wait_frac = avg_timings['data_wait_s'] / total_avg_step_s
                 logging.info(
-                    'step %d/%d | meta_loss %.6f | inner_loss %.6f | inner_grad %.6f | outer_lr %.3e | %.2f step/s | data_wait %.3fs | train_step %.3fs | data_wait_frac %.2f',
+                    'step %d/%d | meta_loss %.6f | read_before %.6f | read_after %.6f | inner_loss %.6f | inner_grad %.6f | mem_delta %.6f | rel_mem_delta %.6f | read_impr %.6f | out_delta %.6f | outer_lr %.3e | %.2f step/s | data_wait %.3fs | train_step %.3fs | data_wait_frac %.2f',
                     global_step,
                     int(cfg.train.num_steps),
-                    avg_metrics['meta_loss'],
-                    avg_metrics['inner_support_loss'],
-                    avg_metrics['inner_memory_grad_norm'],
+                    avg_metrics.get('meta_loss', 0.0),
+                    avg_metrics.get('read_loss_before', 0.0),
+                    avg_metrics.get('read_loss_after', 0.0),
+                    avg_metrics.get('inner_support_loss', 0.0),
+                    avg_metrics.get('inner_memory_grad_norm', 0.0),
+                    avg_metrics.get('memory_delta_norm', 0.0),
+                    avg_metrics.get('memory_relative_delta_norm', 0.0),
+                    avg_metrics.get('read_improvement', 0.0),
+                    avg_metrics.get('action_output_delta', 0.0),
                     float(memory_cfg.outer_lr),
                     steps_per_sec,
                     avg_timings['data_wait_s'],
@@ -503,10 +549,8 @@ def train(cfg: ConfigDict) -> None:
                 step_total_s = max(1e-6, float(data_wait_s) + float(train_step_s))
                 wandb_run.log(
                     {
-                        'train/meta_loss': metrics_host['meta_loss'],
-                        'train/outer_loss': metrics_host['meta_loss'],
-                        'train/inner_support_loss': metrics_host['inner_support_loss'],
-                        'train/inner_memory_grad_norm': metrics_host['inner_memory_grad_norm'],
+                        **{f'train/{key}': float(value) for key, value in metrics_host.items()},
+                        'train/outer_loss': metrics_host.get('meta_loss', 0.0),
                         'train/data_wait_s': float(data_wait_s),
                         'train/train_step_s': float(train_step_s),
                         'train/data_wait_frac': float(data_wait_s) / step_total_s,

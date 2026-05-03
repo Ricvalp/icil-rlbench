@@ -22,8 +22,132 @@ class DirectDecoderConfig:
     conditioner_dropout: float = 0.0
     context_attention_mode: str = 'two_ctx'
     memory_num_tokens: int = 128
+    separate_write_read_heads: bool = False
+    shared_write_read_head: bool = False
+    write_num_query_tokens: int = 4
+    write_use_demo_id_embed: bool = True
+    write_use_time_embed: bool = True
+    write_max_demo_id: int = 16
+    write_max_time_bins: int = 512
+    write_time_embed_type: str = 'continuous_sinusoidal'
+    write_query_mlp_mult: int = 2
+    use_decoder_mode_embed: bool = False
+    memory_layer_norm_after_update: bool = False
+    memory_update_clip_norm: float = 0.0
+    action_loss_type: str = ''
+    position_loss_weight: float = 1.0
+    rotation_loss_weight: float = 1.0
+    gripper_loss_weight: float = 1.0
+    chunk_decay: float = 0.0
     dtype: jnp.dtype = jnp.float32
     param_dtype: jnp.dtype = jnp.float32
+
+
+def _as_token_metadata(
+    value: Optional[jnp.ndarray],
+    *,
+    batch_size: int,
+    num_tokens: int,
+    dtype: jnp.dtype,
+) -> jnp.ndarray:
+    if value is None:
+        return jnp.zeros((int(batch_size),), dtype=dtype)
+    x = jnp.asarray(value, dtype=dtype)
+    if x.ndim == 0:
+        return jnp.broadcast_to(x[None], (int(batch_size),))
+    if x.ndim == 1:
+        return x
+    # If callers pass per-write-token metadata, average it into a stable
+    # per-example descriptor. The token-specific learned base already breaks
+    # symmetry across WRITE query tokens.
+    return jnp.mean(x[:, : int(num_tokens)], axis=1)
+
+
+def _sinusoidal_scalar_embedding(x: jnp.ndarray, dim: int) -> jnp.ndarray:
+    half = max(1, int(dim) // 2)
+    freqs = jnp.exp(
+        -jnp.log(jnp.asarray(10000.0, dtype=x.dtype))
+        * jnp.arange(half, dtype=x.dtype)
+        / jnp.asarray(max(1, half - 1), dtype=x.dtype)
+    )
+    angles = x[..., None] * freqs[None, :]
+    emb = jnp.concatenate([jnp.sin(angles), jnp.cos(angles)], axis=-1)
+    if emb.shape[-1] < int(dim):
+        emb = jnp.pad(emb, ((0, 0), (0, int(dim) - emb.shape[-1])))
+    return emb[..., : int(dim)]
+
+
+class WriteQueryTokenBuilder(nn.Module):
+    cfg: DirectDecoderConfig
+
+    @nn.compact
+    def __call__(
+        self,
+        *,
+        batch_size: int,
+        demo_id: Optional[jnp.ndarray],
+        chunk_start: Optional[jnp.ndarray],
+        train: bool,
+    ) -> tuple[jnp.ndarray, jnp.ndarray]:
+        del train  # deterministic token construction for now.
+        B = int(batch_size)
+        Q = max(1, int(self.cfg.write_num_query_tokens))
+        d = int(self.cfg.d_model)
+        dtype = self.cfg.dtype
+        param_dtype = self.cfg.param_dtype
+
+        base = self.param(
+            'write_query_base',
+            nn.initializers.normal(stddev=0.02),
+            (Q, d),
+            param_dtype,
+        )
+        tokens = jnp.broadcast_to(base.astype(dtype)[None, :, :], (B, Q, d))
+
+        if bool(self.cfg.write_use_demo_id_embed):
+            demo = _as_token_metadata(demo_id, batch_size=B, num_tokens=Q, dtype=jnp.float32)
+            demo = jnp.clip(jnp.rint(demo).astype(jnp.int32), 0, max(1, int(self.cfg.write_max_demo_id)) - 1)
+            demo_embed = self.param(
+                'write_demo_id_embed',
+                nn.initializers.normal(stddev=0.02),
+                (max(1, int(self.cfg.write_max_demo_id)), d),
+                param_dtype,
+            )
+            tokens = tokens + demo_embed[demo].astype(dtype)[:, None, :]
+
+        if bool(self.cfg.write_use_time_embed):
+            time_value = _as_token_metadata(chunk_start, batch_size=B, num_tokens=Q, dtype=jnp.float32)
+            time_type = str(self.cfg.write_time_embed_type).lower()
+            if time_type == 'learned':
+                bucket = jnp.clip(
+                    jnp.rint(time_value).astype(jnp.int32),
+                    0,
+                    max(1, int(self.cfg.write_max_time_bins)) - 1,
+                )
+                time_embed = self.param(
+                    'write_time_embed',
+                    nn.initializers.normal(stddev=0.02),
+                    (max(1, int(self.cfg.write_max_time_bins)), d),
+                    param_dtype,
+                )
+                t = time_embed[bucket].astype(dtype)
+            elif time_type == 'continuous_sinusoidal':
+                max_time = jnp.asarray(max(1, int(self.cfg.write_max_time_bins) - 1), dtype=jnp.float32)
+                tau = jnp.clip(time_value, 0.0, max_time) / max_time
+                t = _sinusoidal_scalar_embedding(tau, d).astype(dtype)
+                hidden = max(d, int(self.cfg.write_query_mlp_mult) * d)
+                t = nn.Dense(hidden, dtype=dtype, param_dtype=param_dtype, name='write_time_mlp_in')(t)
+                t = nn.silu(t)
+                t = nn.Dense(d, dtype=dtype, param_dtype=param_dtype, name='write_time_mlp_out')(t)
+            else:
+                raise ValueError(
+                    "write_time_embed_type must be one of: 'continuous_sinusoidal', 'learned'. "
+                    f"Got {self.cfg.write_time_embed_type!r}."
+                )
+            tokens = tokens + t[:, None, :]
+
+        mask = jnp.ones((B, Q), dtype=jnp.bool_)
+        return tokens, mask
 
 
 class PooledContextConditioner(nn.Module):
@@ -44,7 +168,7 @@ class PooledContextConditioner(nn.Module):
     def __call__(
         self,
         *,
-        query_tokens: jnp.ndarray,
+        query_tokens: Optional[jnp.ndarray],
         query_mask: Optional[jnp.ndarray],
         support_tokens: Optional[jnp.ndarray],
         support_mask: Optional[jnp.ndarray],
@@ -53,6 +177,10 @@ class PooledContextConditioner(nn.Module):
         param_dtype = self.cfg.param_dtype
         pooled_query = self._masked_mean(query_tokens, query_mask)
         pooled_support = self._masked_mean(support_tokens, support_mask)
+        if pooled_query is None and pooled_support is None:
+            raise ValueError('At least one of query_tokens or support_tokens must be provided.')
+        if pooled_query is None:
+            pooled_query = jnp.zeros_like(pooled_support)
         if pooled_support is None:
             pooled_support = jnp.zeros_like(pooled_query)
         x = jnp.concatenate([pooled_query, pooled_support], axis=-1)
@@ -139,13 +267,47 @@ class DirectDecoderCore(nn.Module):
     def __call__(
         self,
         *,
-        query_tokens: jnp.ndarray,
+        query_tokens: Optional[jnp.ndarray],
         query_mask: Optional[jnp.ndarray],
         support_tokens: Optional[jnp.ndarray],
         support_mask: Optional[jnp.ndarray],
         train: bool,
+        mode: str = 'read',
+        write_demo_id: Optional[jnp.ndarray] = None,
+        write_chunk_start: Optional[jnp.ndarray] = None,
     ) -> jnp.ndarray:
-        B = int(query_tokens.shape[0])
+        mode = str(mode).lower()
+        if mode not in ('read', 'write'):
+            raise ValueError(f"mode must be 'read' or 'write', got {mode!r}.")
+        if mode == 'read':
+            if query_tokens is None:
+                raise ValueError('READ mode requires query_tokens.')
+            B = int(query_tokens.shape[0])
+            # Touch WRITE-only parameters when the new WRITE/READ mode is
+            # enabled so model.init from a READ call still initializes the full
+            # checkpoint parameter tree.
+            if bool(self.cfg.separate_write_read_heads) or bool(self.cfg.use_decoder_mode_embed):
+                _unused_write_tokens, _unused_write_mask = WriteQueryTokenBuilder(
+                    self.cfg,
+                    name='write_query_builder',
+                )(
+                    batch_size=B,
+                    demo_id=None,
+                    chunk_start=None,
+                    train=train,
+                )
+                del _unused_write_tokens, _unused_write_mask
+        else:
+            if support_tokens is None:
+                raise ValueError('WRITE mode requires support_tokens/memory_tokens.')
+            B = int(support_tokens.shape[0])
+            query_tokens, query_mask = WriteQueryTokenBuilder(self.cfg, name='write_query_builder')(
+                batch_size=B,
+                demo_id=write_demo_id,
+                chunk_start=write_chunk_start,
+                train=train,
+            )
+
         d = int(self.cfg.d_model)
         dtype = self.cfg.dtype
         param_dtype = self.cfg.param_dtype
@@ -155,6 +317,15 @@ class DirectDecoderCore(nn.Module):
             support_tokens=support_tokens,
             support_mask=support_mask,
         )
+        if bool(self.cfg.use_decoder_mode_embed):
+            mode_embed = self.param(
+                'mode_embed',
+                nn.initializers.normal(stddev=0.02),
+                (2, d),
+                param_dtype,
+            )
+            mode_idx = 1 if mode == 'write' else 0
+            cond_vec = cond_vec + mode_embed[mode_idx].astype(dtype)[None, :]
         action_queries = self.param('action_queries', nn.initializers.normal(stddev=0.02), (int(self.cfg.horizon), d), param_dtype)
         action_slot_embed = self.param('action_slot_embed', nn.initializers.normal(stddev=0.02), (int(self.cfg.horizon), d), param_dtype)
         x = jnp.broadcast_to((action_queries + action_slot_embed).astype(dtype)[None, :, :], (B, int(self.cfg.horizon), d))
@@ -168,4 +339,9 @@ class DirectDecoderCore(nn.Module):
                 support_mask=support_mask,
                 train=train,
             )
-        return nn.Dense(int(self.action_dim), dtype=dtype, param_dtype=param_dtype, name='action_out')(x)
+        if bool(self.cfg.shared_write_read_head) or not bool(self.cfg.separate_write_read_heads):
+            return nn.Dense(int(self.action_dim), dtype=dtype, param_dtype=param_dtype, name='action_out')(x)
+
+        read_out = nn.Dense(int(self.action_dim), dtype=dtype, param_dtype=param_dtype, name='read_action_out')(x)
+        write_out = nn.Dense(int(self.action_dim), dtype=dtype, param_dtype=param_dtype, name='write_action_out')(x)
+        return write_out if mode == 'write' else read_out
