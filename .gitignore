@@ -8,6 +8,9 @@ legacy/
 eval_checkpoints/
 pretrained_checkpoints/
 
+
+metaworld_cache_viz
+
 *.mp4
 raw_episodes_videos/*
 

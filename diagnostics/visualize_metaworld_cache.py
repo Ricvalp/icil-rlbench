@@ -276,6 +276,39 @@ def _write_metadata(path: Path, *, task: MetaWorldMAMLTaskSpec, cfg: MetaWorldIC
     path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding='utf-8')
 
 
+def _selected_episode_duplicate_summary(
+    store: MetaWorldEpisodeStore,
+    task: MetaWorldMAMLTaskSpec,
+) -> Dict[str, Any]:
+    episode_ids = [int(x) for x in task.support_episode_ids] + [int(task.query_episode_id)]
+    if len(episode_ids) < 2:
+        return {'episode_ids': episode_ids, 'all_identical_to_first': False, 'comparisons': []}
+    first = _load_full_episode(store, task.task_name, episode_ids[0])
+    comparisons = []
+    all_identical = True
+    for episode_id in episode_ids[1:]:
+        cur = _load_full_episode(store, task.task_name, episode_id)
+        same_obs = bool(np.array_equal(first['obs_raw'], cur['obs_raw']))
+        same_action = bool(np.array_equal(first['action'], cur['action']))
+        if not (same_obs and same_action):
+            all_identical = False
+        comparisons.append(
+            {
+                'episode_id': int(episode_id),
+                'obs_raw_max_abs_diff': float(np.max(np.abs(first['obs_raw'] - cur['obs_raw']))),
+                'action_max_abs_diff': float(np.max(np.abs(first['action'] - cur['action']))),
+                'same_obs_raw': same_obs,
+                'same_action': same_action,
+            }
+        )
+    return {
+        'episode_ids': episode_ids,
+        'reference_episode_id': int(episode_ids[0]),
+        'all_identical_to_first': bool(all_identical),
+        'comparisons': comparisons,
+    }
+
+
 def visualize(args: argparse.Namespace) -> None:
     cache_root = Path(str(args.cache_root or os.environ.get('ICIL_METAWORLD_CACHE_ROOT', ''))).expanduser()
     if not str(cache_root):
@@ -316,6 +349,13 @@ def visualize(args: argparse.Namespace) -> None:
         overview_path = output_dir / f'{stem}.episodes_3d.png'
         chunks_path = output_dir / f'{stem}.support_query_chunks_3d.png'
         meta_path = output_dir / f'{stem}.support_query_chunks.json'
+        duplicate_summary = _selected_episode_duplicate_summary(store, task)
+        if bool(duplicate_summary.get('all_identical_to_first', False)):
+            print(
+                'WARNING: all selected support/query episodes are byte-identical in obs_raw and actions. '
+                'The full-episode subplots will look identical; this usually means the MetaWorld task instance '
+                'has a fixed reset and the scripted expert is deterministic.'
+            )
         _plot_full_episode_overview(
             store=store,
             task=task,
@@ -335,6 +375,9 @@ def visualize(args: argparse.Namespace) -> None:
             dpi=int(args.dpi),
         )
         _write_metadata(meta_path, task=task, cfg=cfg, chunks=chunks)
+        meta = json.loads(meta_path.read_text(encoding='utf-8'))
+        meta['duplicate_summary'] = duplicate_summary
+        meta_path.write_text(json.dumps(meta, indent=2, sort_keys=True), encoding='utf-8')
         print(f'Wrote {overview_path}')
         print(f'Wrote {chunks_path}')
         print(f'Wrote {meta_path}')
