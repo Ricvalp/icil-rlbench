@@ -39,8 +39,89 @@ pip install -e ".[profile]"
 - `ICIL_EVAL_OUTPUT_DIR`: parent directory for eval outputs
 - `ICIL_PROFILE_TRACE_DIR`: profiling trace output directory
 - `ICIL_PRETRAIN_PROFILE_TRACE_FILE`: profiling trace filename stem
+- `ICIL_METAWORLD_CACHE_ROOT`: MetaWorld HDF5 cache root used by the JAX MetaWorld configs
 
 If `cfg.conditioning.cache_root` is empty in eval configs, eval falls back to `checkpoint["config"]["data"]["cache_root"]`.
+
+## JAX Query-Memory Experiments
+The JAX path under `icil_jax_query_memory/` implements the encoder-free query-memory direct-regression experiments. The model keeps learnable memory tokens as fast parameters, tokenizes only the query observation, adapts memory tokens on support action supervision, and predicts action chunks directly.
+
+RLBench configs:
+```bash
+PYTHONPATH=. python icil_jax_query_memory/maml_query_memory_direct_regression.py \
+  --config=configs/jax_maml_query_memory_direct_regression.py
+
+PYTHONPATH=. python icil_jax_query_memory/fomaml_query_memory_direct_regression.py \
+  --config=configs/jax_fomaml_query_memory_direct_regression.py
+```
+
+WRITE/READ GradMem configs use WRITE-mode support updates and READ-mode query prediction with separate configurable heads:
+```bash
+PYTHONPATH=. python icil_jax_query_memory/maml_query_memory_write_read_direct_regression.py \
+  --config=configs/jax_maml_query_memory_write_read_direct_regression.py
+
+PYTHONPATH=. python icil_jax_query_memory/fomaml_query_memory_write_read_direct_regression.py \
+  --config=configs/jax_fomaml_query_memory_write_read_direct_regression.py
+```
+
+Useful JAX data-loading knobs:
+- `cfg.data.num_workers`: Torch DataLoader workers used to prepare host batches
+- `cfg.data.prefetch_factor`: worker prefetch depth when `num_workers > 0`
+- `cfg.train.batch_size`: per-device meta-batch size
+- `cfg.maml.num_queries_per_step`: support chunks per inner step
+- `cfg.maml.num_query_loss_samples`: query chunks per task for the outer loss
+
+## MetaWorld Dataset
+The MetaWorld pipeline lives under `icil_metaworld/`. It generates scripted-policy demonstrations into a simple HDF5 cache and reuses the JAX query-memory trainer through `cfg.data.source = "metaworld"`.
+
+Generate a default ML1 `button-press-v3` cache:
+```bash
+conda activate jax-icil
+PYTHONPATH=. python -m icil_metaworld.data.generate_metaworld_expert_cache \
+  --config=configs/metaworld_generate_cache.py
+```
+
+Inspect the cache:
+```bash
+PYTHONPATH=. python -m icil_metaworld.data.inspect_metaworld_cache \
+  --cache-root "${ICIL_METAWORLD_CACHE_ROOT:-output_data_playground_v3/.metaworld_cache/button_press_ml1_train}"
+```
+
+Visualize sampled support/query cache chunks:
+```bash
+PYTHONPATH=. python diagnostics/visualize_metaworld_cache.py \
+  --cache-root "${ICIL_METAWORLD_CACHE_ROOT:-output_data_playground_v3/.metaworld_cache/button_press_ml1_train}" \
+  --output-dir diagnostics/metaworld_cache_viz \
+  --task-name button-press-v3 \
+  --task-instance-id 0 \
+  --K 4 \
+  --T_obs 2 \
+  --H 8
+```
+
+MetaWorld JAX MAML/FOMAML with the original READ support objective:
+```bash
+PYTHONPATH=. python icil_jax_query_memory/maml_metaworld_query_memory_direct_regression.py \
+  --config=configs/jax_metaworld_maml_query_memory_direct_regression.py
+
+PYTHONPATH=. python icil_jax_query_memory/fomaml_metaworld_query_memory_direct_regression.py \
+  --config=configs/jax_metaworld_fomaml_query_memory_direct_regression.py
+```
+
+MetaWorld JAX MAML/FOMAML with the WRITE/READ GradMem objective:
+```bash
+PYTHONPATH=. python icil_jax_query_memory/maml_metaworld_query_memory_write_read_direct_regression.py \
+  --config=configs/jax_metaworld_maml_query_memory_write_read_direct_regression.py
+
+PYTHONPATH=. python icil_jax_query_memory/fomaml_metaworld_query_memory_write_read_direct_regression.py \
+  --config=configs/jax_metaworld_fomaml_query_memory_write_read_direct_regression.py
+```
+
+Default MetaWorld behavior:
+- `button-press-v2` aliases are normalized to MetaWorld 3.0 `button-press-v3`
+- model observations default to `obs_no_task_no_goal`, removing the final 3D goal slot from 39D MetaWorld observations
+- query point clouds are dummy one-point tensors; the actual policy input is the low-dimensional `obs_model` state
+- support and query episodes are sampled from the same task instance/goal by default, with distinct episodes unless explicitly overridden
 
 ## Pretrain
 Single GPU:

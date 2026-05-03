@@ -1,0 +1,1 @@
+from configs.metaworld_generate_cache import get_config

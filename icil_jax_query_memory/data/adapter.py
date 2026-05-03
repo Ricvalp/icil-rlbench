@@ -82,10 +82,17 @@ def prepared_tasks_to_host_batch(
                 )
 
     query = _stack_batches([task['query_batch'] for task in prepared_tasks])
+    def _task_index(task_obj: Any) -> int:
+        if hasattr(task_obj, 'vidx'):
+            return int(task_obj.vidx)
+        if hasattr(task_obj, 'task_index'):
+            return int(task_obj.task_index)
+        return -1
+
     meta = {
         'support_ids': np.asarray([task['support_ids'] for task in prepared_tasks], dtype=np.int32),
         'query_episode_id': np.asarray([task['query_episode_id'] for task in prepared_tasks], dtype=np.int32),
-        'vidx': np.asarray([task['task'].vidx for task in prepared_tasks], dtype=np.int32),
+        'vidx': np.asarray([_task_index(task['task']) for task in prepared_tasks], dtype=np.int32),
     }
     return {
         'inner': inner,

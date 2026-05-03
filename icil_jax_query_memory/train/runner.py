@@ -33,6 +33,10 @@ from icil_jax_query_memory.utils.action_representation import decode_action_chun
 from icil_jax_query_memory.utils.checkpoints import load_checkpoint, save_checkpoint
 
 
+def _data_source(cfg: ConfigDict) -> str:
+    return str(getattr(cfg.data, 'source', 'rlbench')).strip().lower()
+
+
 def _as_bool(value: Any) -> bool:
     return bool(value)
 
@@ -59,6 +63,24 @@ def _resolve_dataset_cfg(cfg: ConfigDict) -> ICILConfig:
         action_representation=str(getattr(cfg.dataset, 'action_representation', 'absolute')),
         task_sampling=str(getattr(cfg.data, 'task_sampling', 'variation_uniform')),
         task_sampling_alpha=float(getattr(cfg.data, 'task_sampling_alpha', 0.5)),
+    )
+
+
+def _resolve_metaworld_dataset_cfg(cfg: ConfigDict) -> Any:
+    from icil_metaworld.data.metaworld_task_builder import MetaWorldICILConfig
+
+    return MetaWorldICILConfig(
+        K=int(cfg.dataset.K),
+        T_obs=int(cfg.dataset.T_obs),
+        H=int(cfg.dataset.H),
+        stride=int(cfg.dataset.stride),
+        action_stride=int(getattr(cfg.dataset, 'action_stride', 1)),
+        pad_short_chunks=bool(getattr(cfg.dataset, 'pad_short_chunks', False)),
+        action_representation=str(getattr(cfg.dataset, 'action_representation', 'absolute')),
+        task_sampling=str(getattr(cfg.data, 'task_sampling', 'task_instance_uniform')),
+        sample_same_task_name=bool(getattr(cfg.data, 'sample_same_task_name', True)),
+        sample_same_task_instance=bool(getattr(cfg.data, 'sample_same_task_instance', True)),
+        allow_support_query_same_episode=bool(getattr(cfg.data, 'allow_support_query_same_episode', False)),
     )
 
 
@@ -317,7 +339,13 @@ def train(cfg: ConfigDict) -> None:
         raise ValueError('train.batch_size must be >= 1 and is interpreted as per-device task batch size.')
     global_task_batch = num_devices * per_device_batch
 
-    dataset_cfg = _resolve_dataset_cfg(cfg)
+    source = _data_source(cfg)
+    if source == 'rlbench':
+        dataset_cfg = _resolve_dataset_cfg(cfg)
+    elif source == 'metaworld':
+        dataset_cfg = _resolve_metaworld_dataset_cfg(cfg)
+    else:
+        raise ValueError(f"Unsupported data.source={source!r}. Expected 'rlbench' or 'metaworld'.")
     memory_cfg = _resolve_memory_cfg(cfg)
     model_cfg_raw = cfg.model
     use_mask_id = _resolve_use_mask_id(model_cfg_raw)
@@ -331,15 +359,28 @@ def train(cfg: ConfigDict) -> None:
     cache_root = Path(str(cfg.data.cache_root)).expanduser()
     tasks = _normalize_task_list(getattr(cfg.data, 'tasks', ()))
     exclude_tasks = _normalize_task_list(getattr(cfg.data, 'exclude_tasks', ()))
-    store, selected_tasks = _build_store(
-        cache_root=cache_root,
-        tasks=tasks,
-        exclude_tasks=exclude_tasks,
-        keep_open_per_worker=bool(cfg.data.keep_open_per_worker),
-    )
+    if source == 'rlbench':
+        store, selected_tasks = _build_store(
+            cache_root=cache_root,
+            tasks=tasks,
+            exclude_tasks=exclude_tasks,
+            keep_open_per_worker=bool(cfg.data.keep_open_per_worker),
+        )
+        state_dim, action_dim = _infer_dims(store)
+        num_points = _infer_num_points(store, use_rgb=use_rgb, use_mask_id=use_mask_id)
+    else:
+        from icil_metaworld.data.metaworld_cache import MetaWorldEpisodeStore
+        from icil_metaworld.data.observation_filter import normalize_env_name
 
-    state_dim, action_dim = _infer_dims(store)
-    num_points = _infer_num_points(store, use_rgb=use_rgb, use_mask_id=use_mask_id)
+        tasks = tuple(normalize_env_name(t) for t in tasks)
+        exclude_tasks = tuple(normalize_env_name(t) for t in exclude_tasks)
+        store = MetaWorldEpisodeStore(
+            cache_root=cache_root,
+            keep_open_per_worker=bool(cfg.data.keep_open_per_worker),
+        )
+        selected_tasks = tasks if tasks else tuple(store.list_task_names())
+        state_dim, action_dim = store.infer_dims()
+        num_points = 1
     # Metadata probing may have opened h5py handles on the main process store.
     # Clear them before the store is captured by spawned DataLoader workers.
     store.close()
@@ -403,24 +444,39 @@ def train(cfg: ConfigDict) -> None:
         memory_layer_norm_after_update=bool(memory_cfg.memory_layer_norm_after_update),
     )
     predict_fn = create_predict_fn(model=model)
-    logging_task_builder = QueryMemoryTaskBuilder(
-        store,
-        cfg=dataset_cfg,
-        seed=seed,
-        num_tries_per_item=int(getattr(cfg.dataset, 'num_tries_per_item', 100)),
-    )
+    if source == 'rlbench':
+        logging_task_builder = QueryMemoryTaskBuilder(
+            store,
+            cfg=dataset_cfg,
+            seed=seed,
+            num_tries_per_item=int(getattr(cfg.dataset, 'num_tries_per_item', 100)),
+        )
+        task_dataset = PreparedQueryMemoryTaskBatchIterable(
+            store,
+            cfg=dataset_cfg,
+            memory_cfg=memory_cfg,
+            task_batch_size_B=int(global_task_batch),
+            num_batches=int(cfg.train.num_steps) + 8,
+            seed=seed,
+            num_tries_per_item=int(getattr(cfg.dataset, 'num_tries_per_item', 100)),
+            use_mask_id=use_mask_id,
+            load_rgb=use_rgb,
+        )
+    else:
+        from icil_metaworld.data.metaworld_task_builder import PreparedMetaWorldQueryMemoryTaskBatchIterable
 
-    task_dataset = PreparedQueryMemoryTaskBatchIterable(
-        store,
-        cfg=dataset_cfg,
-        memory_cfg=memory_cfg,
-        task_batch_size_B=int(global_task_batch),
-        num_batches=int(cfg.train.num_steps) + 8,
-        seed=seed,
-        num_tries_per_item=int(getattr(cfg.dataset, 'num_tries_per_item', 100)),
-        use_mask_id=use_mask_id,
-        load_rgb=use_rgb,
-    )
+        logging_task_builder = None
+        task_dataset = PreparedMetaWorldQueryMemoryTaskBatchIterable(
+            store,
+            cfg=dataset_cfg,
+            memory_cfg=memory_cfg,
+            task_batch_size_B=int(global_task_batch),
+            num_batches=int(cfg.train.num_steps) + 8,
+            seed=seed,
+            num_tries_per_item=int(getattr(cfg.dataset, 'num_tries_per_item', 100)),
+            task_names=tasks,
+            exclude_tasks=exclude_tasks,
+        )
     num_workers = int(getattr(cfg.data, 'num_workers', 0))
     persistent_workers = bool(getattr(cfg.data, 'persistent_workers', False)) and num_workers > 0
     loader_kwargs: Dict[str, Any] = {
@@ -452,6 +508,7 @@ def train(cfg: ConfigDict) -> None:
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
     config_payload = {
         'resolved': {
+            'data_source': source,
             'state_dim': int(state_dim),
             'action_dim': int(action_dim),
             'num_points': int(num_points),
@@ -560,7 +617,12 @@ def train(cfg: ConfigDict) -> None:
                     step=int(global_step),
                 )
 
-            if wandb_run is not None and wandb_sample_every > 0 and (global_step % wandb_sample_every == 0):
+            if (
+                wandb_run is not None
+                and wandb_sample_every > 0
+                and logging_task_builder is not None
+                and (global_step % wandb_sample_every == 0)
+            ):
                 fig = None
                 try:
                     params_for_logging = jax_utils.unreplicate(replicated_state).params
