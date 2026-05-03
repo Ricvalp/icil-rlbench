@@ -1,17 +1,15 @@
 from __future__ import annotations
 
 import json
-import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import jax
 import jax.numpy as jnp
 import numpy as np
-from absl import app, logging
-from ml_collections import ConfigDict
-from ml_collections.config_flags import config_flags
 import torch
+from absl import logging
+from ml_collections import ConfigDict
 from tqdm.auto import tqdm
 
 from icil.datasets.in_context_imitation_learning.cache_variation_h5 import (
@@ -32,12 +30,6 @@ from icil_jax_query_memory.train.step import create_adapt_with_stats_fn, create_
 from icil_jax_query_memory.utils.action_representation import decode_action_chunk_np
 from icil_jax_query_memory.utils.checkpoints import load_checkpoint
 
-_CONFIG = config_flags.DEFINE_config_file(
-    'config',
-    default='configs/jax_eval_query_memory_direct_regression.py',
-    help_string='Path to ml_collections config file.',
-)
-
 _CAMERAS: Tuple[str, ...] = (
     'left_shoulder',
     'right_shoulder',
@@ -47,24 +39,24 @@ _CAMERAS: Tuple[str, ...] = (
 )
 
 
-def _as_bool(v: Any) -> bool:
+def as_bool(v: Any) -> bool:
     return bool(v)
 
 
-def _set_seed(seed: int) -> None:
+def set_seed(seed: int) -> None:
     np.random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
 
 
-def _normalize_quaternion_xyzw(q: np.ndarray) -> np.ndarray:
+def normalize_quaternion_xyzw(q: np.ndarray) -> np.ndarray:
     norm = float(np.linalg.norm(q))
     if norm < 1e-8:
         return np.asarray([0.0, 0.0, 0.0, 1.0], dtype=np.float32)
     return (q / norm).astype(np.float32)
 
 
-def _sanitize_action(
+def sanitize_action(
     action: np.ndarray,
     *,
     normalize_quaternion: bool,
@@ -72,7 +64,7 @@ def _sanitize_action(
 ) -> np.ndarray:
     a = np.asarray(action, dtype=np.float32).copy()
     if a.shape[0] >= 7 and normalize_quaternion:
-        a[3:7] = _normalize_quaternion_xyzw(a[3:7])
+        a[3:7] = normalize_quaternion_xyzw(a[3:7])
     if a.shape[0] >= 8:
         if discretize_gripper:
             a[7] = 1.0 if float(a[7]) > 0.5 else 0.0
@@ -81,7 +73,7 @@ def _sanitize_action(
     return a
 
 
-def _extract_rgb_frame(obs: Any, camera: str) -> np.ndarray:
+def extract_rgb_frame(obs: Any, camera: str) -> np.ndarray:
     frame = getattr(obs, f'{camera}_rgb', None)
     if frame is None:
         frame = getattr(obs, 'front_rgb', None)
@@ -95,7 +87,7 @@ def _extract_rgb_frame(obs: Any, camera: str) -> np.ndarray:
     return arr
 
 
-def _write_video(frames: Sequence[np.ndarray], out_path: Path, fps: int) -> Path:
+def write_video(frames: Sequence[np.ndarray], out_path: Path, fps: int) -> Path:
     out_path.parent.mkdir(parents=True, exist_ok=True)
     ext = out_path.suffix.lower()
 
@@ -133,7 +125,7 @@ def _write_video(frames: Sequence[np.ndarray], out_path: Path, fps: int) -> Path
     return fallback
 
 
-def _save_inner_loss_artifacts(
+def save_inner_loss_artifacts(
     *,
     inner_losses: Sequence[float],
     inner_grad_norms: Sequence[float],
@@ -151,7 +143,7 @@ def _save_inner_loss_artifacts(
     with losses_path.open('w', encoding='utf-8') as f:
         json.dump(payload, f, indent=2)
 
-    plot_path = run_dir / f'{stem}.inner_losses.png'
+    plot_path: Optional[Path] = run_dir / f'{stem}.inner_losses.png'
     try:
         import matplotlib.pyplot as plt
 
@@ -163,7 +155,7 @@ def _save_inner_loss_artifacts(
         ax.set_xlabel('Inner Step')
         ax.set_ylabel('Direct Regression Loss')
         ax.set_yscale('log')
-        ax.set_title('JAX Memory MAML Inner-Loop Loss')
+        ax.set_title(stem.replace('_', ' '))
         ax.grid(True, which='both', alpha=0.3)
         if len(xs) > 0:
             max_xticks = min(8, len(xs))
@@ -173,8 +165,8 @@ def _save_inner_loss_artifacts(
         fig.tight_layout()
         fig.savefig(plot_path, dpi=160)
         plt.close(fig)
-    except Exception as exc:  # pragma: no cover - optional plotting dependency/runtime
-        logging.warning('Failed to save JAX memory inner-loss plot to %s: %s', plot_path, exc)
+    except Exception as exc:
+        logging.warning('Failed to save inner-loss plot to %s: %s', plot_path, exc)
         plot_path = None
 
     return {
@@ -183,7 +175,7 @@ def _save_inner_loss_artifacts(
     }
 
 
-class _LiveConditioningProcessor:
+class LiveConditioningProcessor:
     def __init__(
         self,
         *,
@@ -241,7 +233,6 @@ class _LiveConditioningProcessor:
             rgb = getattr(obs, f'{cam}_rgb', None)
             if pc is None or msk is None:
                 continue
-
             pts = np.asarray(pc, dtype=np.float32).reshape(-1, 3)
             masks = np.asarray(msk).reshape(-1).astype(np.int32, copy=False)
             cols = None
@@ -250,13 +241,11 @@ class _LiveConditioningProcessor:
                     cols = np.zeros((pts.shape[0], 3), dtype=np.uint8)
                 else:
                     cols = np.asarray(rgb).reshape(-1, 3).astype(np.uint8, copy=False)
-
             finite = np.isfinite(pts).all(axis=1)
             pts = pts[finite]
             masks = masks[finite]
             if cols is not None:
                 cols = cols[finite]
-
             if pts.shape[0] == 0:
                 continue
             merged_points.append(pts)
@@ -298,7 +287,6 @@ class _LiveConditioningProcessor:
             mask_id = msk_all[idx].astype(np.int64, copy=False) if self.use_mask_id else None
 
         state = _build_vector(obs, ('gripper_pose', 'gripper_open')).astype(np.float32, copy=False)
-
         out: Dict[str, torch.Tensor] = {
             'xyz': torch.from_numpy(xyz).float(),
             'valid': torch.from_numpy(valid).bool(),
@@ -311,7 +299,7 @@ class _LiveConditioningProcessor:
         return out
 
 
-def _build_query_window(
+def build_query_window(
     history: Sequence[Dict[str, torch.Tensor]],
     *,
     dataset_cfg: ICILConfig,
@@ -326,7 +314,6 @@ def _build_query_window(
         rel = (dataset_cfg.T_obs - 1 - i) * qstep
         idx.append(max(0, last - rel))
     frames = [history[i] for i in idx]
-
     out: Dict[str, torch.Tensor] = {
         'query_xyz': torch.stack([f['xyz'] for f in frames], 0).unsqueeze(0),
         'query_state': torch.stack([f['state'] for f in frames], 0).unsqueeze(0),
@@ -339,7 +326,7 @@ def _build_query_window(
     return out
 
 
-def _build_rlbench_env(cfg: ConfigDict, task_name: str):
+def build_rlbench_env(cfg: ConfigDict, task_name: str):
     from pyrep.const import RenderMode
     from rlbench import ObservationConfig
     from rlbench.action_modes.action_mode import MoveArmThenGripper
@@ -350,7 +337,6 @@ def _build_rlbench_env(cfg: ConfigDict, task_name: str):
 
     obs_config = ObservationConfig()
     obs_config.set_all(True)
-
     image_size = tuple(int(x) for x in cfg.sim.image_size)
     renderer_name = str(cfg.sim.renderer).lower()
     if renderer_name == 'opengl':
@@ -358,36 +344,33 @@ def _build_rlbench_env(cfg: ConfigDict, task_name: str):
     elif renderer_name == 'opengl3':
         render_mode = RenderMode.OPENGL3
     else:
-        raise ValueError(f"Unsupported renderer '{cfg.sim.renderer}'. Use 'opengl' or 'opengl3'.")
-
+        raise ValueError(f"Unsupported renderer {cfg.sim.renderer!r}. Use 'opengl' or 'opengl3'.")
     for cam_name in _CAMERAS:
         cam_cfg = getattr(obs_config, f'{cam_name}_camera')
         cam_cfg.image_size = image_size
         cam_cfg.depth_in_meters = False
         cam_cfg.masks_as_one_channel = True
         cam_cfg.render_mode = render_mode
-
     action_mode = MoveArmThenGripper(
         EndEffectorPoseViaPlanning(
             absolute_mode=True,
-            collision_checking=_as_bool(cfg.sim.collision_checking),
+            collision_checking=as_bool(cfg.sim.collision_checking),
         ),
         Discrete(),
     )
     env = Environment(
         action_mode=action_mode,
         obs_config=obs_config,
-        headless=_as_bool(cfg.sim.headless),
+        headless=as_bool(cfg.sim.headless),
         arm_max_velocity=float(cfg.sim.arm_max_velocity),
         arm_max_acceleration=float(cfg.sim.arm_max_acceleration),
     )
     env.launch()
     task_class = task_file_to_task_class(task_name)
-    task_env = env.get_task(task_class)
-    return env, task_env
+    return env, env.get_task(task_class)
 
 
-def _model_cfg_from_checkpoint_or_default(cfg: ConfigDict, ckpt: Dict[str, Any], *, compute_dtype: jnp.dtype):
+def model_cfg_from_checkpoint_or_default(cfg: ConfigDict, ckpt: Dict[str, Any], *, compute_dtype: jnp.dtype):
     raw = None
     if isinstance(ckpt.get('config', None), dict):
         maybe = ckpt['config'].get('model', None)
@@ -401,11 +384,11 @@ def _model_cfg_from_checkpoint_or_default(cfg: ConfigDict, ckpt: Dict[str, Any],
     return build_model_config_from_raw(raw, state_dim=state_dim, action_dim=action_dim, compute_dtype=compute_dtype)
 
 
-def _dataset_config_from_eval_and_checkpoint(cfg: ConfigDict, ckpt: Dict[str, Any]) -> ICILConfig:
+def dataset_config_from_eval_and_checkpoint(cfg: ConfigDict, ckpt: Dict[str, Any]) -> ICILConfig:
     ckpt_dataset = {}
     if isinstance(ckpt.get('config', None), dict):
         ckpt_dataset = ckpt['config'].get('dataset', {}) or {}
-    use_ckpt = _as_bool(getattr(cfg.dataset, 'use_checkpoint_dataset_config', True))
+    use_ckpt = as_bool(getattr(cfg.dataset, 'use_checkpoint_dataset_config', True))
 
     def _ival(name: str, default: int) -> int:
         if use_ckpt and name in ckpt_dataset:
@@ -415,7 +398,6 @@ def _dataset_config_from_eval_and_checkpoint(cfg: ConfigDict, ckpt: Dict[str, An
     action_representation = str(getattr(cfg.dataset, 'action_representation', 'absolute'))
     if use_ckpt and 'action_representation' in ckpt_dataset:
         action_representation = str(ckpt_dataset['action_representation'])
-
     return ICILConfig(
         K=_ival('K', 1),
         L=_ival('L', 16),
@@ -426,7 +408,7 @@ def _dataset_config_from_eval_and_checkpoint(cfg: ConfigDict, ckpt: Dict[str, An
     )
 
 
-def _resolve_memory_cfg(cfg: ConfigDict, ckpt: Dict[str, Any]) -> QueryMemoryMetaConfig:
+def resolve_memory_cfg(cfg: ConfigDict, ckpt: Dict[str, Any]) -> QueryMemoryMetaConfig:
     ckpt_maml = ckpt.get('config', {}).get('maml', {}) if isinstance(ckpt.get('config', None), dict) else {}
 
     def _ival(local_value: int, key: str, default: int) -> int:
@@ -445,10 +427,10 @@ def _resolve_memory_cfg(cfg: ConfigDict, ckpt: Dict[str, Any]) -> QueryMemoryMet
 
     inner_lr_mode = str(ckpt_maml.get('inner_lr_mode', getattr(cfg.memory_ttt, 'inner_lr_mode', 'fixed')))
     if inner_lr_mode != 'fixed':
-        raise ValueError(
-            'JAX query-memory v1 eval only supports fixed inner_lr_mode. '
-            f'Got {inner_lr_mode!r}.'
-        )
+        raise ValueError(f'JAX query-memory diagnostics only support fixed inner_lr_mode, got {inner_lr_mode!r}.')
+    first_order = bool(ckpt_maml.get('first_order', True))
+    if hasattr(cfg.memory_ttt, 'first_order'):
+        first_order = bool(cfg.memory_ttt.first_order)
     return QueryMemoryMetaConfig(
         inner_steps=_ival(getattr(cfg.memory_ttt, 'inner_steps', -1), 'inner_steps', 1),
         inner_lr=_fval(getattr(cfg.memory_ttt, 'inner_lr', -1.0), 'inner_lr', 1e-2),
@@ -460,33 +442,42 @@ def _resolve_memory_cfg(cfg: ConfigDict, ckpt: Dict[str, Any]) -> QueryMemoryMet
         num_query_loss_samples=1,
         num_inner_batches=_ival(getattr(cfg.memory_ttt, 'num_inner_batches', -1), 'num_inner_batches', 0),
         holdout_index=-1,
-        first_order=bool(ckpt_maml.get('first_order', True)),
+        first_order=first_order,
         reuse_diffusion_noise=False,
         grad_accum_steps=1,
     )
 
 
-def _query_stride_mode_from_eval(cfg: ConfigDict) -> str:
+def query_stride_mode_from_eval(cfg: ConfigDict) -> str:
     mode = str(getattr(cfg.dataset, 'query_stride_mode', 'dataset')).lower()
     if mode not in ('dataset', 'consecutive'):
         raise ValueError('cfg.dataset.query_stride_mode must be one of: dataset, consecutive.')
     return mode
 
 
-def _resolve_use_mask_id(model_cfg) -> bool:
-    return bool(model_cfg.query_encoder.use_mask_id)
+def build_task_store(cache_root: Path, task_name: str) -> VariationStore:
+    task_keys = build_variation_keys(cache_root, task_name)
+    if not task_keys:
+        raise RuntimeError(f'No cached variations found for task {task_name!r} under {cache_root}.')
+    return VariationStore(task_keys, keep_open_per_worker=True)
 
 
-def _resolve_use_rgb(model_cfg) -> bool:
-    return bool(model_cfg.query_encoder.use_rgb)
-
-
-def _build_cached_support_ids(*, store: VariationStore, dataset_cfg: ICILConfig, variation: int, rng: np.random.Generator) -> Tuple[int, List[int]]:
+def select_vidx(*, store: VariationStore, variation: int, rng: np.random.Generator) -> int:
     candidates = [idx for idx, key in enumerate(store.keys) if variation < 0 or int(key.variation) == int(variation)]
     if not candidates:
         available = sorted({int(key.variation) for key in store.keys})
-        raise RuntimeError(f'No cached variation found for requested variation={variation}. Available variations: {available}')
-    vidx = int(candidates[0] if variation >= 0 else rng.choice(np.asarray(candidates, dtype=np.int64)))
+        raise RuntimeError(f'No cached variation found for requested variation={variation}. Available={available}')
+    return int(candidates[0] if variation >= 0 else rng.choice(np.asarray(candidates, dtype=np.int64)))
+
+
+def build_cached_support_ids(
+    *,
+    store: VariationStore,
+    dataset_cfg: ICILConfig,
+    variation: int,
+    rng: np.random.Generator,
+) -> Tuple[int, List[int]]:
+    vidx = select_vidx(store=store, variation=variation, rng=rng)
     episode_ids = store.list_episode_ids(vidx)
     if episode_ids.shape[0] < dataset_cfg.K:
         raise RuntimeError(f'Need at least K={dataset_cfg.K} cached support episodes, got {episode_ids.shape[0]}.')
@@ -494,26 +485,34 @@ def _build_cached_support_ids(*, store: VariationStore, dataset_cfg: ICILConfig,
     return vidx, [int(v) for v in np.asarray(support_ids).tolist()]
 
 
-def _torch_batch_to_numpy(batch: Dict[str, Any], *, use_mask_id: bool, use_rgb: bool) -> Dict[str, np.ndarray]:
+def torch_batch_to_numpy(batch: Dict[str, Any], *, use_mask_id: bool, use_rgb: bool) -> Dict[str, np.ndarray]:
     out: Dict[str, np.ndarray] = {
-        'query_xyz': batch['query_xyz'].cpu().numpy(),
-        'query_state': batch['query_state'].cpu().numpy(),
-        'query_valid': batch['query_valid'].cpu().numpy(),
-        'target_action': batch['target_action'].cpu().numpy(),
+        'query_xyz': batch['query_xyz'].detach().cpu().numpy(),
+        'query_state': batch['query_state'].detach().cpu().numpy(),
+        'query_valid': batch['query_valid'].detach().cpu().numpy(),
+        'target_action': batch['target_action'].detach().cpu().numpy(),
     }
     if use_mask_id and 'query_mask_id' in batch:
-        out['query_mask_id'] = batch['query_mask_id'].cpu().numpy()
+        out['query_mask_id'] = batch['query_mask_id'].detach().cpu().numpy()
     if use_rgb and 'query_rgb' in batch:
-        out['query_rgb'] = batch['query_rgb'].cpu().numpy()
+        out['query_rgb'] = batch['query_rgb'].detach().cpu().numpy()
     return out
 
 
-def _prepare_support_inner_batches(
+def numpy_batch_to_jax(batch: Dict[str, Any]) -> Dict[str, jnp.ndarray]:
+    out: Dict[str, jnp.ndarray] = {}
+    for key in ('query_xyz', 'query_state', 'query_valid', 'target_action', 'query_rgb', 'query_mask_id'):
+        if key in batch:
+            out[key] = jnp.asarray(batch[key])
+    return out
+
+
+def prepare_support_inner_batches(
     *,
     task_builder: QueryMemoryTaskBuilder,
     vidx: int,
     support_ids: Sequence[int],
-    memory_cfg: MemoryMAMLConfig,
+    memory_cfg: QueryMemoryMetaConfig,
     use_mask_id: bool,
     use_rgb: bool,
     rng: np.random.Generator,
@@ -523,8 +522,12 @@ def _prepare_support_inner_batches(
         support_episode_ids=tuple(int(eid) for eid in support_ids),
         query_episode_id=int(support_ids[0]),
     )
-    num_inner_batches = int(memory_cfg.inner_steps) if int(memory_cfg.num_inner_batches) <= 0 else min(int(memory_cfg.num_inner_batches), int(memory_cfg.inner_steps))
-    if num_inner_batches <= 0:
+    num_inner_batches = (
+        int(memory_cfg.inner_steps)
+        if int(memory_cfg.num_inner_batches) <= 0
+        else min(int(memory_cfg.num_inner_batches), int(memory_cfg.inner_steps))
+    )
+    if int(memory_cfg.inner_steps) <= 0 or num_inner_batches <= 0:
         return {}
     base_batches: List[Dict[str, np.ndarray]] = []
     for _ in range(num_inner_batches):
@@ -535,7 +538,7 @@ def _prepare_support_inner_batches(
             load_rgb=use_rgb,
             load_mask_id=use_mask_id,
         )
-        base_batches.append(_torch_batch_to_numpy(batch, use_mask_id=use_mask_id, use_rgb=use_rgb))
+        base_batches.append(torch_batch_to_numpy(batch, use_mask_id=use_mask_id, use_rgb=use_rgb))
     expanded = [base_batches[idx % len(base_batches)] for idx in range(int(memory_cfg.inner_steps))]
     out: Dict[str, np.ndarray] = {}
     for key in ('query_xyz', 'query_state', 'query_valid', 'target_action'):
@@ -547,9 +550,152 @@ def _prepare_support_inner_batches(
     return out
 
 
-def _run_eval_episode(
+def build_target_query_batch(
+    *,
+    task_builder: QueryMemoryTaskBuilder,
+    store: VariationStore,
+    vidx: int,
+    batch_size: int,
+    rng: np.random.Generator,
+    use_mask_id: bool,
+    use_rgb: bool,
+    exclude_episode_ids: Sequence[int] = (),
+) -> Dict[str, np.ndarray]:
+    episode_ids = [int(eid) for eid in np.asarray(store.list_episode_ids(int(vidx))).tolist()]
+    if not episode_ids:
+        raise RuntimeError(f'No episodes available for vidx={vidx}.')
+    exclude = {int(eid) for eid in exclude_episode_ids}
+    candidate_ids = [eid for eid in episode_ids if eid not in exclude]
+    if not candidate_ids:
+        candidate_ids = episode_ids
+    samples: List[Dict[str, Any]] = []
+    tries = 0
+    max_tries = max(100, int(batch_size) * 50)
+    while len(samples) < int(batch_size) and tries < max_tries:
+        tries += 1
+        episode_id = int(candidate_ids[int(rng.integers(0, len(candidate_ids)))])
+        num_valid = task_builder._num_valid_query_t0s(vidx=int(vidx), episode_id=episode_id)
+        if num_valid < 1:
+            continue
+        t0 = int(rng.integers(0, num_valid))
+        samples.append(
+            task_builder._build_query_sample_at_t0(
+                vidx=int(vidx),
+                episode_id=episode_id,
+                t0=t0,
+                load_rgb=use_rgb,
+                load_mask_id=use_mask_id,
+            )
+        )
+    if len(samples) < int(batch_size):
+        raise RuntimeError(f'Could not assemble target query batch: need={batch_size}, got={len(samples)}.')
+    return torch_batch_to_numpy(task_builder._stack_query_samples(samples), use_mask_id=use_mask_id, use_rgb=use_rgb)
+
+
+def load_policy_components(cfg: ConfigDict) -> Dict[str, Any]:
+    checkpoint_path = Path(str(cfg.checkpoint_path)).expanduser().resolve()
+    if not checkpoint_path.is_file():
+        raise FileNotFoundError(f'Checkpoint not found: {checkpoint_path}')
+    ckpt = load_checkpoint(checkpoint_path)
+    compute_dtype = resolve_dtype('float32')
+    model_cfg = model_cfg_from_checkpoint_or_default(cfg, ckpt, compute_dtype=compute_dtype)
+    dataset_cfg = dataset_config_from_eval_and_checkpoint(cfg, ckpt)
+    memory_cfg = resolve_memory_cfg(cfg, ckpt)
+    model = QueryMemoryDirectRegressionModel(cfg=model_cfg)
+    params = ckpt['params']
+    adapt_with_stats_fn = create_adapt_with_stats_fn(
+        model=model,
+        inner_steps=int(memory_cfg.inner_steps),
+        inner_lr=float(memory_cfg.inner_lr),
+        max_grad_norm=float(memory_cfg.max_grad_norm),
+        first_order=bool(memory_cfg.first_order),
+    )
+    predict_fn = create_predict_fn(model=model)
+    return {
+        'checkpoint_path': checkpoint_path,
+        'ckpt': ckpt,
+        'params': params,
+        'model_cfg': model_cfg,
+        'dataset_cfg': dataset_cfg,
+        'memory_cfg': memory_cfg,
+        'model': model,
+        'adapt_with_stats_fn': adapt_with_stats_fn,
+        'predict_fn': predict_fn,
+        'use_mask_id': bool(model_cfg.query_encoder.use_mask_id),
+        'use_rgb': bool(model_cfg.query_encoder.use_rgb),
+        'action_dim': int(model_cfg.action_dim),
+    }
+
+
+def adapt_memory_for_support(
+    *,
+    params: Any,
+    adapt_with_stats_fn: Any,
+    task_builder: QueryMemoryTaskBuilder,
+    vidx: int,
+    support_ids: Sequence[int],
+    memory_cfg: QueryMemoryMetaConfig,
+    use_mask_id: bool,
+    use_rgb: bool,
+    rng: np.random.Generator,
+    run_dir: Optional[Path] = None,
+    stem: str = 'adaptation',
+) -> Dict[str, Any]:
+    support_inner = prepare_support_inner_batches(
+        task_builder=task_builder,
+        vidx=int(vidx),
+        support_ids=support_ids,
+        memory_cfg=memory_cfg,
+        use_mask_id=use_mask_id,
+        use_rgb=use_rgb,
+        rng=rng,
+    )
+    adapted_memory, inner_losses, inner_grad_norms = adapt_with_stats_fn(
+        params,
+        numpy_batch_to_jax(support_inner),
+    )
+    inner_losses_np = np.asarray(inner_losses, dtype=np.float32)
+    inner_grads_np = np.asarray(inner_grad_norms, dtype=np.float32)
+    artifacts: Dict[str, str] = {}
+    if run_dir is not None:
+        artifacts = save_inner_loss_artifacts(
+            inner_losses=[float(v) for v in inner_losses_np.tolist()],
+            inner_grad_norms=[float(v) for v in inner_grads_np.tolist()],
+            run_dir=run_dir,
+            stem=stem,
+        )
+    return {
+        'memory_tokens': adapted_memory,
+        'inner_losses': [float(v) for v in inner_losses_np.tolist()],
+        'inner_grad_norms': [float(v) for v in inner_grads_np.tolist()],
+        'avg_inner_loss': float(np.mean(inner_losses_np)) if inner_losses_np.size else 0.0,
+        'support_ids': [int(v) for v in support_ids],
+        **artifacts,
+    }
+
+
+def mse_metrics(pred: np.ndarray, target: np.ndarray) -> Dict[str, float]:
+    pred = np.asarray(pred, dtype=np.float32)
+    target = np.asarray(target, dtype=np.float32)
+    xyz_dim = min(3, int(target.shape[-1]))
+    return {
+        'mse': float(np.mean(np.square(pred - target))),
+        'l1': float(np.mean(np.abs(pred - target))),
+        'xyz_mse': float(np.mean(np.square(pred[..., :xyz_dim] - target[..., :xyz_dim]))),
+    }
+
+
+def mean_metric_dict(items: Sequence[Dict[str, float]]) -> Dict[str, float]:
+    if not items:
+        return {}
+    keys = sorted(items[0].keys())
+    return {key: float(np.mean([float(item[key]) for item in items])) for key in keys}
+
+
+def run_eval_episode(
     *,
     episode_index: int,
+    support_label: str,
     task_env: Any,
     variation: int,
     params: Any,
@@ -557,7 +703,7 @@ def _run_eval_episode(
     adapted_memory_tokens: jnp.ndarray,
     dataset_cfg: ICILConfig,
     query_stride_mode: str,
-    processor: _LiveConditioningProcessor,
+    processor: LiveConditioningProcessor,
     cfg: ConfigDict,
     run_dir: Path,
     action_dim: int,
@@ -572,8 +718,8 @@ def _run_eval_episode(
     del descriptions
     history: List[Dict[str, torch.Tensor]] = [processor.observation_to_frame(obs)]
     frames: List[np.ndarray] = []
-    if _as_bool(cfg.video.enable):
-        frames.append(_extract_rgb_frame(obs, str(cfg.video.camera)))
+    if as_bool(cfg.video.enable):
+        frames.append(extract_rgb_frame(obs, str(cfg.video.camera)))
 
     success = False
     terminated = False
@@ -581,10 +727,10 @@ def _run_eval_episode(
     env_steps = 0
     execute_actions = max(1, int(cfg.control.execute_actions_per_plan))
     max_env_steps = int(cfg.task.max_env_steps)
-    pbar = tqdm(total=max_env_steps, desc=f'Episode {episode_index}', leave=False, unit='step')
+    pbar = tqdm(total=max_env_steps, desc=f'{support_label} episode {episode_index}', leave=False, unit='step')
     try:
         while env_steps < max_env_steps and not success and not terminated:
-            query = _build_query_window(history, dataset_cfg=dataset_cfg, query_stride_mode=query_stride_mode)
+            query = build_query_window(history, dataset_cfg=dataset_cfg, query_stride_mode=query_stride_mode)
             query_batch: Dict[str, np.ndarray] = {
                 'query_xyz': query['query_xyz'].cpu().numpy(),
                 'query_state': query['query_state'].cpu().numpy(),
@@ -595,20 +741,18 @@ def _run_eval_episode(
                 query_batch['query_mask_id'] = query['query_mask_id'].cpu().numpy()
             if use_rgb and 'query_rgb' in query:
                 query_batch['query_rgb'] = query['query_rgb'].cpu().numpy()
-
-            plan = predict_fn(params, {k: jnp.asarray(v) for k, v in query_batch.items()}, adapted_memory_tokens)
-            plan_np = np.asarray(plan)
+            plan = predict_fn(params, numpy_batch_to_jax(query_batch), adapted_memory_tokens)
             plan_np = decode_action_chunk_np(
-                plan_np,
+                np.asarray(plan),
                 query_state=query_batch['query_state'],
                 representation=str(dataset_cfg.action_representation),
             )[0]
             n_exec = int(min(execute_actions, plan_np.shape[0], max_env_steps - env_steps))
             for i in range(n_exec):
-                action = _sanitize_action(
+                action = sanitize_action(
                     plan_np[i],
-                    normalize_quaternion=_as_bool(cfg.control.normalize_quaternion),
-                    discretize_gripper=_as_bool(cfg.control.discretize_gripper),
+                    normalize_quaternion=as_bool(cfg.control.normalize_quaternion),
+                    discretize_gripper=as_bool(cfg.control.discretize_gripper),
                 )
                 try:
                     obs, reward, terminated = task_env.step(action.astype(np.float32))
@@ -624,19 +768,19 @@ def _run_eval_episode(
                 pbar.update(1)
                 success = bool(float(reward) > 0.5)
                 history.append(processor.observation_to_frame(obs))
-                if _as_bool(cfg.video.enable):
-                    frames.append(_extract_rgb_frame(obs, str(cfg.video.camera)))
+                if as_bool(cfg.video.enable):
+                    frames.append(extract_rgb_frame(obs, str(cfg.video.camera)))
                 if success or terminated or env_steps >= max_env_steps:
                     break
     finally:
         pbar.close()
 
     video_path = None
-    if _as_bool(cfg.video.enable) and frames:
-        video_file = run_dir / 'videos' / f'episode_{episode_index:04d}.{str(cfg.video.format).lower()}'
-        video_path = str(_write_video(frames, video_file, fps=int(cfg.video.fps)))
-
+    if as_bool(cfg.video.enable) and frames:
+        video_file = run_dir / f'{support_label}_videos' / f'episode_{episode_index:04d}.{str(cfg.video.format).lower()}'
+        video_path = str(write_video(frames, video_file, fps=int(cfg.video.fps)))
     return {
+        'support_label': str(support_label),
         'episode_index': int(episode_index),
         'success': bool(success),
         'terminated': bool(terminated),
@@ -646,146 +790,11 @@ def _run_eval_episode(
     }
 
 
-def evaluate(cfg: ConfigDict) -> None:
-    seed = int(cfg.seed)
-    _set_seed(seed)
-    checkpoint_path = Path(str(cfg.checkpoint_path)).expanduser().resolve()
-    if not checkpoint_path.is_file():
-        raise FileNotFoundError(f'Checkpoint not found: {checkpoint_path}')
-
-    ckpt = load_checkpoint(checkpoint_path)
-    compute_dtype = resolve_dtype('float32')
-    model_cfg = _model_cfg_from_checkpoint_or_default(cfg, ckpt, compute_dtype=compute_dtype)
-    dataset_cfg = _dataset_config_from_eval_and_checkpoint(cfg, ckpt)
-    query_stride_mode = _query_stride_mode_from_eval(cfg)
-    memory_cfg = _resolve_memory_cfg(cfg, ckpt)
-    model = QueryMemoryDirectRegressionModel(cfg=model_cfg)
-    params = ckpt['params']
-    adapt_with_stats_fn = create_adapt_with_stats_fn(
-        model=model,
-        inner_steps=int(memory_cfg.inner_steps),
-        inner_lr=float(memory_cfg.inner_lr),
-        max_grad_norm=float(memory_cfg.max_grad_norm),
-        first_order=bool(memory_cfg.first_order),
-    )
-    predict_fn = create_predict_fn(model=model)
-
-    use_mask_id = bool(model_cfg.query_encoder.use_mask_id)
-    use_rgb = bool(model_cfg.query_encoder.use_rgb)
-    task_name = str(cfg.task.name)
-    variation = int(cfg.task.variation)
-    run_id = time.strftime('%Y%m%d-%H%M%S')
-    run_dir = Path(str(cfg.output.root_dir)).expanduser().resolve() / f'{task_name}_var{variation}_{run_id}'
-    run_dir.mkdir(parents=True, exist_ok=True)
-    with (run_dir / 'resolved_eval_config.json').open('w', encoding='utf-8') as f:
-        json.dump(cfg.to_dict(), f, indent=2)
-
-    env = None
-    task_env = None
-    support_store: Optional[VariationStore] = None
-    results: List[Dict[str, Any]] = []
-    try:
-        cache_root = Path(str(cfg.conditioning.cache_root)).expanduser().resolve()
-        task_keys = build_variation_keys(cache_root, task_name)
-        if not task_keys:
-            raise RuntimeError(f"No cached variations found for task '{task_name}' under {cache_root}.")
-        support_store = VariationStore(task_keys, keep_open_per_worker=True)
-        task_builder = QueryMemoryTaskBuilder(
-            store=support_store,
-            cfg=dataset_cfg,
-            seed=seed + 101,
-            num_tries_per_item=int(getattr(cfg.dataset, 'num_tries_per_item', 100)),
-        )
-        rng = np.random.default_rng(seed + 102)
-        vidx, support_ids = _build_cached_support_ids(store=support_store, dataset_cfg=dataset_cfg, variation=variation, rng=rng)
-        support_inner = _prepare_support_inner_batches(
-            task_builder=task_builder,
-            vidx=vidx,
-            support_ids=support_ids,
-            memory_cfg=memory_cfg,
-            use_mask_id=use_mask_id,
-            use_rgb=use_rgb,
-            rng=rng,
-        )
-        adapted_memory_tokens, inner_losses, inner_grad_norms = adapt_with_stats_fn(
-            params,
-            {k: jnp.asarray(v) for k, v in support_inner.items()},
-        )
-        inner_artifacts = _save_inner_loss_artifacts(
-            inner_losses=[float(v) for v in np.asarray(inner_losses).tolist()],
-            inner_grad_norms=[float(v) for v in np.asarray(inner_grad_norms).tolist()],
-            run_dir=run_dir,
-            stem='jax_memory',
-        )
-        logging.info(
-            'adapted memory with %d inner steps | avg_inner_loss=%.6f | plot=%s',
-            int(len(np.asarray(inner_losses))),
-            float(np.mean(np.asarray(inner_losses))) if np.asarray(inner_losses).size else 0.0,
-            inner_artifacts.get('inner_loss_plot_path', ''),
-        )
-
-        env, task_env = _build_rlbench_env(cfg, task_name)
-        processor = _LiveConditioningProcessor(
-            task_env=task_env,
-            num_points=int(cfg.conditioning.num_points),
-            use_rgb=use_rgb,
-            use_mask_id=use_mask_id,
-            seed=seed + 103,
-        )
-
-        for episode_index in range(int(cfg.task.num_eval_episodes)):
-            result = _run_eval_episode(
-                episode_index=episode_index,
-                task_env=task_env,
-                variation=variation,
-                params=params,
-                predict_fn=predict_fn,
-                adapted_memory_tokens=adapted_memory_tokens,
-                dataset_cfg=dataset_cfg,
-                query_stride_mode=query_stride_mode,
-                processor=processor,
-                cfg=cfg,
-                run_dir=run_dir,
-                action_dim=int(model_cfg.action_dim),
-                use_mask_id=use_mask_id,
-                use_rgb=use_rgb,
-            )
-            results.append(result)
-            logging.info(
-                'episode=%d success=%s terminated=%s env_steps=%d error=%s',
-                int(result['episode_index']),
-                bool(result['success']),
-                bool(result['terminated']),
-                int(result['env_steps']),
-                result['error'],
-            )
-    finally:
-        if support_store is not None:
-            support_store.close()
-        if env is not None:
-            env.shutdown()
-
-    summary = {
-        'checkpoint_path': str(checkpoint_path),
-        'task_name': task_name,
-        'variation': int(variation),
-        'success_rate': float(np.mean([1.0 if r['success'] else 0.0 for r in results])) if results else 0.0,
-        'num_eval_episodes': int(len(results)),
-        'memory_adaptation': {
-            'inner_losses': [float(v) for v in np.asarray(inner_losses).tolist()],
-            'inner_grad_norms': [float(v) for v in np.asarray(inner_grad_norms).tolist()],
-            **inner_artifacts,
-        },
-        'results': results,
+def summarize_rollout_results(results: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
+    n_success = sum(1 for result in results if bool(result.get('success', False)))
+    return {
+        'num_episodes': int(len(results)),
+        'num_success': int(n_success),
+        'success_rate': float(n_success) / float(max(1, len(results))),
+        'results': list(results),
     }
-    with (run_dir / 'summary.json').open('w', encoding='utf-8') as f:
-        json.dump(summary, f, indent=2)
-
-
-def main(argv=None):
-    del argv
-    evaluate(_CONFIG.value)
-
-
-if __name__ == '__main__':
-    app.run(main)

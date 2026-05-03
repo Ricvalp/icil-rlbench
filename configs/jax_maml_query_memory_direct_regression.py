@@ -54,7 +54,7 @@ def get_config():
     cfg.model.simple_query_point_encoder.mask_hash_buckets = 2048
     cfg.model.simple_query_point_encoder.use_gripper_point_features = False
     cfg.model.simple_query_point_encoder.gripper_xyz_state_start = 0
-    cfg.model.simple_query_point_encoder.max_T_obs = 16
+    cfg.model.simple_query_point_encoder.max_T_obs = 2
     cfg.model.simple_query_point_encoder.add_state_token = True
 
     cfg.train = ConfigDict()

@@ -177,6 +177,43 @@ def create_adapt_fn(
     return adapt_fn
 
 
+def create_adapt_with_stats_fn(
+    *,
+    model: QueryMemoryDirectRegressionModel,
+    inner_steps: int,
+    inner_lr: float,
+    max_grad_norm: float,
+    first_order: bool,
+):
+    @jax.jit
+    def adapt_with_stats_fn(params: Any, inner_batch: Dict[str, jnp.ndarray]):
+        memory_tokens = params['memory_token_init']
+
+        def inner_step(carry: jnp.ndarray, step_batch: Dict[str, jnp.ndarray]):
+            def support_loss_fn(mem: jnp.ndarray) -> jnp.ndarray:
+                return _batch_loss(params, model=model, batch=step_batch, memory_tokens=mem, train=False)
+
+            support_loss, grad = jax.value_and_grad(support_loss_fn)(carry)
+            if bool(first_order):
+                grad = jax.lax.stop_gradient(grad)
+            grad_norm = _tree_global_norm(grad)
+            grad = _clip_tree_by_global_norm(grad, max_grad_norm)
+            next_mem = carry - jnp.asarray(inner_lr, dtype=carry.dtype) * grad
+            return next_mem, (support_loss, grad_norm)
+
+        if int(inner_steps) <= 0:
+            return (
+                memory_tokens,
+                jnp.zeros((0,), dtype=jnp.float32),
+                jnp.zeros((0,), dtype=jnp.float32),
+            )
+
+        adapted_memory, (inner_losses, inner_grad_norms) = jax.lax.scan(inner_step, memory_tokens, inner_batch)
+        return adapted_memory, inner_losses, inner_grad_norms
+
+    return adapt_with_stats_fn
+
+
 def create_predict_fn(*, model: QueryMemoryDirectRegressionModel):
     @jax.jit
     def predict_fn(params: Any, query_batch: Dict[str, jnp.ndarray], memory_tokens: jnp.ndarray) -> jnp.ndarray:

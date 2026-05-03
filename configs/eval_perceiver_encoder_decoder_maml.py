@@ -14,7 +14,7 @@ def get_config():
     cfg.task = ConfigDict()
     cfg.task.name = 'close_drawer'
     cfg.task.variation = 0
-    cfg.task.num_eval_episodes = 50
+    cfg.task.num_eval_episodes = 20
     cfg.task.max_env_steps = 220
 
     cfg.dataset = ConfigDict()
@@ -57,7 +57,7 @@ def get_config():
     cfg.sim.collision_checking = False
 
     cfg.control = ConfigDict()
-    cfg.control.execute_actions_per_plan = 2
+    cfg.control.execute_actions_per_plan = 1
     cfg.control.normalize_quaternion = True
     cfg.control.discretize_gripper = True
 
