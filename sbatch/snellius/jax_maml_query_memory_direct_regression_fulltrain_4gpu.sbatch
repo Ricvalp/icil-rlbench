@@ -3,8 +3,8 @@
 #SBATCH --output=/gpfs/home1/rvalperga/icil-rlbench/sbatch/snellius/logs/jax_query_mem_maml.%j.out
 #SBATCH --error=/gpfs/home1/rvalperga/icil-rlbench/sbatch/snellius/logs/jax_query_mem_maml.%j.err
 #SBATCH --partition=gpu_h100
-#SBATCH --gres=gpu:1
-#SBATCH --time=00:10:00
+#SBATCH --gres=gpu:2
+#SBATCH --time=12:00:00
 
 set -euo pipefail
 
@@ -30,10 +30,10 @@ python /gpfs/home1/rvalperga/icil-rlbench/icil_jax_query_memory/maml_query_memor
   --config.data.task_sampling=variation_uniform \
   --config.data.task_sampling_alpha=0.5 \
   --config.train.num_steps=100000 \
-  --config.train.batch_size=16 \
+  --config.train.batch_size=8 \
   --config.train.weight_decay=1e-4 \
   --config.train.log_every=10 \
-  --config.train.ckpt_every=500 \
+  --config.train.ckpt_every=1000 \
   --config.data.num_workers=24 \
   --config.data.pin_memory=True \
   --config.data.persistent_workers=True \
@@ -43,7 +43,7 @@ python /gpfs/home1/rvalperga/icil-rlbench/icil_jax_query_memory/maml_query_memor
   --config.maml.inner_lr_mode=fixed \
   --config.maml.outer_lr=1e-4 \
   --config.maml.max_grad_norm=1.0 \
-  --config.maml.num_queries_per_step=16 \
+  --config.maml.num_queries_per_step=32 \
   --config.maml.num_inner_batches=0 \
   --config.maml.num_query_loss_samples=1 \
   --config.maml.reuse_diffusion_noise=False \
