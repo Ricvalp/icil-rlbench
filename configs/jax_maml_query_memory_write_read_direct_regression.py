@@ -47,6 +47,14 @@ def get_config():
     cfg.maml.read_improvement_margin_weight = 0.0
     cfg.maml.log_output_delta = False
     cfg.maml.training_mode_metrics_only = True
+    cfg.maml.use_wrong_support_margin = False
+    cfg.maml.wrong_support_margin = 0.0
+    cfg.maml.wrong_support_margin_weight = 0.0
+    cfg.maml.wrong_support_strategy = 'random_different_task'
+    cfg.maml.use_memory_contrast = False
+    cfg.maml.memory_contrast_weight = 0.0
+    cfg.maml.memory_contrast_temperature = 0.1
+    cfg.maml.memory_contrast_on_delta = True
 
     cfg.wandb.project = os.environ.get('WANDB_PROJECT', 'icil-jax-query-memory-write-read-maml')
     cfg.wandb.tags = ('write_read', 'gradmem')

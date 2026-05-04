@@ -25,3 +25,11 @@ class QueryMemoryMetaConfig:
     read_improvement_margin_weight: float = 0.0
     log_output_delta: bool = False
     training_mode_metrics_only: bool = False
+    use_wrong_support_margin: bool = False
+    wrong_support_margin: float = 0.0
+    wrong_support_margin_weight: float = 0.0
+    wrong_support_strategy: str = 'random_different_task'
+    use_memory_contrast: bool = False
+    memory_contrast_weight: float = 0.0
+    memory_contrast_temperature: float = 0.1
+    memory_contrast_on_delta: bool = True

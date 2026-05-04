@@ -42,6 +42,46 @@ def _stack_batches(batches: Sequence[Dict[str, Any]]) -> Dict[str, np.ndarray]:
     return out
 
 
+def _expand_inner_batches(
+    prepared_tasks: Sequence[Dict[str, Any]],
+    *,
+    inner_steps: int,
+    field_name: str,
+) -> List[List[Dict[str, Any]]]:
+    expanded: List[List[Dict[str, Any]]] = []
+    for task in prepared_tasks:
+        base_inner = list(task.get(field_name, []))
+        if int(inner_steps) > 0 and not base_inner:
+            raise ValueError(f'prepared task is missing {field_name} while inner_steps > 0.')
+        steps = [base_inner[idx % len(base_inner)] for idx in range(int(inner_steps))] if inner_steps > 0 else []
+        expanded.append(steps)
+    return expanded
+
+
+def _stack_expanded_inner(expanded_inner: Sequence[Sequence[Dict[str, Any]]]) -> Dict[str, np.ndarray]:
+    inner: Dict[str, np.ndarray] = {}
+    if not expanded_inner or not expanded_inner[0]:
+        return inner
+    for key in _MANDATORY_QUERY_KEYS:
+        inner[key] = np.stack(
+            [
+                np.stack([_to_numpy(step_batch[key]) for step_batch in task_steps], axis=0)
+                for task_steps in expanded_inner
+            ],
+            axis=0,
+        )
+    for key in _OPTIONAL_QUERY_KEYS:
+        if all(all(key in step_batch for step_batch in task_steps) for task_steps in expanded_inner):
+            inner[key] = np.stack(
+                [
+                    np.stack([_to_numpy(step_batch[key]) for step_batch in task_steps], axis=0)
+                    for task_steps in expanded_inner
+                ],
+                axis=0,
+            )
+    return inner
+
+
 def prepared_tasks_to_host_batch(
     prepared_tasks: Sequence[Dict[str, Any]],
     *,
@@ -53,33 +93,9 @@ def prepared_tasks_to_host_batch(
     if int(inner_steps) < 0:
         raise ValueError(f'inner_steps must be >= 0, got {inner_steps}.')
 
-    expanded_inner: List[List[Dict[str, Any]]] = []
-    for task in prepared_tasks:
-        base_inner = list(task.get('inner_batches', []))
-        if int(inner_steps) > 0 and not base_inner:
-            raise ValueError('prepared task is missing inner_batches while inner_steps > 0.')
-        steps = [base_inner[idx % len(base_inner)] for idx in range(int(inner_steps))] if inner_steps > 0 else []
-        expanded_inner.append(steps)
+    expanded_inner = _expand_inner_batches(prepared_tasks, inner_steps=int(inner_steps), field_name='inner_batches')
 
-    inner: Dict[str, np.ndarray] = {}
-    if inner_steps > 0:
-        for key in _MANDATORY_QUERY_KEYS:
-            inner[key] = np.stack(
-                [
-                    np.stack([_to_numpy(step_batch[key]) for step_batch in task_steps], axis=0)
-                    for task_steps in expanded_inner
-                ],
-                axis=0,
-            )
-        for key in _OPTIONAL_QUERY_KEYS:
-            if all(all(key in step_batch for step_batch in task_steps) for task_steps in expanded_inner):
-                inner[key] = np.stack(
-                    [
-                        np.stack([_to_numpy(step_batch[key]) for step_batch in task_steps], axis=0)
-                        for task_steps in expanded_inner
-                    ],
-                    axis=0,
-                )
+    inner = _stack_expanded_inner(expanded_inner) if inner_steps > 0 else {}
 
     query = _stack_batches([task['query_batch'] for task in prepared_tasks])
     def _task_index(task_obj: Any) -> int:
@@ -104,12 +120,28 @@ def prepared_tasks_to_host_batch(
             [task['query_task_instance_id'] for task in prepared_tasks],
             dtype=np.int32,
         )
-    return {
+    out = {
         'inner': inner,
         'query': query,
         'meta': meta,
         'task_count': np.asarray(task_count, dtype=np.int32),
     }
+    if int(inner_steps) > 0 and all('wrong_inner_batches' in task for task in prepared_tasks):
+        out['wrong_inner'] = _stack_expanded_inner(
+            _expand_inner_batches(prepared_tasks, inner_steps=int(inner_steps), field_name='wrong_inner_batches')
+        )
+        if all('wrong_support_ids' in task for task in prepared_tasks):
+            meta['wrong_support_ids'] = np.asarray([task['wrong_support_ids'] for task in prepared_tasks], dtype=np.int32)
+        if all('wrong_support_task_instance_ids' in task for task in prepared_tasks):
+            meta['wrong_support_task_instance_ids'] = np.asarray(
+                [task['wrong_support_task_instance_ids'] for task in prepared_tasks],
+                dtype=np.int32,
+            )
+    if int(inner_steps) > 0 and all('contrast_inner_batches' in task for task in prepared_tasks):
+        out['contrast_inner'] = _stack_expanded_inner(
+            _expand_inner_batches(prepared_tasks, inner_steps=int(inner_steps), field_name='contrast_inner_batches')
+        )
+    return out
 
 
 def _reshape_for_devices(tree: Any, num_devices: int, per_device_batch: int) -> Any:

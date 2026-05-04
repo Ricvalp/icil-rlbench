@@ -280,12 +280,71 @@ def _adapt_one_task(
     return adapted_memory, stats
 
 
+def _memory_embedding(memory_tokens: jnp.ndarray, initial_memory: jnp.ndarray, *, on_delta: bool) -> jnp.ndarray:
+    x = memory_tokens - initial_memory if bool(on_delta) else memory_tokens
+    z = jnp.mean(jnp.asarray(x, dtype=jnp.float32), axis=0)
+    return z / (jnp.linalg.norm(z) + jnp.asarray(1e-6, dtype=jnp.float32))
+
+
+def _masked_info_nce(
+    z_a: jnp.ndarray,
+    z_b: jnp.ndarray,
+    labels: jnp.ndarray,
+    *,
+    temperature: float,
+) -> Tuple[jnp.ndarray, Dict[str, jnp.ndarray]]:
+    labels = jnp.asarray(labels)
+    B = int(z_a.shape[0])
+    temp = jnp.maximum(jnp.asarray(float(temperature), dtype=jnp.float32), jnp.asarray(1e-6, dtype=jnp.float32))
+    logits = (z_a @ z_b.T) / temp
+    same = labels[:, None] == labels[None, :]
+    eye = jnp.eye(B, dtype=jnp.bool_)
+    valid = jnp.logical_or(jnp.logical_not(same), eye)
+    logits = jnp.where(valid, logits, jnp.asarray(-1e9, dtype=logits.dtype))
+    log_probs = jax.nn.log_softmax(logits, axis=1)
+    targets = jnp.arange(B, dtype=jnp.int32)
+    per_row = -log_probs[targets, targets]
+    has_negative = jnp.any(jnp.logical_and(jnp.logical_not(same), jnp.logical_not(eye)), axis=1)
+    denom = jnp.maximum(jnp.sum(has_negative.astype(jnp.float32)), jnp.asarray(1.0, dtype=jnp.float32))
+    loss = jnp.sum(jnp.where(has_negative, per_row, 0.0)) / denom
+    pred = jnp.argmax(logits, axis=1)
+    acc = jnp.sum(jnp.where(has_negative, (pred == targets).astype(jnp.float32), 0.0)) / denom
+
+    sim = z_a @ z_b.T
+    within = jnp.mean(jnp.diag(sim))
+    between_mask = jnp.logical_and(jnp.logical_not(same), jnp.logical_not(eye))
+    between_denom = jnp.maximum(jnp.sum(between_mask.astype(jnp.float32)), jnp.asarray(1.0, dtype=jnp.float32))
+    between = jnp.sum(jnp.where(between_mask, sim, 0.0)) / between_denom
+    return loss, {
+        'memory_contrast_accuracy': acc,
+        'within_task_memory_similarity': within,
+        'between_task_memory_similarity': between,
+    }
+
+
+def _symmetric_memory_contrast_loss(
+    z_a: jnp.ndarray,
+    z_b: jnp.ndarray,
+    labels: jnp.ndarray,
+    *,
+    temperature: float,
+) -> Tuple[jnp.ndarray, Dict[str, jnp.ndarray]]:
+    loss_ab, metrics_ab = _masked_info_nce(z_a, z_b, labels, temperature=temperature)
+    loss_ba, metrics_ba = _masked_info_nce(z_b, z_a, labels, temperature=temperature)
+    return 0.5 * (loss_ab + loss_ba), {
+        key: 0.5 * (metrics_ab[key] + metrics_ba[key])
+        for key in metrics_ab
+    }
+
+
 def _task_meta_objective(
     params: Any,
     *,
     model: QueryMemoryDirectRegressionModel,
     task_inner: Dict[str, jnp.ndarray],
     task_query: Dict[str, jnp.ndarray],
+    task_wrong_inner: Dict[str, jnp.ndarray],
+    task_contrast_inner: Dict[str, jnp.ndarray],
     inner_steps: int,
     inner_lr: float,
     max_grad_norm: float,
@@ -297,6 +356,11 @@ def _task_meta_objective(
     read_improvement_margin_weight: float,
     log_output_delta: bool,
     training_mode_metrics_only: bool,
+    use_wrong_support_margin: bool,
+    wrong_support_margin: float,
+    wrong_support_margin_weight: float,
+    use_memory_contrast: bool,
+    memory_contrast_on_delta: bool,
 ) -> Tuple[jnp.ndarray, Dict[str, jnp.ndarray]]:
     initial_memory = params['memory_token_init']
     adapted_memory, inner_stats = _adapt_one_task(
@@ -331,6 +395,47 @@ def _task_meta_objective(
         read_loss_before_ref = jax.lax.stop_gradient(read_loss_before)
         meta_loss = meta_loss + weight * jnp.maximum(0.0, margin + read_loss_after - read_loss_before_ref)
 
+    read_loss_wrong = jnp.array(0.0, dtype=jnp.float32)
+    wrong_rank_loss = jnp.array(0.0, dtype=jnp.float32)
+    wrong_minus_correct = jnp.array(0.0, dtype=jnp.float32)
+    wrong_ranking_accuracy = jnp.array(0.0, dtype=jnp.float32)
+    wrong_memory_delta_norm = jnp.array(0.0, dtype=jnp.float32)
+    wrong_memory_relative_delta_norm = jnp.array(0.0, dtype=jnp.float32)
+    if bool(use_wrong_support_margin):
+        wrong_memory, wrong_stats = _adapt_one_task(
+            params,
+            model=model,
+            task_inner=task_wrong_inner,
+            inner_steps=inner_steps,
+            inner_lr=inner_lr,
+            max_grad_norm=max_grad_norm,
+            first_order=first_order,
+            inner_loss_mode=inner_loss_mode,
+            memory_layer_norm_after_update=memory_layer_norm_after_update,
+        )
+        read_loss_wrong = _read_loss(params, model=model, batch=task_query, memory_tokens=wrong_memory, train=True)
+        wrong_minus_correct = read_loss_wrong - read_loss_after
+        margin = jnp.asarray(wrong_support_margin, dtype=read_loss_after.dtype)
+        weight = jnp.asarray(wrong_support_margin_weight, dtype=read_loss_after.dtype)
+        wrong_rank_loss = jnp.maximum(0.0, margin + read_loss_after - read_loss_wrong)
+        meta_loss = meta_loss + weight * wrong_rank_loss
+        wrong_ranking_accuracy = (read_loss_wrong > read_loss_after).astype(jnp.float32)
+        wrong_memory_delta_norm = wrong_stats['memory_delta_norm']
+        wrong_memory_relative_delta_norm = wrong_stats['memory_relative_delta_norm']
+
+    if bool(use_memory_contrast):
+        contrast_memory, _ = _adapt_one_task(
+            params,
+            model=model,
+            task_inner=task_contrast_inner,
+            inner_steps=inner_steps,
+            inner_lr=inner_lr,
+            max_grad_norm=max_grad_norm,
+            first_order=first_order,
+            inner_loss_mode=inner_loss_mode,
+            memory_layer_norm_after_update=memory_layer_norm_after_update,
+        )
+
     if bool(log_output_delta):
         pred_before = _read_predict(params, model=model, batch=task_query, memory_tokens=initial_memory, train=True)
         pred_after = _read_predict(params, model=model, batch=task_query, memory_tokens=adapted_memory, train=True)
@@ -355,7 +460,24 @@ def _task_meta_objective(
         'memory_delta_norm': inner_stats['memory_delta_norm'],
         'memory_relative_delta_norm': inner_stats['memory_relative_delta_norm'],
         'action_output_delta': action_output_delta,
+        'read_loss_wrong_support': read_loss_wrong,
+        'wrong_support_rank_loss': wrong_rank_loss,
+        'wrong_minus_correct_loss': wrong_minus_correct,
+        'wrong_support_ranking_accuracy': wrong_ranking_accuracy,
+        'wrong_memory_delta_norm': wrong_memory_delta_norm,
+        'wrong_memory_relative_delta_norm': wrong_memory_relative_delta_norm,
     }
+    if bool(use_memory_contrast):
+        metrics['memory_contrast_z_a'] = _memory_embedding(
+            adapted_memory,
+            initial_memory,
+            on_delta=bool(memory_contrast_on_delta),
+        )
+        metrics['memory_contrast_z_b'] = _memory_embedding(
+            contrast_memory,
+            initial_memory,
+            on_delta=bool(memory_contrast_on_delta),
+        )
     return meta_loss, metrics
 
 
@@ -373,16 +495,27 @@ def create_train_step(
     read_improvement_margin_weight: float = 0.0,
     log_output_delta: bool = False,
     training_mode_metrics_only: bool = False,
+    use_wrong_support_margin: bool = False,
+    wrong_support_margin: float = 0.0,
+    wrong_support_margin_weight: float = 0.0,
+    use_memory_contrast: bool = False,
+    memory_contrast_weight: float = 0.0,
+    memory_contrast_temperature: float = 0.1,
+    memory_contrast_on_delta: bool = True,
 ):
     @partial(jax.pmap, axis_name='device')
     def train_step(state: TrainState, batch: Dict[str, Any]):
         def loss_fn(params: Any):
+            task_wrong_inner = batch['wrong_inner'] if bool(use_wrong_support_margin) else batch['inner']
+            task_contrast_inner = batch['contrast_inner'] if bool(use_memory_contrast) else batch['inner']
             task_losses, task_aux = jax.vmap(
-                lambda task_inner, task_query: _task_meta_objective(
+                lambda task_inner, task_query, wrong_inner, contrast_inner: _task_meta_objective(
                     params,
                     model=model,
                     task_inner=task_inner,
                     task_query=task_query,
+                    task_wrong_inner=wrong_inner,
+                    task_contrast_inner=contrast_inner,
                     inner_steps=int(inner_steps),
                     inner_lr=float(inner_lr),
                     max_grad_norm=float(max_grad_norm),
@@ -394,11 +527,39 @@ def create_train_step(
                     read_improvement_margin_weight=float(read_improvement_margin_weight),
                     log_output_delta=bool(log_output_delta),
                     training_mode_metrics_only=bool(training_mode_metrics_only),
+                    use_wrong_support_margin=bool(use_wrong_support_margin),
+                    wrong_support_margin=float(wrong_support_margin),
+                    wrong_support_margin_weight=float(wrong_support_margin_weight),
+                    use_memory_contrast=bool(use_memory_contrast),
+                    memory_contrast_on_delta=bool(memory_contrast_on_delta),
                 ),
-                in_axes=(0, 0),
-            )(batch['inner'], batch['query'])
-            metrics = {key: jnp.mean(value) for key, value in task_aux.items()}
-            metrics['meta_loss'] = jnp.mean(task_losses)
+                in_axes=(0, 0, 0, 0),
+            )(batch['inner'], batch['query'], task_wrong_inner, task_contrast_inner)
+            meta_loss = jnp.mean(task_losses)
+            contrast_metrics = {
+                'memory_contrast_loss': jnp.array(0.0, dtype=jnp.float32),
+                'memory_contrast_accuracy': jnp.array(0.0, dtype=jnp.float32),
+                'within_task_memory_similarity': jnp.array(0.0, dtype=jnp.float32),
+                'between_task_memory_similarity': jnp.array(0.0, dtype=jnp.float32),
+            }
+            if bool(use_memory_contrast):
+                z_a = task_aux['memory_contrast_z_a']
+                z_b = task_aux['memory_contrast_z_b']
+                labels = batch['meta']['vidx'] if 'meta' in batch and 'vidx' in batch['meta'] else jnp.arange(z_a.shape[0])
+                contrast_loss, contrast_metrics = _symmetric_memory_contrast_loss(
+                    z_a,
+                    z_b,
+                    labels,
+                    temperature=float(memory_contrast_temperature),
+                )
+                meta_loss = meta_loss + jnp.asarray(float(memory_contrast_weight), dtype=meta_loss.dtype) * contrast_loss
+            metrics = {
+                key: jnp.mean(value)
+                for key, value in task_aux.items()
+                if key not in ('memory_contrast_z_a', 'memory_contrast_z_b')
+            }
+            metrics.update(contrast_metrics)
+            metrics['meta_loss'] = meta_loss
             return metrics['meta_loss'], metrics
 
         (loss, metrics), grads = jax.value_and_grad(loss_fn, has_aux=True)(state.params)

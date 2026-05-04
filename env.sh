@@ -12,9 +12,6 @@ export ICIL_CACHE_ROOT="/mnt/external_storage/robotics/rlbench/icil_rlbench/.rlb
 # Root of generated MetaWorld ICIL caches.
 export ICIL_METAWORLD_DATA_ROOT="/mnt/external_storage/robotics/metaworld/icil_metaworld"
 
-# Default MetaWorld cache used by the JAX MetaWorld configs.
-export ICIL_METAWORLD_CACHE_ROOT="${ICIL_METAWORLD_DATA_ROOT}/button_press_ml1_train"
-
 # Multi-task MetaWorld caches.
 export ICIL_METAWORLD_MT10_CACHE_ROOT="${ICIL_METAWORLD_DATA_ROOT}/mt10_train_50x1"
 export ICIL_METAWORLD_MT10_GOAL_CACHE_ROOT="${ICIL_METAWORLD_DATA_ROOT}/mt10_goal_train_50x1"
@@ -25,6 +22,9 @@ export ICIL_METAWORLD_ML45_CACHE_ROOT="${ICIL_METAWORLD_DATA_ROOT}/ml45_train_20
 export ICIL_METAWORLD_ML45_TEST_CACHE_ROOT="${ICIL_METAWORLD_DATA_ROOT}/ml45_test_50x1"
 export ICIL_METAWORLD_ML45_GOAL_CACHE_ROOT="${ICIL_METAWORLD_DATA_ROOT}/ml45_goal_train_50x1"
 export ICIL_METAWORLD_ML45_GOAL_TEST_CACHE_ROOT="${ICIL_METAWORLD_DATA_ROOT}/ml45_goal_test_50x1"
+
+# Default MetaWorld cache used by the JAX MetaWorld configs.
+export ICIL_METAWORLD_CACHE_ROOT="${ICIL_METAWORLD_ML45_GOAL_CACHE_ROOT}"
 
 # =============================================================================
 # OUTPUT DIRECTORIES

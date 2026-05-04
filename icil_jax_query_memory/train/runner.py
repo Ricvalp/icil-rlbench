@@ -113,6 +113,8 @@ def _resolve_memory_cfg(cfg: ConfigDict) -> QueryMemoryMetaConfig:
     inner_loss_mode = str(getattr(cfg.maml, 'inner_loss_mode', 'read')).lower()
     if inner_loss_mode not in ('read', 'write'):
         raise ValueError("maml.inner_loss_mode must be one of: 'read', 'write'.")
+    if bool(getattr(cfg.maml, 'use_wrong_support_margin', False)) and bool(getattr(cfg.maml, 'use_read_improvement_margin', False)):
+        raise ValueError('Set only one of maml.use_wrong_support_margin or maml.use_read_improvement_margin for clean attribution.')
     return QueryMemoryMetaConfig(
         inner_steps=int(cfg.maml.inner_steps),
         inner_lr=float(cfg.maml.inner_lr),
@@ -140,6 +142,14 @@ def _resolve_memory_cfg(cfg: ConfigDict) -> QueryMemoryMetaConfig:
         read_improvement_margin_weight=float(getattr(cfg.maml, 'read_improvement_margin_weight', 0.0)),
         log_output_delta=bool(getattr(cfg.maml, 'log_output_delta', False)),
         training_mode_metrics_only=bool(getattr(cfg.maml, 'training_mode_metrics_only', False)),
+        use_wrong_support_margin=bool(getattr(cfg.maml, 'use_wrong_support_margin', False)),
+        wrong_support_margin=float(getattr(cfg.maml, 'wrong_support_margin', 0.0)),
+        wrong_support_margin_weight=float(getattr(cfg.maml, 'wrong_support_margin_weight', 0.0)),
+        wrong_support_strategy=str(getattr(cfg.maml, 'wrong_support_strategy', 'random_different_task')),
+        use_memory_contrast=bool(getattr(cfg.maml, 'use_memory_contrast', False)),
+        memory_contrast_weight=float(getattr(cfg.maml, 'memory_contrast_weight', 0.0)),
+        memory_contrast_temperature=float(getattr(cfg.maml, 'memory_contrast_temperature', 0.1)),
+        memory_contrast_on_delta=bool(getattr(cfg.maml, 'memory_contrast_on_delta', True)),
     )
 
 
@@ -456,6 +466,13 @@ def train(cfg: ConfigDict) -> None:
         read_improvement_margin_weight=float(memory_cfg.read_improvement_margin_weight),
         log_output_delta=bool(memory_cfg.log_output_delta),
         training_mode_metrics_only=bool(memory_cfg.training_mode_metrics_only),
+        use_wrong_support_margin=bool(memory_cfg.use_wrong_support_margin),
+        wrong_support_margin=float(memory_cfg.wrong_support_margin),
+        wrong_support_margin_weight=float(memory_cfg.wrong_support_margin_weight),
+        use_memory_contrast=bool(memory_cfg.use_memory_contrast),
+        memory_contrast_weight=float(memory_cfg.memory_contrast_weight),
+        memory_contrast_temperature=float(memory_cfg.memory_contrast_temperature),
+        memory_contrast_on_delta=bool(memory_cfg.memory_contrast_on_delta),
     )
     adapt_fn = create_adapt_fn(
         model=model,
@@ -582,7 +599,16 @@ def train(cfg: ConfigDict) -> None:
             train_batch = {
                 'inner': sharded_batch['inner'],
                 'query': sharded_batch['query'],
+                'meta': sharded_batch.get('meta', {}),
             }
+            if bool(memory_cfg.use_wrong_support_margin):
+                if 'wrong_inner' not in sharded_batch:
+                    raise RuntimeError('maml.use_wrong_support_margin=True but prepared batch has no wrong_inner.')
+                train_batch['wrong_inner'] = sharded_batch['wrong_inner']
+            if bool(memory_cfg.use_memory_contrast):
+                if 'contrast_inner' not in sharded_batch:
+                    raise RuntimeError('maml.use_memory_contrast=True but prepared batch has no contrast_inner.')
+                train_batch['contrast_inner'] = sharded_batch['contrast_inner']
             t_step_0 = time.time()
             replicated_state, metrics = p_train_step(replicated_state, train_batch)
             global_step = int(jax.device_get(jax_utils.unreplicate(replicated_state.step)))
