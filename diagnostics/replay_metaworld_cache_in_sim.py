@@ -80,6 +80,7 @@ def _make_env_for_task(
     camera_name: str,
     width: int,
     height: int,
+    force_goal_observable: bool = False,
 ) -> Any:
     metaworld = import_metaworld()
     benchmark = _make_benchmark(metaworld, benchmark_name, task_name, benchmark_seed)
@@ -99,6 +100,12 @@ def _make_env_for_task(
         height=int(height),
     )
     env.set_task(matching_tasks[int(task_instance_id)])
+    if bool(force_goal_observable):
+        env._partially_observable = False
+        try:
+            del env.sawyer_observation_space
+        except Exception:
+            pass
     return env
 
 
@@ -188,6 +195,7 @@ def replay(args: argparse.Namespace) -> None:
             camera_name=str(args.camera_name),
             width=int(args.width),
             height=int(args.height),
+            force_goal_observable=bool(args.force_goal_observable),
         )
         obs, _ = _reset_env(env, seed=int(meta.get('seed', 0)))
         reset_obs_diff = float(np.max(np.abs(obs - cached_obs[0]))) if obs.shape == cached_obs[0].shape else float('inf')
@@ -244,6 +252,7 @@ def replay(args: argparse.Namespace) -> None:
             'split': split,
             'benchmark_seed': int(args.benchmark_seed),
             'camera_name': str(args.camera_name),
+            'force_goal_observable': bool(args.force_goal_observable),
             'flip_vertical': bool(args.flip_vertical),
             'frames': len(frames),
             'frame_stride': int(args.frame_stride),
@@ -281,6 +290,7 @@ def main() -> None:
     parser.add_argument('--split', default='', help='Override cache split, e.g. train/test.')
     parser.add_argument('--benchmark-seed', type=int, default=0, help='Seed used to generate MetaWorld ML/MT task instances. Default matches configs/metaworld_generate_cache.py.')
     parser.add_argument('--camera-name', default='corner')
+    parser.add_argument('--force-goal-observable', action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument('--width', type=int, default=320)
     parser.add_argument('--height', type=int, default=240)
     parser.add_argument('--flip-vertical', action=argparse.BooleanOptionalAction, default=True, help='Flip rendered frames vertically before saving. Default fixes MuJoCo offscreen upside-down frames.')

@@ -25,6 +25,7 @@ def get_config():
     decoder.write_max_time_bins = 512
     decoder.write_time_embed_type = 'continuous_sinusoidal'
     decoder.write_query_mlp_mult = 2
+    decoder.write_use_support_obs = False
     decoder.use_decoder_mode_embed = True
     decoder.memory_layer_norm_after_update = True
     decoder.memory_update_clip_norm = 1.0

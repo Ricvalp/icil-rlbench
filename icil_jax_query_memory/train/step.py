@@ -325,7 +325,11 @@ def _task_meta_objective(
     if bool(use_read_improvement_margin):
         margin = jnp.asarray(read_improvement_margin, dtype=read_loss_after.dtype)
         weight = jnp.asarray(read_improvement_margin_weight, dtype=read_loss_after.dtype)
-        meta_loss = meta_loss + weight * jnp.maximum(0.0, margin + read_loss_after - read_loss_before)
+        # Do not let the margin objective satisfy itself by worsening the
+        # pre-adaptation READ loss. The main READ-after loss still trains the
+        # post-adaptation policy; read_loss_before remains available for logs.
+        read_loss_before_ref = jax.lax.stop_gradient(read_loss_before)
+        meta_loss = meta_loss + weight * jnp.maximum(0.0, margin + read_loss_after - read_loss_before_ref)
 
     if bool(log_output_delta):
         pred_before = _read_predict(params, model=model, batch=task_query, memory_tokens=initial_memory, train=True)

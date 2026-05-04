@@ -15,10 +15,7 @@ def _output_root():
 
 
 def _cache_root():
-    return os.environ.get(
-        'ICIL_METAWORLD_MT10_GOAL_CACHE_ROOT',
-        os.path.join('/mnt', 'external_storage', 'robotics', 'metaworld', 'icil_metaworld', 'mt10_goal_train_50x1'),
-    )
+    return ''
 
 
 def get_config():
@@ -33,12 +30,14 @@ def get_config():
     cfg.data.cache_root = _cache_root()
     cfg.data.tasks = ()
     cfg.data.exclude_tasks = ()
-    cfg.data.task_sampling = 'task_instance_uniform'
-    cfg.data.sample_same_task_name = True
-    cfg.data.sample_same_task_instance = False
-    cfg.data.allow_support_query_same_episode = False
-    cfg.data.support_zero_goal = False
-    cfg.data.query_zero_goal = False
+    # None means infer from the checkpoint config. Pass true/false or a
+    # concrete string on the CLI to override for diagnostics.
+    cfg.data.task_sampling = None
+    cfg.data.sample_same_task_name = None
+    cfg.data.sample_same_task_instance = None
+    cfg.data.allow_support_query_same_episode = None
+    cfg.data.support_zero_goal = None
+    cfg.data.query_zero_goal = None
     cfg.data.preload_to_memory = False
 
     cfg.dataset = ConfigDict()
@@ -48,8 +47,8 @@ def get_config():
     cfg.dataset.H = 8
     cfg.dataset.stride = 1
     cfg.dataset.action_stride = 1
-    cfg.dataset.pad_short_chunks = False
-    cfg.dataset.action_representation = 'absolute'
+    cfg.dataset.pad_short_chunks = None
+    cfg.dataset.action_representation = None
     cfg.dataset.num_tries_per_item = 100
 
     # Negative numeric values mean "read the value from the checkpoint".

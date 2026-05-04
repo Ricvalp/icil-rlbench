@@ -91,6 +91,26 @@ def _cfg_dict(ckpt: Dict[str, Any], key: str) -> Dict[str, Any]:
     return value if isinstance(value, dict) else {}
 
 
+def _auto_bool(value: Any) -> Any:
+    if isinstance(value, str):
+        text = value.strip().lower()
+        if text in ('', 'auto'):
+            return 'auto'
+        if text in ('1', 'true', 'yes', 'y', 'on'):
+            return True
+        if text in ('0', 'false', 'no', 'n', 'off'):
+            return False
+        raise ValueError(f'Expected bool or "auto", got {value!r}.')
+    if value is None:
+        return 'auto'
+    return bool(value)
+
+
+def _auto_str(value: Any) -> str:
+    text = str(value or '').strip()
+    return 'auto' if text.lower() in ('', 'auto') else text
+
+
 def _model_cfg_from_checkpoint(cfg: ConfigDict, ckpt: Dict[str, Any], *, compute_dtype: jnp.dtype):
     raw = None
     ckpt_cfg = ckpt.get('config', {}) if isinstance(ckpt.get('config', None), dict) else {}
@@ -127,11 +147,36 @@ def resolve_metaworld_data_cfg(cfg: ConfigDict, ckpt: Dict[str, Any]) -> MetaWor
         return int(getattr(cfg.dataset, name, local_default))
 
     def _bdata(name: str, default: bool) -> bool:
-        if hasattr(cfg.data, name):
-            return bool(getattr(cfg.data, name))
+        local = _auto_bool(getattr(cfg.data, name, 'auto'))
+        if local != 'auto':
+            return bool(local)
         if use_ckpt and name in ckpt_data:
             return bool(ckpt_data[name])
         return bool(default)
+
+    def _sdata(name: str, default: str) -> str:
+        local = _auto_str(getattr(cfg.data, name, 'auto'))
+        if local != 'auto':
+            return str(local)
+        if use_ckpt and name in ckpt_data:
+            return str(ckpt_data[name])
+        return str(default)
+
+    def _bdataset(name: str, default: bool) -> bool:
+        local = _auto_bool(getattr(cfg.dataset, name, 'auto'))
+        if local != 'auto':
+            return bool(local)
+        if use_ckpt and name in ckpt_dataset:
+            return bool(ckpt_dataset[name])
+        return bool(default)
+
+    def _sdataset(name: str, default: str) -> str:
+        local = _auto_str(getattr(cfg.dataset, name, 'auto'))
+        if local != 'auto':
+            return str(local)
+        if use_ckpt and name in ckpt_dataset:
+            return str(ckpt_dataset[name])
+        return str(default)
 
     return MetaWorldICILConfig(
         K=_ival(ckpt_dataset, 'K', 4),
@@ -139,9 +184,9 @@ def resolve_metaworld_data_cfg(cfg: ConfigDict, ckpt: Dict[str, Any]) -> MetaWor
         H=_ival(ckpt_dataset, 'H', 8),
         stride=_ival(ckpt_dataset, 'stride', 1),
         action_stride=_ival(ckpt_dataset, 'action_stride', 1),
-        pad_short_chunks=bool(ckpt_dataset.get('pad_short_chunks', getattr(cfg.dataset, 'pad_short_chunks', False))),
-        action_representation=str(ckpt_dataset.get('action_representation', getattr(cfg.dataset, 'action_representation', 'absolute'))),
-        task_sampling=str(ckpt_data.get('task_sampling', getattr(cfg.data, 'task_sampling', 'task_instance_uniform'))),
+        pad_short_chunks=_bdataset('pad_short_chunks', False),
+        action_representation=_sdataset('action_representation', 'absolute'),
+        task_sampling=_sdata('task_sampling', 'task_instance_uniform'),
         sample_same_task_name=_bdata('sample_same_task_name', True),
         sample_same_task_instance=_bdata('sample_same_task_instance', True),
         allow_support_query_same_episode=_bdata('allow_support_query_same_episode', False),
@@ -249,7 +294,9 @@ def load_metaworld_policy_components(cfg: ConfigDict) -> Dict[str, Any]:
 
 
 def load_store(cfg: ConfigDict, ckpt: Optional[Dict[str, Any]] = None) -> MetaWorldEpisodeStore:
-    cache_root = str(getattr(cfg.data, 'cache_root', ''))
+    cache_root = _auto_str(getattr(cfg.data, 'cache_root', ''))
+    if cache_root == 'auto':
+        cache_root = ''
     if not cache_root and ckpt is not None:
         cache_root = str(_cfg_dict(ckpt, 'data').get('cache_root', ''))
     if not cache_root:
@@ -435,6 +482,7 @@ def make_metaworld_env_for_instance(
     camera_name: str = 'corner',
     width: int = 320,
     height: int = 240,
+    force_goal_observable: bool = False,
 ) -> Any:
     metaworld = import_metaworld()
     benchmark_name = str(benchmark_name).upper()
@@ -459,6 +507,12 @@ def make_metaworld_env_for_instance(
         height=int(height),
     )
     env.set_task(matching[int(task_instance_id)])
+    if bool(force_goal_observable):
+        env._partially_observable = False
+        try:
+            del env.sawyer_observation_space
+        except Exception:
+            pass
     return env
 
 

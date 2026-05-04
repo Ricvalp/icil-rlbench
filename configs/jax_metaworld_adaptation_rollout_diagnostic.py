@@ -12,10 +12,15 @@ def get_config():
     cfg.rollout.num_episodes = 10
     cfg.rollout.max_steps = 200
     cfg.rollout.execute_actions_per_plan = 4
+    cfg.rollout.log_initial_plan_deltas = True
 
     cfg.sim = ConfigDict()
-    cfg.sim.benchmark = 'MT10'
-    cfg.sim.split = 'train'
+    # Empty means infer from the selected cache index.json.
+    cfg.sim.benchmark = ''
+    cfg.sim.split = ''
+    # "auto" forces goal-observable ML envs when the selected cache stores
+    # goal-observable 39D states and query_zero_goal=False.
+    cfg.sim.force_goal_observable = 'auto'
     cfg.sim.benchmark_seed = int(os.environ.get('ICIL_METAWORLD_BENCHMARK_SEED', '0'))
 
     cfg.video = ConfigDict()
