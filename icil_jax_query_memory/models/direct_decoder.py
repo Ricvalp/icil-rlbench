@@ -31,6 +31,7 @@ class DirectDecoderConfig:
     write_max_time_bins: int = 512
     write_time_embed_type: str = 'continuous_sinusoidal'
     write_query_mlp_mult: int = 2
+    write_use_support_obs: bool = False
     use_decoder_mode_embed: bool = False
     memory_layer_norm_after_update: bool = False
     memory_update_clip_norm: float = 0.0
@@ -301,12 +302,20 @@ class DirectDecoderCore(nn.Module):
             if support_tokens is None:
                 raise ValueError('WRITE mode requires support_tokens/memory_tokens.')
             B = int(support_tokens.shape[0])
-            query_tokens, query_mask = WriteQueryTokenBuilder(self.cfg, name='write_query_builder')(
+            write_tokens, write_mask = WriteQueryTokenBuilder(self.cfg, name='write_query_builder')(
                 batch_size=B,
                 demo_id=write_demo_id,
                 chunk_start=write_chunk_start,
                 train=train,
             )
+            if query_tokens is None:
+                query_tokens, query_mask = write_tokens, write_mask
+            else:
+                query_tokens = jnp.concatenate([query_tokens, write_tokens], axis=1)
+                if query_mask is None:
+                    query_mask = jnp.ones(query_tokens.shape[:2], dtype=jnp.bool_)
+                else:
+                    query_mask = jnp.concatenate([query_mask, write_mask], axis=1)
 
         d = int(self.cfg.d_model)
         dtype = self.cfg.dtype

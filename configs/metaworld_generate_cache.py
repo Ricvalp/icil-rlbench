@@ -28,6 +28,10 @@ def get_config():
     cfg.metaworld.max_path_length = 200
     cfg.metaworld.render = False
     cfg.metaworld.keep_successful_only = True
+    cfg.metaworld.skip_failed_task_instances = False
+    # ML benchmarks hide the goal in obs by default. Scripted policies need the
+    # goal for several tasks, so goal-kept caches should override this.
+    cfg.metaworld.force_goal_observable = False
 
     cfg.obs = ConfigDict()
     cfg.obs.variant = 'no_task_no_goal'

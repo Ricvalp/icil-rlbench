@@ -9,7 +9,13 @@ import numpy as np
 
 
 class MetaWorldEpisodeStore:
-    def __init__(self, cache_root: str | Path, *, keep_open_per_worker: bool = True):
+    def __init__(
+        self,
+        cache_root: str | Path,
+        *,
+        keep_open_per_worker: bool = True,
+        preload_to_memory: bool = False,
+    ):
         root = Path(cache_root).expanduser().resolve()
         if root.is_file():
             self.cache_path = root
@@ -25,13 +31,22 @@ class MetaWorldEpisodeStore:
         with self.index_path.open('r', encoding='utf-8') as f:
             self.index = json.load(f)
         self.keep_open_per_worker = bool(keep_open_per_worker)
+        self.preload_to_memory = bool(preload_to_memory)
         self._h5: Optional[h5py.File] = None
+        self._episode_cache: Optional[Dict[str, Dict[str, np.ndarray]]] = None
+        self._preloaded_bytes = 0
+        if self.preload_to_memory:
+            self._ensure_preloaded()
 
     def __getstate__(self) -> Dict[str, Any]:
         state = dict(self.__dict__)
         # h5py handles are process-local and cannot be pickled by spawned
         # DataLoader workers. Workers reopen lazily through _file().
         state['_h5'] = None
+        # Avoid serializing potentially large numpy caches into DataLoader
+        # workers. If preload_to_memory=True, each worker preloads lazily.
+        state['_episode_cache'] = None
+        state['_preloaded_bytes'] = 0
         return state
 
     def _file(self) -> h5py.File:
@@ -45,6 +60,31 @@ class MetaWorldEpisodeStore:
         if self._h5 is not None:
             self._h5.close()
             self._h5 = None
+
+    @property
+    def preloaded_bytes(self) -> int:
+        return int(self._preloaded_bytes)
+
+    def _ensure_preloaded(self) -> None:
+        if self._episode_cache is not None:
+            return
+        cache: Dict[str, Dict[str, np.ndarray]] = {}
+        total_bytes = 0
+        with h5py.File(self.cache_path, 'r') as f:
+            for episode_id in sorted(f['episodes'].keys(), key=lambda x: int(x)):
+                group = f['episodes'][episode_id]
+                item: Dict[str, np.ndarray] = {
+                    'obs_model': group['obs_model'][:].astype(np.float32),
+                    'actions': group['actions'][:].astype(np.float32),
+                    'success': group['success'][:].astype(bool),
+                }
+                if 'obs_raw' in group:
+                    item['obs_raw'] = group['obs_raw'][:].astype(np.float32)
+                for arr in item.values():
+                    total_bytes += int(arr.nbytes)
+                cache[str(episode_id)] = item
+        self._episode_cache = cache
+        self._preloaded_bytes = int(total_bytes)
 
     def __len__(self) -> int:
         return len(self.list_task_instance_keys())
@@ -131,6 +171,13 @@ class MetaWorldEpisodeStore:
             return np.stack([dataset[int(i)] for i in idx.tolist()], axis=0)
         return dataset[idx]
 
+    @staticmethod
+    def _read_rows_np(array: np.ndarray, idx: np.ndarray) -> np.ndarray:
+        idx = np.asarray(idx, dtype=np.int64)
+        if idx.ndim != 1:
+            raise ValueError(f'Index array must be 1D, got shape {idx.shape}.')
+        return np.asarray(array[idx])
+
     def load_episode_slices(
         self,
         task_id_or_name: int | str | tuple[str, int],
@@ -141,6 +188,30 @@ class MetaWorldEpisodeStore:
         load_raw_obs: bool = False,
     ) -> Dict[str, Any]:
         del task_id_or_name
+        if self.preload_to_memory:
+            self._ensure_preloaded()
+            assert self._episode_cache is not None
+            episode_key = str(int(episode_id))
+            ep = self._episode_cache[episode_key]
+            idx = np.asarray(t_idx, dtype=np.int64)
+            obs_model = self._read_rows_np(ep['obs_model'], idx).astype(np.float32)
+            actions = self._read_rows_np(ep['actions'], idx).astype(np.float32)
+            out: Dict[str, Any] = {
+                'obs_model': obs_model,
+                'state': obs_model,
+                'action': actions,
+                'success': self._read_rows_np(ep['success'], idx).astype(bool),
+            }
+            if load_raw_obs:
+                out['obs_raw'] = self._read_rows_np(ep['obs_raw'], idx).astype(np.float32)
+            if load_full_traj:
+                if load_raw_obs:
+                    out['obs_raw_traj'] = ep['obs_raw'].astype(np.float32)
+                out['obs_model_traj'] = ep['obs_model'].astype(np.float32)
+                out['action_traj'] = ep['actions'].astype(np.float32)
+                out['success_traj'] = ep['success'].astype(bool)
+            return out
+
         close_after = not self.keep_open_per_worker
         f = self._file()
         try:

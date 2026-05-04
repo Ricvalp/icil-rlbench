@@ -94,6 +94,16 @@ def prepared_tasks_to_host_batch(
         'query_episode_id': np.asarray([task['query_episode_id'] for task in prepared_tasks], dtype=np.int32),
         'vidx': np.asarray([_task_index(task['task']) for task in prepared_tasks], dtype=np.int32),
     }
+    if all('support_task_instance_ids' in task for task in prepared_tasks):
+        meta['support_task_instance_ids'] = np.asarray(
+            [task['support_task_instance_ids'] for task in prepared_tasks],
+            dtype=np.int32,
+        )
+    if all('query_task_instance_id' in task for task in prepared_tasks):
+        meta['query_task_instance_id'] = np.asarray(
+            [task['query_task_instance_id'] for task in prepared_tasks],
+            dtype=np.int32,
+        )
     return {
         'inner': inner,
         'query': query,

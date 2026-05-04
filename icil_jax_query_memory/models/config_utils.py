@@ -60,6 +60,7 @@ def build_model_config_from_raw(raw_model_cfg: Any, *, state_dim: int, action_di
         write_max_time_bins=int(getattr(decoder_raw, 'write_max_time_bins', 512)),
         write_time_embed_type=str(getattr(decoder_raw, 'write_time_embed_type', 'continuous_sinusoidal')),
         write_query_mlp_mult=int(getattr(decoder_raw, 'write_query_mlp_mult', 2)),
+        write_use_support_obs=bool(getattr(decoder_raw, 'write_use_support_obs', False)),
         use_decoder_mode_embed=bool(getattr(decoder_raw, 'use_decoder_mode_embed', False)),
         memory_layer_norm_after_update=bool(getattr(decoder_raw, 'memory_layer_norm_after_update', False)),
         memory_update_clip_norm=float(getattr(decoder_raw, 'memory_update_clip_norm', 0.0)),

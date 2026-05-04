@@ -43,14 +43,20 @@ def _apply_metaworld_overrides(cfg):
     cfg.data.tasks = ('button-press-v3',)
     cfg.data.exclude_tasks = ()
     cfg.data.keep_open_per_worker = True
-    cfg.data.num_workers = 8
+    cfg.data.preload_to_memory = False
+    # MetaWorld cache items are low-dimensional. Keeping this at 0 avoids
+    # spawned PyTorch workers importing the JAX runtime and consuming multiple
+    # GB each on local workstations.
+    cfg.data.num_workers = 0
     cfg.data.pin_memory = False
-    cfg.data.persistent_workers = True
-    cfg.data.prefetch_factor = 4
+    cfg.data.persistent_workers = False
+    cfg.data.prefetch_factor = 2
     cfg.data.task_sampling = 'task_instance_uniform'
     cfg.data.sample_same_task_name = True
     cfg.data.sample_same_task_instance = True
     cfg.data.allow_support_query_same_episode = False
+    cfg.data.support_zero_goal = False
+    cfg.data.query_zero_goal = False
 
     cfg.dataset.K = 4
     cfg.dataset.L = 0

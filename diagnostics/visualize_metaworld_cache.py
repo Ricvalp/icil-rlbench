@@ -164,16 +164,38 @@ def _plot_full_episode_overview(
         all_points.extend([hand, obj])
         role = 'query' if int(episode_id) == int(task.query_episode_id) else 'support'
         color = 'tab:purple' if role == 'query' else 'tab:blue'
+        ax.set_facecolor('#f6f0ff' if role == 'query' else '#f3f7ff')
         ax.plot(hand[:, 0], hand[:, 1], hand[:, 2], color=color, linewidth=1.6, label='hand')
         ax.scatter(hand[0, 0], hand[0, 1], hand[0, 2], color='black', s=22, label='start')
         ax.scatter(hand[-1, 0], hand[-1, 1], hand[-1, 2], color=color, s=36, marker='x', label='end')
         ax.plot(obj[:, 0], obj[:, 1], obj[:, 2], color='tab:orange', linewidth=1.2, alpha=0.9, label='object/button')
-        if np.any(success):
-            sidx = int(np.argmax(success))
-            ax.scatter(hand[sidx, 0], hand[sidx, 1], hand[sidx, 2], color='tab:green', s=50, marker='*', label='first success')
         q_idx = np.linspace(0, max(0, hand.shape[0] - 1), num=min(max_quivers, hand.shape[0]), dtype=np.int64)
         vec = actions[q_idx, :3] * float(action_scale)
-        ax.quiver(hand[q_idx, 0], hand[q_idx, 1], hand[q_idx, 2], vec[:, 0], vec[:, 1], vec[:, 2], color='tab:red', length=1.0, normalize=False, alpha=0.55)
+        ax.quiver(hand[q_idx, 0], hand[q_idx, 1], hand[q_idx, 2], vec[:, 0], vec[:, 1], vec[:, 2], color='tab:red', length=1.0, normalize=False, alpha=0.45)
+        if np.any(success):
+            sidx = int(np.argmax(success))
+            ax.scatter(
+                hand[sidx, 0],
+                hand[sidx, 1],
+                hand[sidx, 2],
+                color='lime',
+                edgecolors='black',
+                linewidths=0.8,
+                s=120,
+                marker='*',
+                label=f'first success t={sidx}',
+                zorder=20,
+            )
+        ax.text2D(
+            0.04,
+            0.93,
+            role.upper(),
+            transform=ax.transAxes,
+            color=color,
+            fontsize=11,
+            fontweight='bold',
+            bbox=dict(facecolor='white', edgecolor=color, alpha=0.85, boxstyle='round,pad=0.25'),
+        )
         ax.set_title(f'{role} episode {episode_id}')
         ax.set_xlabel('x')
         ax.set_ylabel('y')
@@ -226,6 +248,7 @@ def _plot_support_query_chunks(
 
         role = str(chunk['role'])
         main_color = 'tab:purple' if role == 'query' else 'tab:blue'
+        ax.set_facecolor('#f6f0ff' if role == 'query' else '#f3f7ff')
         ax.plot(hand[:, 0], hand[:, 1], hand[:, 2], color='0.80', linewidth=0.8, label='episode hand')
         ax.plot(obj[:, 0], obj[:, 1], obj[:, 2], color='tab:orange', linewidth=1.0, alpha=0.8, label='object/button')
         ax.plot(obs_hand[:, 0], obs_hand[:, 1], obs_hand[:, 2], color=main_color, linewidth=2.6, marker='o', label='T_obs')
@@ -235,6 +258,16 @@ def _plot_support_query_chunks(
         vec = act[q_idx] * float(action_scale)
         ax.quiver(base[:, 0], base[:, 1], base[:, 2], vec[:, 0], vec[:, 1], vec[:, 2], color='tab:red', length=1.0, normalize=False, alpha=0.8, label='action xyz')
         ax.scatter(hand[int(chunk['t0']), 0], hand[int(chunk['t0']), 1], hand[int(chunk['t0']), 2], color='black', s=24, label='t0')
+        ax.text2D(
+            0.04,
+            0.93,
+            role.upper(),
+            transform=ax.transAxes,
+            color=main_color,
+            fontsize=11,
+            fontweight='bold',
+            bbox=dict(facecolor='white', edgecolor=main_color, alpha=0.85, boxstyle='round,pad=0.25'),
+        )
         if role == 'support':
             title = f'support demo {chunk["demo_id"]}\nep {episode_id}, t0 {chunk["t0"]}'
         else:

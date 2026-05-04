@@ -235,6 +235,7 @@ def generate(cfg: ConfigDict) -> Path:
     max_path_length = int(getattr(cfg.metaworld, 'max_path_length', 200))
     clip_action = bool(getattr(cfg.action, 'clip', False))
     keep_successful_only = bool(getattr(cfg.metaworld, 'keep_successful_only', True)) if hasattr(cfg.metaworld, 'keep_successful_only') else True
+    skip_failed_task_instances = bool(getattr(cfg.metaworld, 'skip_failed_task_instances', False))
     debug_limit_episodes = int(getattr(cfg.debug, 'limit_episodes', 0))
     if debug_limit_episodes > 0:
         required_successes = min(required_successes, debug_limit_episodes)
@@ -247,6 +248,7 @@ def generate(cfg: ConfigDict) -> Path:
         'split': str(getattr(cfg.metaworld, 'train_or_test', 'train')),
         'obs': cfg.obs.to_dict(),
         'action': cfg.action.to_dict(),
+        'skipped_task_instances': [],
         'tasks': {},
         'episodes': {},
     }
@@ -275,6 +277,12 @@ def generate(cfg: ConfigDict) -> Path:
                 env = env_cls()
                 try:
                     env.set_task(task)
+                    if bool(getattr(cfg.metaworld, 'force_goal_observable', False)):
+                        env._partially_observable = False
+                        try:
+                            del env.sawyer_observation_space
+                        except Exception:
+                            pass
                     try:
                         env.action_space.seed(int(cfg.seed) + 7919 * task_index + task_instance_id)
                     except Exception:
@@ -339,9 +347,25 @@ def generate(cfg: ConfigDict) -> Path:
                         instance_episode_ids.append(episode_id)
                         successes += 1
                     if successes < required_successes:
-                        raise RuntimeError(
+                        message = (
                             f'Only generated {successes}/{required_successes} successful episodes for '
                             f'{task_name} instance {task_instance_id} after {attempts} attempts.'
+                        )
+                        if skip_failed_task_instances:
+                            logging.warning('Skipping failed MetaWorld task instance: %s', message)
+                            index['skipped_task_instances'].append(
+                                {
+                                    'task_name': str(task_name),
+                                    'task_index': int(task_index),
+                                    'task_instance_id': int(task_instance_id),
+                                    'successes': int(successes),
+                                    'required_successes': int(required_successes),
+                                    'attempts': int(attempts),
+                                }
+                            )
+                            continue
+                        raise RuntimeError(
+                            message
                         )
                     index['tasks'][task_name]['instances'][str(task_instance_id)] = instance_episode_ids
                 finally:

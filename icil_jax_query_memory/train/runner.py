@@ -41,6 +41,24 @@ def _as_bool(value: Any) -> bool:
     return bool(value)
 
 
+def _shutdown_dataloader_workers(loader_iter: Any, loader: Any) -> None:
+    # PyTorch usually tears workers down when the iterator is GC'ed, but JAX
+    # jobs are often interrupted or fail during compilation/logging. Explicit
+    # shutdown avoids orphaned spawned pt_data_worker processes keeping many GB
+    # of RSS alive after the main process exits.
+    seen = set()
+    for obj in (loader_iter, getattr(loader, '_iterator', None)):
+        if obj is None or id(obj) in seen:
+            continue
+        seen.add(id(obj))
+        shutdown = getattr(obj, '_shutdown_workers', None)
+        if callable(shutdown):
+            try:
+                shutdown()
+            except Exception:
+                pass
+
+
 def _set_seed(seed: int) -> None:
     np.random.seed(seed)
 
@@ -81,6 +99,8 @@ def _resolve_metaworld_dataset_cfg(cfg: ConfigDict) -> Any:
         sample_same_task_name=bool(getattr(cfg.data, 'sample_same_task_name', True)),
         sample_same_task_instance=bool(getattr(cfg.data, 'sample_same_task_instance', True)),
         allow_support_query_same_episode=bool(getattr(cfg.data, 'allow_support_query_same_episode', False)),
+        support_zero_goal=bool(getattr(cfg.data, 'support_zero_goal', False)),
+        query_zero_goal=bool(getattr(cfg.data, 'query_zero_goal', False)),
     )
 
 
@@ -377,7 +397,10 @@ def train(cfg: ConfigDict) -> None:
         store = MetaWorldEpisodeStore(
             cache_root=cache_root,
             keep_open_per_worker=bool(cfg.data.keep_open_per_worker),
+            preload_to_memory=bool(getattr(cfg.data, 'preload_to_memory', False)),
         )
+        if bool(getattr(cfg.data, 'preload_to_memory', False)):
+            logging.info('Preloaded MetaWorld cache into RAM: %.2f MiB', float(store.preloaded_bytes) / (1024.0 * 1024.0))
         selected_tasks = tasks if tasks else tuple(store.list_task_names())
         state_dim, action_dim = store.infer_dims()
         num_points = 1
@@ -536,9 +559,10 @@ def train(cfg: ConfigDict) -> None:
     log_timing_sums = {'data_wait_s': 0.0, 'train_step_s': 0.0}
     log_count = 0
     window_start = time.time()
-    loader_iter = iter(loader)
+    loader_iter = None
 
     try:
+        loader_iter = iter(loader)
         while True:
             if global_step >= int(cfg.train.num_steps):
                 break
@@ -679,6 +703,7 @@ def train(cfg: ConfigDict) -> None:
         )
         logging.info('Training complete. Final checkpoint: %s', checkpoint_dir / 'last.pkl')
     finally:
+        _shutdown_dataloader_workers(loader_iter, loader)
         if wandb_run is not None:
             wandb_run.finish()
         store.close()

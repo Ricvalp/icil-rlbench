@@ -158,6 +158,11 @@ def _write_predict(
 ) -> jnp.ndarray:
     return model.apply(
         {'params': params},
+        query_xyz=batch.get('query_xyz', None),
+        query_state=batch.get('query_state', None),
+        query_valid=batch.get('query_valid', None),
+        query_rgb=batch.get('query_rgb', None),
+        query_mask_id=batch.get('query_mask_id', None),
         memory_tokens=memory_tokens,
         mode='write',
         write_demo_id=_metadata_or_zeros(batch, 'demo_id', 'support_demo_id'),

@@ -26,6 +26,8 @@ class MetaWorldICILConfig:
     sample_same_task_name: bool = True
     sample_same_task_instance: bool = True
     allow_support_query_same_episode: bool = False
+    support_zero_goal: bool = False
+    query_zero_goal: bool = False
 
     def __post_init__(self) -> None:
         for name in ('K', 'T_obs', 'H', 'stride', 'action_stride'):
@@ -38,8 +40,6 @@ class MetaWorldICILConfig:
             raise ValueError('MetaWorld action_representation must be "absolute" for raw action chunks.')
         if not bool(self.sample_same_task_name):
             raise NotImplementedError('MetaWorld training currently samples support/query from the same task family.')
-        if not bool(self.sample_same_task_instance):
-            raise NotImplementedError('MetaWorld training currently samples support/query from the same task instance/goal.')
 
 
 @dataclass(frozen=True)
@@ -49,6 +49,8 @@ class MetaWorldMAMLTaskSpec:
     task_instance_id: int
     support_episode_ids: Tuple[int, ...]
     query_episode_id: int
+    support_task_instance_ids: Tuple[int, ...] = ()
+    query_task_instance_id: int = -1
 
     @property
     def vidx(self) -> int:
@@ -76,6 +78,10 @@ class MetaWorldQueryMemoryTaskBuilder:
         self.task_instance_keys = store.list_task_instance_keys(tasks=task_names, exclude_tasks=exclude_tasks)
         if not self.task_instance_keys:
             raise RuntimeError('No MetaWorld task instances available after task filtering.')
+        self.task_instances_by_name: Dict[str, List[int]] = {}
+        for task_name, instance_id in self.task_instance_keys:
+            self.task_instances_by_name.setdefault(str(task_name), []).append(int(instance_id))
+        self.task_names = tuple(sorted(self.task_instances_by_name.keys()))
 
     def _rng(self) -> np.random.Generator:
         wi = get_worker_info()
@@ -95,27 +101,75 @@ class MetaWorldQueryMemoryTaskBuilder:
         idx = int(rng.integers(0, len(self.task_instance_keys)))
         return self.task_instance_keys[idx]
 
+    def _sample_episode_from_instance(self, task_name: str, instance_id: int, rng: np.random.Generator) -> Optional[int]:
+        episode_ids = self.store.list_episode_ids(task_name, task_instance_id=int(instance_id))
+        if episode_ids.shape[0] == 0:
+            return None
+        return int(rng.choice(episode_ids))
+
+    def _build_same_instance_task_spec(self, rng: np.random.Generator) -> Optional[MetaWorldMAMLTaskSpec]:
+        task_name, instance_id = self._sample_task_instance(rng)
+        episode_ids = self.store.list_episode_ids(task_name, task_instance_id=instance_id)
+        need = int(self.cfg.K) + (0 if bool(self.cfg.allow_support_query_same_episode) else 1)
+        if episode_ids.shape[0] < need:
+            return None
+        if bool(self.cfg.allow_support_query_same_episode):
+            support_ids = rng.choice(episode_ids, size=int(self.cfg.K), replace=episode_ids.shape[0] < int(self.cfg.K))
+            query_id = int(rng.choice(episode_ids))
+        else:
+            chosen = rng.choice(episode_ids, size=int(self.cfg.K) + 1, replace=False).astype(np.int64)
+            support_ids = chosen[: int(self.cfg.K)]
+            query_id = int(chosen[int(self.cfg.K)])
+        return MetaWorldMAMLTaskSpec(
+            task_name=str(task_name),
+            task_index=int(self.store.task_index(task_name)),
+            task_instance_id=int(instance_id),
+            support_episode_ids=tuple(int(eid) for eid in np.asarray(support_ids).tolist()),
+            query_episode_id=int(query_id),
+            support_task_instance_ids=tuple([int(instance_id)] * int(self.cfg.K)),
+            query_task_instance_id=int(instance_id),
+        )
+
+    def _build_same_family_different_instance_task_spec(self, rng: np.random.Generator) -> Optional[MetaWorldMAMLTaskSpec]:
+        valid_task_names = [
+            name for name in self.task_names if len(self.task_instances_by_name.get(name, ())) >= int(self.cfg.K) + 1
+        ]
+        if not valid_task_names:
+            return None
+        task_name = str(valid_task_names[int(rng.integers(0, len(valid_task_names)))])
+        instance_ids = np.asarray(self.task_instances_by_name[task_name], dtype=np.int64)
+        chosen_instances = rng.choice(instance_ids, size=int(self.cfg.K) + 1, replace=False).astype(np.int64)
+        support_instance_ids = chosen_instances[: int(self.cfg.K)]
+        query_instance_id = int(chosen_instances[int(self.cfg.K)])
+
+        support_episode_ids: List[int] = []
+        for instance_id in support_instance_ids.tolist():
+            episode_id = self._sample_episode_from_instance(task_name, int(instance_id), rng)
+            if episode_id is None:
+                return None
+            support_episode_ids.append(int(episode_id))
+        query_episode_id = self._sample_episode_from_instance(task_name, query_instance_id, rng)
+        if query_episode_id is None:
+            return None
+
+        return MetaWorldMAMLTaskSpec(
+            task_name=str(task_name),
+            task_index=int(self.store.task_index(task_name)),
+            task_instance_id=int(query_instance_id),
+            support_episode_ids=tuple(int(eid) for eid in support_episode_ids),
+            query_episode_id=int(query_episode_id),
+            support_task_instance_ids=tuple(int(v) for v in support_instance_ids.tolist()),
+            query_task_instance_id=int(query_instance_id),
+        )
+
     def build_task_spec(self, rng: np.random.Generator) -> Optional[MetaWorldMAMLTaskSpec]:
         for _ in range(self.num_tries_per_item):
-            task_name, instance_id = self._sample_task_instance(rng)
-            episode_ids = self.store.list_episode_ids(task_name, task_instance_id=instance_id)
-            need = int(self.cfg.K) + (0 if bool(self.cfg.allow_support_query_same_episode) else 1)
-            if episode_ids.shape[0] < need:
-                continue
-            if bool(self.cfg.allow_support_query_same_episode):
-                support_ids = rng.choice(episode_ids, size=int(self.cfg.K), replace=episode_ids.shape[0] < int(self.cfg.K))
-                query_id = int(rng.choice(episode_ids))
+            if bool(self.cfg.sample_same_task_instance):
+                spec = self._build_same_instance_task_spec(rng)
             else:
-                chosen = rng.choice(episode_ids, size=int(self.cfg.K) + 1, replace=False).astype(np.int64)
-                support_ids = chosen[: int(self.cfg.K)]
-                query_id = int(chosen[int(self.cfg.K)])
-            return MetaWorldMAMLTaskSpec(
-                task_name=str(task_name),
-                task_index=int(self.store.task_index(task_name)),
-                task_instance_id=int(instance_id),
-                support_episode_ids=tuple(int(eid) for eid in np.asarray(support_ids).tolist()),
-                query_episode_id=int(query_id),
-            )
+                spec = self._build_same_family_different_instance_task_spec(rng)
+            if spec is not None:
+                return spec
         return None
 
     def _valid_t0_bounds(self, *, task_name: str, episode_id: int) -> Optional[tuple[int, int]]:
@@ -136,6 +190,13 @@ class MetaWorldQueryMemoryTaskBuilder:
             act_idx = np.minimum(act_idx, int(episode_length) - 1)
         return obs_idx.astype(np.int64), act_idx.astype(np.int64)
 
+    @staticmethod
+    def _maybe_zero_goal(query_state: torch.Tensor, *, zero_goal: bool) -> torch.Tensor:
+        if bool(zero_goal) and query_state.shape[-1] >= 39:
+            query_state = query_state.clone()
+            query_state[..., -3:] = 0.0
+        return query_state
+
     def _build_query_sample_at_t0(
         self,
         *,
@@ -143,13 +204,15 @@ class MetaWorldQueryMemoryTaskBuilder:
         episode_id: int,
         t0: int,
         demo_id: Optional[int] = None,
+        zero_goal: bool = False,
     ) -> Dict[str, Any]:
         T = int(self.store.episode_length(task_name, episode_id))
         obs_idx, act_idx = self._indices_for_t0(t0=int(t0), episode_length=T)
         obs = self.store.load_episode_slices(task_name, int(episode_id), obs_idx)
         act = self.store.load_episode_slices(task_name, int(episode_id), act_idx)
-        query_state = torch.from_numpy(obs['obs_model']).float()
+        query_state = self._maybe_zero_goal(torch.from_numpy(obs['obs_model']).float(), zero_goal=bool(zero_goal))
         target_action = torch.from_numpy(act['action']).float()
+        ep_meta = self.store.episode_metadata(int(episode_id))
         sample: Dict[str, Any] = {
             'query_xyz': torch.zeros((int(self.cfg.T_obs), 1, 3), dtype=torch.float32),
             'query_state': query_state,
@@ -158,7 +221,9 @@ class MetaWorldQueryMemoryTaskBuilder:
             'meta': {
                 'task_name': str(task_name),
                 'episode_id': int(episode_id),
+                'task_instance_id': int(ep_meta.get('task_instance_id', -1)),
                 't0': int(t0),
+                'goal_zeroed': bool(zero_goal),
             },
         }
         if demo_id is not None:
@@ -209,12 +274,17 @@ class MetaWorldQueryMemoryTaskBuilder:
                 episode_id=int(episode_id),
                 t0=t0,
                 demo_id=demo_id,
+                zero_goal=bool(self.cfg.support_zero_goal),
             )
+            support_instance_id = int(self.store.episode_metadata(int(episode_id)).get('task_instance_id', -1))
             sample['meta'].update(
                 {
                     'support_episode': int(episode_id),
+                    'support_task_instance_id': support_instance_id,
                     'support_episodes': support_ids,
+                    'support_task_instance_ids': [int(v) for v in task.support_task_instance_ids],
                     'task_query_episode': int(task.query_episode_id),
+                    'query_task_instance_id': int(task.query_task_instance_id),
                 }
             )
             samples.append(sample)
@@ -242,11 +312,14 @@ class MetaWorldQueryMemoryTaskBuilder:
                 episode_id=int(task.query_episode_id),
                 t0=t0,
                 demo_id=None,
+                zero_goal=bool(self.cfg.query_zero_goal),
             )
             sample['meta'].update(
                 {
                     'support_episodes': [int(ep_id) for ep_id in task.support_episode_ids],
+                    'support_task_instance_ids': [int(v) for v in task.support_task_instance_ids],
                     'task_query_episode': int(task.query_episode_id),
+                    'query_task_instance_id': int(task.query_task_instance_id),
                 }
             )
             samples.append(sample)
@@ -290,7 +363,9 @@ def prepare_metaworld_query_memory_task_for_meta_step(
     return {
         'task': task,
         'support_ids': [int(ep_id) for ep_id in task.support_episode_ids],
+        'support_task_instance_ids': [int(v) for v in task.support_task_instance_ids],
         'query_episode_id': int(task.query_episode_id),
+        'query_task_instance_id': int(task.query_task_instance_id),
         'inner_batches': inner_batches,
         'query_batch': query_batch,
     }

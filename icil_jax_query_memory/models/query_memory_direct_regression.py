@@ -53,9 +53,23 @@ class QueryMemoryDirectRegressionModel(nn.Module):
             )
             batch_size = int(query_xyz.shape[0])
         else:
-            query_tokens = None
-            query_mask = None
-            if memory_tokens is not None and memory_tokens.ndim == 3:
+            if bool(self.cfg.decoder.write_use_support_obs) and query_xyz is not None and query_state is not None:
+                encoder = SimpleQueryPointEncoder(cfg=self.cfg.query_encoder, state_dim=int(self.cfg.state_dim), name='context_encoder')
+                query_tokens, query_mask = encoder(
+                    query_xyz=query_xyz,
+                    query_state=query_state,
+                    query_valid=query_valid,
+                    query_rgb=query_rgb,
+                    query_mask_id=query_mask_id,
+                )
+                batch_size = int(query_xyz.shape[0])
+            else:
+                query_tokens = None
+                query_mask = None
+                batch_size = -1
+            if batch_size > 0:
+                pass
+            elif memory_tokens is not None and memory_tokens.ndim == 3:
                 batch_size = int(memory_tokens.shape[0])
             elif write_demo_id is not None:
                 arr = jnp.asarray(write_demo_id)

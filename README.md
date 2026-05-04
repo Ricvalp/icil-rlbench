@@ -40,6 +40,9 @@ pip install -e ".[profile]"
 - `ICIL_PROFILE_TRACE_DIR`: profiling trace output directory
 - `ICIL_PRETRAIN_PROFILE_TRACE_FILE`: profiling trace filename stem
 - `ICIL_METAWORLD_CACHE_ROOT`: MetaWorld HDF5 cache root used by the JAX MetaWorld configs
+- `ICIL_METAWORLD_MT10_CACHE_ROOT`: MetaWorld MT10 multitask cache root
+- `ICIL_METAWORLD_MT10_GOAL_CACHE_ROOT`: MetaWorld MT10 cache root with the final 3D goal kept in `obs_model`
+- `ICIL_METAWORLD_MT50_CACHE_ROOT`: MetaWorld MT50 multitask cache root
 
 If `cfg.conditioning.cache_root` is empty in eval configs, eval falls back to `checkpoint["config"]["data"]["cache_root"]`.
 
@@ -81,6 +84,36 @@ PYTHONPATH=. python -m icil_metaworld.data.generate_metaworld_expert_cache \
   --config=configs/metaworld_generate_cache.py
 ```
 
+Generate a multitask MT10 cache:
+```bash
+conda activate jax-icil
+PYTHONPATH=. python -m icil_metaworld.data.generate_metaworld_expert_cache \
+  --config=configs/metaworld_generate_mt10_cache.py
+```
+
+MT10/MT50 are the preferred scripted-demo multitask caches for now. The scripted expert sees the full environment state while the stored model observation still removes the final 3D goal slot (`obs.remove_goal=True`). ML10/ML45 configs are present, but several MetaWorld scripted policies fail there because ML benchmarks hide the goal from the observation.
+
+Generate the corrected MT10 family-level cache with the final 3D goal kept and one rollout per task instance:
+```bash
+conda activate jax-icil
+PYTHONPATH=. python -m icil_metaworld.data.generate_metaworld_expert_cache \
+  --config=configs/metaworld_generate_mt10_goal_cache.py
+```
+
+The corresponding family-level MAML config samples support/query from different task instances of the same task family:
+```bash
+PYTHONPATH=. python icil_jax_query_memory/maml_metaworld_query_memory_write_read_direct_regression.py \
+  --config=configs/jax_metaworld_mt10_goal_family_maml_query_memory_write_read_direct_regression.py
+```
+
+In the WRITE/READ path, WRITE consumes support observation tokens plus learned WRITE metadata tokens before predicting support action chunks; READ consumes query observation tokens plus adapted memory. This makes support/query goal visibility meaningful for the family-level configs.
+
+For the support-goal-hidden ablation, keep the same cache and zero the support goal slot at load time:
+```bash
+PYTHONPATH=. python icil_jax_query_memory/maml_metaworld_query_memory_write_read_direct_regression.py \
+  --config=configs/jax_metaworld_mt10_goal_family_support_no_goal_maml_query_memory_write_read_direct_regression.py
+```
+
 Inspect the cache:
 ```bash
 PYTHONPATH=. python -m icil_metaworld.data.inspect_metaworld_cache \
@@ -99,6 +132,20 @@ PYTHONPATH=. python diagnostics/visualize_metaworld_cache.py \
   --H 8
 ```
 
+Replay a cached episode in the MetaWorld simulator and save rendered video:
+```bash
+MUJOCO_GL=egl \
+PYTHONPATH=. python diagnostics/replay_metaworld_cache_in_sim.py \
+  --cache-root "${ICIL_METAWORLD_CACHE_ROOT:-output_data_playground_v3/.metaworld_cache/button_press_ml1_train}" \
+  --output-dir diagnostics/metaworld_sim_replay \
+  --task-name button-press-v3 \
+  --task-instance-id 0 \
+  --max-steps 120 \
+  --frame-stride 2 \
+  --flip-vertical \
+  --formats gif
+```
+
 MetaWorld JAX MAML/FOMAML with the original READ support objective:
 ```bash
 PYTHONPATH=. python icil_jax_query_memory/maml_metaworld_query_memory_direct_regression.py \
@@ -115,6 +162,15 @@ PYTHONPATH=. python icil_jax_query_memory/maml_metaworld_query_memory_write_read
 
 PYTHONPATH=. python icil_jax_query_memory/fomaml_metaworld_query_memory_write_read_direct_regression.py \
   --config=configs/jax_metaworld_fomaml_query_memory_write_read_direct_regression.py
+```
+
+MT10 multitask variants:
+```bash
+PYTHONPATH=. python icil_jax_query_memory/maml_metaworld_query_memory_write_read_direct_regression.py \
+  --config=configs/jax_metaworld_mt10_maml_query_memory_write_read_direct_regression.py
+
+PYTHONPATH=. python icil_jax_query_memory/fomaml_metaworld_query_memory_write_read_direct_regression.py \
+  --config=configs/jax_metaworld_mt10_fomaml_query_memory_write_read_direct_regression.py
 ```
 
 Default MetaWorld behavior:

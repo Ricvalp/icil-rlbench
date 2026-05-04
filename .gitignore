@@ -10,6 +10,7 @@ pretrained_checkpoints/
 
 
 metaworld_cache_viz
+metaworld_sim_replay
 
 *.mp4
 raw_episodes_videos/*
