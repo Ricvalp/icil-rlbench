@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from functools import partial
-from typing import Any, Dict, Tuple
+from typing import Any, Dict, Optional, Tuple
 
 import jax
 import jax.numpy as jnp
@@ -362,6 +362,7 @@ def _adapt_one_task(
     *,
     model: QueryMemoryDirectRegressionModel,
     task_inner: Dict[str, jnp.ndarray],
+    initial_memory_tokens: Optional[jnp.ndarray] = None,
     inner_steps: int,
     inner_lr: float,
     max_grad_norm: float,
@@ -369,7 +370,7 @@ def _adapt_one_task(
     inner_loss_mode: str,
     memory_layer_norm_after_update: bool,
 ) -> Tuple[jnp.ndarray, Dict[str, jnp.ndarray]]:
-    memory_tokens = params['memory_token_init']
+    memory_tokens = params['memory_token_init'] if initial_memory_tokens is None else initial_memory_tokens
     initial_memory = memory_tokens
     effective_clip = float(model.cfg.decoder.memory_update_clip_norm)
     if effective_clip <= 0.0:
@@ -421,6 +422,54 @@ def _adapt_one_task(
         'memory_relative_delta_norm': memory_relative_delta_norm,
     }
     return adapted_memory, stats
+
+
+def _flatten_support_for_memory(task_inner: Dict[str, jnp.ndarray]) -> Dict[str, jnp.ndarray]:
+    if 'query_state' not in task_inner or 'target_action' not in task_inner:
+        raise ValueError('Support-encoder memory requires task_inner query_state and target_action.')
+    state = task_inner['query_state']
+    action = task_inner['target_action']
+    if state.ndim < 4 or action.ndim < 4:
+        raise ValueError(
+            'Support-encoder memory expects per-task inner tensors with leading [inner_steps, support_chunks]. '
+            f'Got query_state={tuple(state.shape)}, target_action={tuple(action.shape)}.'
+        )
+    out = {
+        'support_query_state': state.reshape((-1,) + tuple(state.shape[2:])),
+        'support_target_action': action.reshape((-1,) + tuple(action.shape[2:])),
+    }
+    for src_key, dst_key in (
+        ('support_demo_id', 'support_demo_id'),
+        ('demo_id', 'support_demo_id'),
+        ('support_chunk_start', 'support_chunk_start'),
+        ('chunk_start', 'support_chunk_start'),
+    ):
+        if src_key in task_inner and dst_key not in out:
+            x = task_inner[src_key]
+            out[dst_key] = x.reshape((-1,) + tuple(x.shape[2:])) if x.ndim > 2 else x.reshape((-1,))
+    return out
+
+
+def _initial_memory_for_task(
+    params: Any,
+    *,
+    model: QueryMemoryDirectRegressionModel,
+    task_inner: Dict[str, jnp.ndarray],
+    train: bool,
+) -> jnp.ndarray:
+    mode = str(getattr(model.cfg, 'memory_initialization_mode', 'base_only')).strip().lower()
+    if mode in ('', 'none', 'learned', 'learned_base', 'base_only'):
+        return params['memory_token_init']
+    support = _flatten_support_for_memory(task_inner)
+    return model.apply(
+        {'params': params},
+        support_query_state=support['support_query_state'],
+        support_target_action=support['support_target_action'],
+        support_demo_id=support.get('support_demo_id'),
+        support_chunk_start=support.get('support_chunk_start'),
+        train=train,
+        method=QueryMemoryDirectRegressionModel.initial_memory_from_support,
+    )
 
 
 def _memory_embedding(memory_tokens: jnp.ndarray, initial_memory: jnp.ndarray, *, on_delta: bool) -> jnp.ndarray:
@@ -511,7 +560,7 @@ def _task_meta_objective(
     goal_prediction_loss_weight: float,
     goal_prediction_loss_type: str,
 ) -> Tuple[jnp.ndarray, Dict[str, jnp.ndarray]]:
-    initial_memory = params['memory_token_init']
+    initial_memory = _initial_memory_for_task(params, model=model, task_inner=task_inner, train=True)
     rng_query_dropout, _rng_aux = jax.random.split(rng)
     task_query_for_read = _apply_query_goal_dropout(
         task_query,
@@ -523,6 +572,7 @@ def _task_meta_objective(
         params,
         model=model,
         task_inner=task_inner,
+        initial_memory_tokens=initial_memory,
         inner_steps=inner_steps,
         inner_lr=inner_lr,
         max_grad_norm=max_grad_norm,
@@ -558,10 +608,12 @@ def _task_meta_objective(
     wrong_memory_delta_norm = jnp.array(0.0, dtype=jnp.float32)
     wrong_memory_relative_delta_norm = jnp.array(0.0, dtype=jnp.float32)
     if bool(use_wrong_support_margin):
+        wrong_initial_memory = _initial_memory_for_task(params, model=model, task_inner=task_wrong_inner, train=True)
         wrong_memory, wrong_stats = _adapt_one_task(
             params,
             model=model,
             task_inner=task_wrong_inner,
+            initial_memory_tokens=wrong_initial_memory,
             inner_steps=inner_steps,
             inner_lr=inner_lr,
             max_grad_norm=max_grad_norm,
@@ -580,10 +632,12 @@ def _task_meta_objective(
         wrong_memory_relative_delta_norm = wrong_stats['memory_relative_delta_norm']
 
     if bool(use_memory_contrast):
+        contrast_initial_memory = _initial_memory_for_task(params, model=model, task_inner=task_contrast_inner, train=True)
         contrast_memory, _ = _adapt_one_task(
             params,
             model=model,
             task_inner=task_contrast_inner,
+            initial_memory_tokens=contrast_initial_memory,
             inner_steps=inner_steps,
             inner_lr=inner_lr,
             max_grad_norm=max_grad_norm,
@@ -665,7 +719,7 @@ def _task_meta_objective(
         )
         metrics['memory_contrast_z_b'] = _memory_embedding(
             contrast_memory,
-            initial_memory,
+            contrast_initial_memory,
             on_delta=bool(memory_contrast_on_delta),
         )
     return meta_loss, metrics
@@ -788,10 +842,12 @@ def create_adapt_fn(
 ):
     @jax.jit
     def adapt_fn(params: Any, inner_batch: Dict[str, jnp.ndarray]) -> jnp.ndarray:
+        initial_memory = _initial_memory_for_task(params, model=model, task_inner=inner_batch, train=False)
         adapted_memory, _ = _adapt_one_task(
             params,
             model=model,
             task_inner=inner_batch,
+            initial_memory_tokens=initial_memory,
             inner_steps=int(inner_steps),
             inner_lr=float(inner_lr),
             max_grad_norm=float(max_grad_norm),
@@ -816,7 +872,7 @@ def create_adapt_with_stats_fn(
 ):
     @jax.jit
     def adapt_with_stats_fn(params: Any, inner_batch: Dict[str, jnp.ndarray]):
-        memory_tokens = params['memory_token_init']
+        initial_memory = _initial_memory_for_task(params, model=model, task_inner=inner_batch, train=False)
         effective_clip = float(model.cfg.decoder.memory_update_clip_norm)
         if effective_clip <= 0.0:
             effective_clip = float(max_grad_norm)
@@ -844,12 +900,12 @@ def create_adapt_with_stats_fn(
 
         if int(inner_steps) <= 0:
             return (
-                memory_tokens,
+                initial_memory,
                 jnp.zeros((0,), dtype=jnp.float32),
                 jnp.zeros((0,), dtype=jnp.float32),
             )
 
-        adapted_memory, (inner_losses, inner_grad_norms) = jax.lax.scan(inner_step, memory_tokens, inner_batch)
+        adapted_memory, (inner_losses, inner_grad_norms) = jax.lax.scan(inner_step, initial_memory, inner_batch)
         return adapted_memory, inner_losses, inner_grad_norms
 
     return adapt_with_stats_fn

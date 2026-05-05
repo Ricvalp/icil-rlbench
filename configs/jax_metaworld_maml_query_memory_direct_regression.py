@@ -86,6 +86,18 @@ def _apply_metaworld_overrides(cfg):
     encoder.max_T_obs = int(cfg.dataset.T_obs)
     encoder.add_state_token = True
 
+    obj = cfg.model.object_centric_state
+    obj.d_model = 256
+    obj.max_T_obs = int(cfg.dataset.T_obs)
+    obj.goal_available = True
+
+    support_encoder = cfg.model.support_encoder_memory
+    support_encoder.d_model = 256
+    support_encoder.n_heads = 4
+    support_encoder.memory_num_tokens = int(decoder.memory_num_tokens)
+    support_encoder.max_demo_id = int(decoder.write_max_demo_id) if hasattr(decoder, 'write_max_demo_id') else 16
+    support_encoder.max_time_bins = int(decoder.write_max_time_bins) if hasattr(decoder, 'write_max_time_bins') else 512
+
     cfg.train.num_steps = 100000
     cfg.train.batch_size = 8
     cfg.train.weight_decay = 1e-4

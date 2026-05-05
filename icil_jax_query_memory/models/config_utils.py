@@ -5,8 +5,10 @@ from typing import Any
 import jax.numpy as jnp
 
 from .direct_decoder import DirectDecoderConfig
+from .object_centric_state import ObjectCentricStateTokenizerConfig, parse_slice
 from .query_memory_direct_regression import QueryMemoryDirectRegressionConfig
 from .simple_query_point_encoder import SimpleQueryPointEncoderConfig
+from .support_encoder_memory import SupportEncoderConfig
 
 
 def resolve_dtype(name: str) -> jnp.dtype:
@@ -20,9 +22,9 @@ def resolve_dtype(name: str) -> jnp.dtype:
 
 def build_model_config_from_raw(raw_model_cfg: Any, *, state_dim: int, action_dim: int, compute_dtype: jnp.dtype) -> QueryMemoryDirectRegressionConfig:
     query_encoder_name = str(getattr(raw_model_cfg, 'query_encoder_name', 'simple_query_point_encoder'))
-    if query_encoder_name != 'simple_query_point_encoder':
+    if query_encoder_name not in ('simple_query_point_encoder', 'object_centric_state'):
         raise ValueError(
-            'JAX query-memory v1 only supports query_encoder_name="simple_query_point_encoder". '
+            'JAX query-memory supports query_encoder_name="simple_query_point_encoder" or "object_centric_state". '
             f'Got {query_encoder_name!r}.'
         )
     decoder_raw = raw_model_cfg.query_memory_direct_regression
@@ -39,6 +41,26 @@ def build_model_config_from_raw(raw_model_cfg: Any, *, state_dim: int, action_di
         dtype=compute_dtype,
         param_dtype=jnp.float32,
     )
+    object_raw = getattr(raw_model_cfg, 'object_centric_state', None)
+    object_cfg = None
+    if object_raw is not None:
+        object_cfg = ObjectCentricStateTokenizerConfig(
+            d_model=int(getattr(object_raw, 'd_model', getattr(encoder_raw, 'd_model', 512))),
+            max_T_obs=int(getattr(object_raw, 'max_T_obs', getattr(encoder_raw, 'max_T_obs', 16))),
+            hand_pos_slice=parse_slice(getattr(object_raw, 'hand_pos_slice', (0, 3)), (0, 3)),
+            gripper_slice=parse_slice(getattr(object_raw, 'gripper_slice', (3, 4)), (3, 4)),
+            obj1_pos_slice=parse_slice(getattr(object_raw, 'obj1_pos_slice', (4, 7)), (4, 7)),
+            obj2_pos_slice=parse_slice(getattr(object_raw, 'obj2_pos_slice', (11, 14)), (11, 14)),
+            goal_pos_slice=parse_slice(getattr(object_raw, 'goal_pos_slice', (36, 39)), (36, 39)),
+            has_obj2=bool(getattr(object_raw, 'has_obj2', True)),
+            goal_available=bool(getattr(object_raw, 'goal_available', int(state_dim) >= 39)),
+            goal_visible=bool(getattr(object_raw, 'goal_visible', True)),
+            hidden_goal_token_policy=str(getattr(object_raw, 'hidden_goal_token_policy', 'mask')),
+            mlp_mult=int(getattr(object_raw, 'mlp_mult', 2)),
+            dtype=compute_dtype,
+            param_dtype=jnp.float32,
+        )
+
     decoder_cfg = DirectDecoderConfig(
         d_model=int(getattr(decoder_raw, 'd_model', 512)),
         n_heads=int(getattr(decoder_raw, 'n_heads', 8)),
@@ -82,9 +104,36 @@ def build_model_config_from_raw(raw_model_cfg: Any, *, state_dim: int, action_di
             'JAX query-memory v1 only supports context_attention_mode="two_ctx". '
             f'Got {decoder_cfg.context_attention_mode!r}.'
         )
-    if encoder_cfg.d_model != decoder_cfg.d_model:
+    support_raw = getattr(raw_model_cfg, 'support_encoder_memory', None)
+    support_cfg = None
+    if support_raw is not None:
+        support_cfg = SupportEncoderConfig(
+            d_model=int(getattr(support_raw, 'd_model', decoder_cfg.d_model)),
+            n_heads=int(getattr(support_raw, 'n_heads', decoder_cfg.n_heads)),
+            memory_num_tokens=int(getattr(support_raw, 'memory_num_tokens', decoder_cfg.memory_num_tokens)),
+            support_encoder_layers=int(getattr(support_raw, 'support_encoder_layers', 2)),
+            memory_self_attn_layers=int(getattr(support_raw, 'memory_self_attn_layers', 1)),
+            mlp_mult=int(getattr(support_raw, 'mlp_mult', 2)),
+            max_support_chunks=int(getattr(support_raw, 'max_support_chunks', 256)),
+            max_demo_id=int(getattr(support_raw, 'max_demo_id', decoder_cfg.write_max_demo_id)),
+            max_time_bins=int(getattr(support_raw, 'max_time_bins', decoder_cfg.write_max_time_bins)),
+            dropout=float(getattr(support_raw, 'dropout', 0.0)),
+            goal_visible=bool(getattr(support_raw, 'goal_visible', True)),
+            dtype=compute_dtype,
+            param_dtype=jnp.float32,
+        )
+
+    tokenizer_d_model = object_cfg.d_model if query_encoder_name == 'object_centric_state' and object_cfg is not None else encoder_cfg.d_model
+    if tokenizer_d_model != decoder_cfg.d_model:
         raise ValueError(
-            f'd_model mismatch between encoder ({encoder_cfg.d_model}) and decoder ({decoder_cfg.d_model}).'
+            f'd_model mismatch between encoder/tokenizer ({tokenizer_d_model}) and decoder ({decoder_cfg.d_model}).'
+        )
+    if support_cfg is not None and int(support_cfg.d_model) != int(decoder_cfg.d_model):
+        raise ValueError(f'd_model mismatch between support encoder ({support_cfg.d_model}) and decoder ({decoder_cfg.d_model}).')
+    if support_cfg is not None and int(support_cfg.memory_num_tokens) != int(decoder_cfg.memory_num_tokens):
+        raise ValueError(
+            f'memory_num_tokens mismatch between support encoder ({support_cfg.memory_num_tokens}) '
+            f'and decoder ({decoder_cfg.memory_num_tokens}).'
         )
     if decoder_cfg.horizon < 1:
         raise ValueError('decoder horizon must be >= 1.')
@@ -94,9 +143,20 @@ def build_model_config_from_raw(raw_model_cfg: Any, *, state_dim: int, action_di
         raise ValueError('write_max_demo_id must be >= 1.')
     if decoder_cfg.write_max_time_bins < 1:
         raise ValueError('write_max_time_bins must be >= 1.')
-    if str(decoder_cfg.memory_conditioning_mode).strip().lower() not in ('', 'none', 'off', 'false', 'film', 'adaln'):
+    if str(decoder_cfg.memory_conditioning_mode).strip().lower() not in (
+        '',
+        'none',
+        'off',
+        'false',
+        'cross_attn',
+        'film',
+        'adaln',
+        'cross_attn_plus_film',
+        'cross_attn_plus_adaln',
+    ):
         raise ValueError(
-            "memory_conditioning_mode must be one of: 'none', 'film', 'adaln'. "
+            "memory_conditioning_mode must be one of: 'none', 'cross_attn', 'film', 'adaln', "
+            "'cross_attn_plus_film', 'cross_attn_plus_adaln'. "
             f"Got {decoder_cfg.memory_conditioning_mode!r}."
         )
     if decoder_cfg.goal_prediction_mlp_mult < 1:
@@ -106,4 +166,10 @@ def build_model_config_from_raw(raw_model_cfg: Any, *, state_dim: int, action_di
         action_dim=int(action_dim),
         query_encoder=encoder_cfg,
         decoder=decoder_cfg,
+        query_tokenizer_name=query_encoder_name,
+        object_tokenizer=object_cfg,
+        support_encoder=support_cfg,
+        memory_initialization_mode=str(getattr(decoder_raw, 'memory_initialization_mode', 'base_only')),
+        query_goal_visible=not bool(getattr(raw_model_cfg, 'query_goal_hidden', False)),
+        support_goal_visible=not bool(getattr(raw_model_cfg, 'support_goal_hidden', False)),
     )

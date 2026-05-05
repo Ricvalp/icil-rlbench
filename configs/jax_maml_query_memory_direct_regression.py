@@ -46,6 +46,7 @@ def get_config():
     cfg.model.query_memory_direct_regression.conditioner_mlp_mult = 2
     cfg.model.query_memory_direct_regression.conditioner_dropout = 0.0
     cfg.model.query_memory_direct_regression.memory_num_tokens = 128
+    cfg.model.query_memory_direct_regression.memory_initialization_mode = 'base_only'
     cfg.model.query_memory_direct_regression.memory_conditioning_mode = 'none'
     cfg.model.query_memory_direct_regression.memory_conditioning_strength = 1.0
     cfg.model.query_memory_direct_regression.log_attention_weights = False
@@ -61,6 +62,33 @@ def get_config():
     cfg.model.simple_query_point_encoder.gripper_xyz_state_start = 0
     cfg.model.simple_query_point_encoder.max_T_obs = 2
     cfg.model.simple_query_point_encoder.add_state_token = True
+
+    cfg.model.object_centric_state = ConfigDict()
+    cfg.model.object_centric_state.d_model = 512
+    cfg.model.object_centric_state.max_T_obs = 2
+    cfg.model.object_centric_state.hand_pos_slice = (0, 3)
+    cfg.model.object_centric_state.gripper_slice = (3, 4)
+    cfg.model.object_centric_state.obj1_pos_slice = (4, 7)
+    cfg.model.object_centric_state.obj2_pos_slice = (11, 14)
+    cfg.model.object_centric_state.goal_pos_slice = (36, 39)
+    cfg.model.object_centric_state.has_obj2 = True
+    cfg.model.object_centric_state.goal_available = True
+    cfg.model.object_centric_state.goal_visible = True
+    cfg.model.object_centric_state.hidden_goal_token_policy = 'mask'
+    cfg.model.object_centric_state.mlp_mult = 2
+
+    cfg.model.support_encoder_memory = ConfigDict()
+    cfg.model.support_encoder_memory.d_model = 512
+    cfg.model.support_encoder_memory.n_heads = 8
+    cfg.model.support_encoder_memory.memory_num_tokens = 128
+    cfg.model.support_encoder_memory.support_encoder_layers = 2
+    cfg.model.support_encoder_memory.memory_self_attn_layers = 1
+    cfg.model.support_encoder_memory.mlp_mult = 2
+    cfg.model.support_encoder_memory.max_support_chunks = 256
+    cfg.model.support_encoder_memory.max_demo_id = 16
+    cfg.model.support_encoder_memory.max_time_bins = 512
+    cfg.model.support_encoder_memory.dropout = 0.0
+    cfg.model.support_encoder_memory.goal_visible = True
 
     cfg.train = ConfigDict()
     cfg.train.num_steps = 100000

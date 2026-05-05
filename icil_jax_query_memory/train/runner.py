@@ -383,6 +383,13 @@ def train(cfg: ConfigDict) -> None:
         raise ValueError(f"Unsupported data.source={source!r}. Expected 'rlbench' or 'metaworld'.")
     memory_cfg = _resolve_memory_cfg(cfg)
     model_cfg_raw = cfg.model
+    # Keep goal-token visibility aligned with the data masking policy for the
+    # new object-centric tokenizer. Existing flat-token configs ignore these
+    # fields, so this is backward-compatible.
+    model_cfg_raw.query_goal_hidden = bool(getattr(cfg.data, 'query_zero_goal', False))
+    model_cfg_raw.support_goal_hidden = bool(getattr(cfg.data, 'support_zero_goal', False))
+    if hasattr(model_cfg_raw, 'support_encoder_memory'):
+        model_cfg_raw.support_encoder_memory.goal_visible = not bool(getattr(cfg.data, 'support_zero_goal', False))
     if bool(memory_cfg.log_attention_metrics):
         model_cfg_raw.query_memory_direct_regression.log_attention_weights = True
     if float(memory_cfg.goal_prediction_loss_weight) > 0.0:
@@ -436,6 +443,21 @@ def train(cfg: ConfigDict) -> None:
     dummy_query_valid = jnp.ones((1, int(dataset_cfg.T_obs), int(num_points)), dtype=jnp.bool_)
     dummy_query_rgb = jnp.zeros((1, int(dataset_cfg.T_obs), int(num_points), 3), dtype=compute_dtype) if use_rgb else None
     dummy_query_mask_id = jnp.zeros((1, int(dataset_cfg.T_obs), int(num_points)), dtype=jnp.int32) if use_mask_id else None
+    memory_init_mode = str(getattr(cfg.model.query_memory_direct_regression, 'memory_initialization_mode', 'base_only')).strip().lower()
+    use_support_memory_init = memory_init_mode not in ('', 'none', 'learned', 'learned_base', 'base_only')
+    dummy_support_count = max(1, int(getattr(memory_cfg, 'num_queries_per_step', 1)))
+    dummy_support_state = (
+        jnp.zeros((1, dummy_support_count, int(dataset_cfg.T_obs), int(state_dim)), dtype=compute_dtype)
+        if use_support_memory_init
+        else None
+    )
+    dummy_support_action = (
+        jnp.zeros((1, dummy_support_count, int(dataset_cfg.H), int(action_dim)), dtype=compute_dtype)
+        if use_support_memory_init
+        else None
+    )
+    dummy_support_demo_id = jnp.zeros((1, dummy_support_count), dtype=jnp.int32) if use_support_memory_init else None
+    dummy_support_chunk_start = jnp.zeros((1, dummy_support_count), dtype=compute_dtype) if use_support_memory_init else None
     params = model.init(
         init_rng,
         query_xyz=dummy_query_xyz,
@@ -443,6 +465,10 @@ def train(cfg: ConfigDict) -> None:
         query_valid=dummy_query_valid,
         query_rgb=dummy_query_rgb,
         query_mask_id=dummy_query_mask_id,
+        support_query_state=dummy_support_state,
+        support_target_action=dummy_support_action,
+        support_demo_id=dummy_support_demo_id,
+        support_chunk_start=dummy_support_chunk_start,
         memory_tokens=None,
         train=False,
     )['params']

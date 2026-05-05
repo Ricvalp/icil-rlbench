@@ -222,13 +222,18 @@ class MemoryAdaLNFiLM(nn.Module):
     @nn.compact
     def __call__(self, x: jnp.ndarray, memory_cond: Optional[jnp.ndarray]) -> jnp.ndarray:
         mode = str(self.cfg.memory_conditioning_mode).strip().lower()
-        if mode in ('', 'none', 'off', 'false'):
+        if mode in ('', 'none', 'off', 'false', 'cross_attn'):
             return x
         if memory_cond is None:
             return x
+        if mode == 'cross_attn_plus_film':
+            mode = 'film'
+        if mode == 'cross_attn_plus_adaln':
+            mode = 'adaln'
         if mode not in ('film', 'adaln'):
             raise ValueError(
-                "memory_conditioning_mode must be one of: 'none', 'film', 'adaln'. "
+                "memory_conditioning_mode must be one of: 'none', 'cross_attn', 'film', 'adaln', "
+                "'cross_attn_plus_film', 'cross_attn_plus_adaln'. "
                 f"Got {self.cfg.memory_conditioning_mode!r}."
             )
         d = int(self.cfg.d_model)
@@ -434,7 +439,7 @@ class DirectDecoderCore(nn.Module):
             query_mask=None,
             support_tokens=support_tokens,
             support_mask=support_mask,
-        ) if str(self.cfg.memory_conditioning_mode).strip().lower() not in ('', 'none', 'off', 'false') else None
+        ) if str(self.cfg.memory_conditioning_mode).strip().lower() not in ('', 'none', 'off', 'false', 'cross_attn') else None
         if bool(self.cfg.use_decoder_mode_embed):
             mode_embed = self.param(
                 'mode_embed',

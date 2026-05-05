@@ -214,6 +214,68 @@ class MetaWorldQueryMemoryTaskBuilder:
                 return spec
         return None
 
+    def build_same_family_wrong_goal_task_spec(
+        self,
+        reference_task: MetaWorldMAMLTaskSpec,
+        rng: np.random.Generator,
+    ) -> Optional[MetaWorldMAMLTaskSpec]:
+        task_name = str(reference_task.task_name)
+        instance_ids = [
+            int(v)
+            for v in self.task_instances_by_name.get(task_name, ())
+            if int(v) != int(reference_task.query_task_instance_id)
+        ]
+        if not instance_ids:
+            return None
+        for _ in range(self.num_tries_per_item):
+            if bool(self.cfg.sample_same_task_instance):
+                instance_id = int(instance_ids[int(rng.integers(0, len(instance_ids)))])
+                episode_ids = self.store.list_episode_ids(task_name, task_instance_id=instance_id)
+                if episode_ids.shape[0] < int(self.cfg.K):
+                    continue
+                support_ids = rng.choice(
+                    episode_ids,
+                    size=int(self.cfg.K),
+                    replace=episode_ids.shape[0] < int(self.cfg.K),
+                ).astype(np.int64)
+                query_id = int(rng.choice(episode_ids))
+                return MetaWorldMAMLTaskSpec(
+                    task_name=task_name,
+                    task_index=int(self.store.task_index(task_name)),
+                    task_instance_id=int(instance_id),
+                    support_episode_ids=tuple(int(eid) for eid in support_ids.tolist()),
+                    query_episode_id=int(query_id),
+                    support_task_instance_ids=tuple([int(instance_id)] * int(self.cfg.K)),
+                    query_task_instance_id=int(instance_id),
+                )
+            if len(instance_ids) < int(self.cfg.K) + 1:
+                return None
+            chosen_instances = rng.choice(np.asarray(instance_ids, dtype=np.int64), size=int(self.cfg.K) + 1, replace=False)
+            support_instance_ids = chosen_instances[: int(self.cfg.K)]
+            query_instance_id = int(chosen_instances[int(self.cfg.K)])
+            support_episode_ids: List[int] = []
+            for instance_id in support_instance_ids.tolist():
+                episode_id = self._sample_episode_from_instance(task_name, int(instance_id), rng)
+                if episode_id is None:
+                    support_episode_ids = []
+                    break
+                support_episode_ids.append(int(episode_id))
+            if not support_episode_ids:
+                continue
+            query_episode_id = self._sample_episode_from_instance(task_name, int(query_instance_id), rng)
+            if query_episode_id is None:
+                continue
+            return MetaWorldMAMLTaskSpec(
+                task_name=task_name,
+                task_index=int(self.store.task_index(task_name)),
+                task_instance_id=int(query_instance_id),
+                support_episode_ids=tuple(int(eid) for eid in support_episode_ids),
+                query_episode_id=int(query_episode_id),
+                support_task_instance_ids=tuple(int(v) for v in support_instance_ids.tolist()),
+                query_task_instance_id=int(query_instance_id),
+            )
+        return None
+
     def build_task_spec(self, rng: np.random.Generator) -> Optional[MetaWorldMAMLTaskSpec]:
         for _ in range(self.num_tries_per_item):
             if bool(self.cfg.sample_same_task_instance):
@@ -393,6 +455,18 @@ def _resolve_num_inner_batches(cfg: QueryMemoryMetaConfig) -> int:
     return min(configured, inner_steps)
 
 
+def _zero_support_batch(batch: Dict[str, Any]) -> Dict[str, Any]:
+    out: Dict[str, Any] = {}
+    for key, value in batch.items():
+        if torch.is_tensor(value):
+            out[key] = torch.zeros_like(value)
+        elif key == 'meta':
+            out[key] = value
+        else:
+            out[key] = value
+    return out
+
+
 def prepare_metaworld_query_memory_task_for_meta_step(
     task: MetaWorldMAMLTaskSpec,
     *,
@@ -414,18 +488,45 @@ def prepare_metaworld_query_memory_task_for_meta_step(
     wrong_inner_batches: List[Dict[str, Any]] = []
     if bool(getattr(cfg, 'use_wrong_support_margin', False)):
         strategy = str(getattr(cfg, 'wrong_support_strategy', 'random_different_task')).lower()
-        if strategy != 'random_different_task':
-            raise ValueError(f'Unsupported wrong_support_strategy={strategy!r}.')
-        wrong_task = task_builder.build_wrong_family_task_spec(task, rng)
-        if wrong_task is None:
-            raise RuntimeError(f'Could not sample wrong-family support for task {task.task_name}.')
-        for _ in range(num_inner_batches):
-            wrong_inner_batches.append(
-                task_builder.build_support_batch(
-                    wrong_task,
-                    count=int(cfg.num_queries_per_step),
-                    rng=rng,
+        if strategy in ('random_different_task', 'random_wrong_family', 'wrong_family'):
+            wrong_task = task_builder.build_wrong_family_task_spec(task, rng)
+            if wrong_task is None:
+                raise RuntimeError(f'Could not sample wrong-family support for task {task.task_name}.')
+            for _ in range(num_inner_batches):
+                wrong_inner_batches.append(
+                    task_builder.build_support_batch(
+                        wrong_task,
+                        count=int(cfg.num_queries_per_step),
+                        rng=rng,
+                    )
                 )
+        elif strategy in ('same_family_wrong_goal', 'same_family_wrong_instance'):
+            wrong_task = task_builder.build_same_family_wrong_goal_task_spec(task, rng)
+            if wrong_task is None:
+                raise RuntimeError(f'Could not sample same-family wrong-goal support for task {task.task_name}.')
+            for _ in range(num_inner_batches):
+                wrong_inner_batches.append(
+                    task_builder.build_support_batch(
+                        wrong_task,
+                        count=int(cfg.num_queries_per_step),
+                        rng=rng,
+                    )
+                )
+        elif strategy in ('null_support', 'zero_support'):
+            for _ in range(num_inner_batches):
+                wrong_inner_batches.append(
+                    _zero_support_batch(
+                        task_builder.build_support_batch(
+                            task,
+                            count=int(cfg.num_queries_per_step),
+                            rng=rng,
+                        )
+                    )
+                )
+        else:
+            raise ValueError(
+                "Unsupported wrong_support_strategy={!r}. Expected random_wrong_family, "
+                "same_family_wrong_goal, or null_support.".format(strategy)
             )
     contrast_inner_batches: List[Dict[str, Any]] = []
     if bool(getattr(cfg, 'use_memory_contrast', False)):

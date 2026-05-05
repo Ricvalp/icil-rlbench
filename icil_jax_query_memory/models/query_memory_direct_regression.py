@@ -7,7 +7,9 @@ import flax.linen as nn
 import jax.numpy as jnp
 
 from .direct_decoder import DirectDecoderConfig, DirectDecoderCore
+from .object_centric_state import ObjectCentricStateTokenizer, ObjectCentricStateTokenizerConfig
 from .simple_query_point_encoder import SimpleQueryPointEncoder, SimpleQueryPointEncoderConfig
+from .support_encoder_memory import SupportEncoderConfig, SupportEncoderMemory
 
 
 @dataclass(frozen=True)
@@ -16,10 +18,122 @@ class QueryMemoryDirectRegressionConfig:
     action_dim: int
     query_encoder: SimpleQueryPointEncoderConfig
     decoder: DirectDecoderConfig
+    query_tokenizer_name: str = 'simple_query_point_encoder'
+    object_tokenizer: Optional[ObjectCentricStateTokenizerConfig] = None
+    support_encoder: Optional[SupportEncoderConfig] = None
+    memory_initialization_mode: str = 'base_only'
+    query_goal_visible: bool = True
+    support_goal_visible: bool = True
 
 
 class QueryMemoryDirectRegressionModel(nn.Module):
     cfg: QueryMemoryDirectRegressionConfig
+
+    def _memory_mode(self) -> str:
+        mode = str(getattr(self.cfg, 'memory_initialization_mode', 'base_only')).strip().lower()
+        aliases = {
+            'learned': 'base_only',
+            'learned_base': 'base_only',
+            'none': 'base_only',
+            'encoder': 'pure_encoder',
+            'encoder_only': 'pure_encoder',
+            'encoder_plus_base': 'additive',
+        }
+        return aliases.get(mode, mode)
+
+    def _encode_context(
+        self,
+        *,
+        query_xyz: Optional[jnp.ndarray],
+        query_state: jnp.ndarray,
+        query_valid: Optional[jnp.ndarray],
+        query_rgb: Optional[jnp.ndarray],
+        query_mask_id: Optional[jnp.ndarray],
+        goal_visible: bool,
+    ) -> tuple[jnp.ndarray, jnp.ndarray]:
+        name = str(getattr(self.cfg, 'query_tokenizer_name', 'simple_query_point_encoder'))
+        if name == 'simple_query_point_encoder':
+            if query_xyz is None:
+                raise ValueError('simple_query_point_encoder requires query_xyz.')
+            encoder = SimpleQueryPointEncoder(cfg=self.cfg.query_encoder, state_dim=int(self.cfg.state_dim), name='context_encoder')
+            return encoder(
+                query_xyz=query_xyz,
+                query_state=query_state,
+                query_valid=query_valid,
+                query_rgb=query_rgb,
+                query_mask_id=query_mask_id,
+            )
+        if name == 'object_centric_state':
+            cfg = self.cfg.object_tokenizer
+            if cfg is None:
+                raise ValueError('query_tokenizer_name="object_centric_state" requires cfg.object_tokenizer.')
+            encoder = ObjectCentricStateTokenizer(cfg=cfg, state_dim=int(self.cfg.state_dim), name='object_context_encoder')
+            return encoder(query_state=query_state, goal_visible=bool(goal_visible))
+        raise ValueError(
+            "query_tokenizer_name must be one of: 'simple_query_point_encoder', 'object_centric_state'. "
+            f'Got {name!r}.'
+        )
+
+    def _support_memory(
+        self,
+        *,
+        support_query_state: jnp.ndarray,
+        support_target_action: jnp.ndarray,
+        support_demo_id: Optional[jnp.ndarray],
+        support_chunk_start: Optional[jnp.ndarray],
+        train: bool,
+    ) -> jnp.ndarray:
+        if self.cfg.support_encoder is None:
+            raise ValueError('Support-encoder memory requires cfg.support_encoder.')
+        if self.cfg.object_tokenizer is None:
+            raise ValueError('Support-encoder memory requires cfg.object_tokenizer.')
+        return SupportEncoderMemory(
+            cfg=self.cfg.support_encoder,
+            state_tokenizer_cfg=self.cfg.object_tokenizer,
+            state_dim=int(self.cfg.state_dim),
+            action_dim=int(self.cfg.action_dim),
+            name='support_memory_encoder',
+        )(
+            support_state=support_query_state,
+            support_target_action=support_target_action,
+            support_demo_id=support_demo_id,
+            support_chunk_start=support_chunk_start,
+            train=train,
+        )
+
+    @nn.compact
+    def initial_memory_from_support(
+        self,
+        *,
+        support_query_state: Optional[jnp.ndarray] = None,
+        support_target_action: Optional[jnp.ndarray] = None,
+        support_demo_id: Optional[jnp.ndarray] = None,
+        support_chunk_start: Optional[jnp.ndarray] = None,
+        train: bool = False,
+    ) -> jnp.ndarray:
+        mem_init = self.param(
+            'memory_token_init',
+            nn.initializers.normal(stddev=0.02),
+            (int(self.cfg.decoder.memory_num_tokens), int(self.cfg.decoder.d_model)),
+            self.cfg.decoder.param_dtype,
+        ).astype(self.cfg.decoder.dtype)
+        mode = self._memory_mode()
+        if mode == 'base_only':
+            return mem_init
+        if support_query_state is None or support_target_action is None:
+            raise ValueError(f'memory_initialization_mode={mode!r} requires support_query_state and support_target_action.')
+        support_memory = self._support_memory(
+            support_query_state=support_query_state,
+            support_target_action=support_target_action,
+            support_demo_id=support_demo_id,
+            support_chunk_start=support_chunk_start,
+            train=train,
+        ).astype(self.cfg.decoder.dtype)
+        if mode == 'pure_encoder':
+            return support_memory
+        if mode == 'additive':
+            return mem_init + support_memory
+        raise ValueError("memory_initialization_mode must be one of: 'base_only', 'pure_encoder', 'additive'.")
 
     @nn.compact
     def __call__(
@@ -31,6 +145,10 @@ class QueryMemoryDirectRegressionModel(nn.Module):
         query_rgb: Optional[jnp.ndarray] = None,
         query_mask_id: Optional[jnp.ndarray] = None,
         memory_tokens: Optional[jnp.ndarray] = None,
+        support_query_state: Optional[jnp.ndarray] = None,
+        support_target_action: Optional[jnp.ndarray] = None,
+        support_demo_id: Optional[jnp.ndarray] = None,
+        support_chunk_start: Optional[jnp.ndarray] = None,
         mode: str = 'read',
         write_demo_id: Optional[jnp.ndarray] = None,
         write_chunk_start: Optional[jnp.ndarray] = None,
@@ -43,24 +161,24 @@ class QueryMemoryDirectRegressionModel(nn.Module):
         if mode in ('read', 'goal'):
             if query_xyz is None or query_state is None:
                 raise ValueError(f'{mode.upper()} mode requires query_xyz and query_state.')
-            encoder = SimpleQueryPointEncoder(cfg=self.cfg.query_encoder, state_dim=int(self.cfg.state_dim), name='context_encoder')
-            query_tokens, query_mask = encoder(
+            query_tokens, query_mask = self._encode_context(
                 query_xyz=query_xyz,
                 query_state=query_state,
                 query_valid=query_valid,
                 query_rgb=query_rgb,
                 query_mask_id=query_mask_id,
+                goal_visible=bool(self.cfg.query_goal_visible),
             )
             batch_size = int(query_xyz.shape[0])
         else:
             if bool(self.cfg.decoder.write_use_support_obs) and query_xyz is not None and query_state is not None:
-                encoder = SimpleQueryPointEncoder(cfg=self.cfg.query_encoder, state_dim=int(self.cfg.state_dim), name='context_encoder')
-                query_tokens, query_mask = encoder(
+                query_tokens, query_mask = self._encode_context(
                     query_xyz=query_xyz,
                     query_state=query_state,
                     query_valid=query_valid,
                     query_rgb=query_rgb,
                     query_mask_id=query_mask_id,
+                    goal_visible=bool(self.cfg.support_goal_visible),
                 )
                 batch_size = int(query_xyz.shape[0])
             else:
@@ -86,7 +204,32 @@ class QueryMemoryDirectRegressionModel(nn.Module):
             (int(self.cfg.decoder.memory_num_tokens), int(self.cfg.decoder.d_model)),
             self.cfg.decoder.param_dtype,
         )
-        if memory_tokens is None:
+        if memory_tokens is None and support_query_state is not None and support_target_action is not None:
+            mode_for_init = self._memory_mode()
+            if mode_for_init == 'base_only':
+                initial_memory = mem_init.astype(self.cfg.decoder.dtype)
+            else:
+                support_memory = self._support_memory(
+                    support_query_state=support_query_state,
+                    support_target_action=support_target_action,
+                    support_demo_id=support_demo_id,
+                    support_chunk_start=support_chunk_start,
+                    train=train,
+                ).astype(self.cfg.decoder.dtype)
+                if mode_for_init == 'pure_encoder':
+                    initial_memory = support_memory
+                elif mode_for_init == 'additive':
+                    initial_memory = mem_init.astype(self.cfg.decoder.dtype) + support_memory
+                else:
+                    raise ValueError("memory_initialization_mode must be one of: 'base_only', 'pure_encoder', 'additive'.")
+            if initial_memory.ndim == 2:
+                support_tokens = jnp.broadcast_to(
+                    initial_memory.astype(self.cfg.decoder.dtype)[None, :, :],
+                    (batch_size,) + tuple(initial_memory.shape),
+                )
+            else:
+                support_tokens = initial_memory.astype(self.cfg.decoder.dtype)
+        elif memory_tokens is None:
             support_tokens = jnp.broadcast_to(mem_init.astype(self.cfg.decoder.dtype)[None, :, :], (batch_size,) + mem_init.shape)
         else:
             if memory_tokens.ndim == 2:
