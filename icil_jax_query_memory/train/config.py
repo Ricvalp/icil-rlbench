@@ -33,3 +33,8 @@ class QueryMemoryMetaConfig:
     memory_contrast_weight: float = 0.0
     memory_contrast_temperature: float = 0.1
     memory_contrast_on_delta: bool = True
+    query_goal_dropout_rate: float = 0.0
+    query_goal_dropout_state_start: int = 36
+    log_attention_metrics: bool = False
+    goal_prediction_loss_weight: float = 0.0
+    goal_prediction_loss_type: str = 'mse'

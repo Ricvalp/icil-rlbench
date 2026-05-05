@@ -69,6 +69,11 @@ def build_model_config_from_raw(raw_model_cfg: Any, *, state_dim: int, action_di
         rotation_loss_weight=float(getattr(decoder_raw, 'rotation_loss_weight', 1.0)),
         gripper_loss_weight=float(getattr(decoder_raw, 'gripper_loss_weight', 1.0)),
         chunk_decay=float(getattr(decoder_raw, 'chunk_decay', 0.0)),
+        memory_conditioning_mode=str(getattr(decoder_raw, 'memory_conditioning_mode', 'none')),
+        memory_conditioning_strength=float(getattr(decoder_raw, 'memory_conditioning_strength', 1.0)),
+        log_attention_weights=bool(getattr(decoder_raw, 'log_attention_weights', False)),
+        use_goal_prediction_head=bool(getattr(decoder_raw, 'use_goal_prediction_head', False)),
+        goal_prediction_mlp_mult=int(getattr(decoder_raw, 'goal_prediction_mlp_mult', 2)),
         dtype=compute_dtype,
         param_dtype=jnp.float32,
     )
@@ -89,6 +94,13 @@ def build_model_config_from_raw(raw_model_cfg: Any, *, state_dim: int, action_di
         raise ValueError('write_max_demo_id must be >= 1.')
     if decoder_cfg.write_max_time_bins < 1:
         raise ValueError('write_max_time_bins must be >= 1.')
+    if str(decoder_cfg.memory_conditioning_mode).strip().lower() not in ('', 'none', 'off', 'false', 'film', 'adaln'):
+        raise ValueError(
+            "memory_conditioning_mode must be one of: 'none', 'film', 'adaln'. "
+            f"Got {decoder_cfg.memory_conditioning_mode!r}."
+        )
+    if decoder_cfg.goal_prediction_mlp_mult < 1:
+        raise ValueError('goal_prediction_mlp_mult must be >= 1.')
     return QueryMemoryDirectRegressionConfig(
         state_dim=int(state_dim),
         action_dim=int(action_dim),

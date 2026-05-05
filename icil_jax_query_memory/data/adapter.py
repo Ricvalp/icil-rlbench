@@ -11,6 +11,7 @@ _MANDATORY_QUERY_KEYS = ('query_xyz', 'query_state', 'query_valid', 'target_acti
 _OPTIONAL_QUERY_KEYS = (
     'query_rgb',
     'query_mask_id',
+    'target_goal',
     'demo_id',
     'support_demo_id',
     'chunk_start',

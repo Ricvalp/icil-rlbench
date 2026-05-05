@@ -40,6 +40,11 @@ class DirectDecoderConfig:
     rotation_loss_weight: float = 1.0
     gripper_loss_weight: float = 1.0
     chunk_decay: float = 0.0
+    memory_conditioning_mode: str = 'none'
+    memory_conditioning_strength: float = 1.0
+    log_attention_weights: bool = False
+    use_goal_prediction_head: bool = False
+    goal_prediction_mlp_mult: int = 2
     dtype: jnp.dtype = jnp.float32
     param_dtype: jnp.dtype = jnp.float32
 
@@ -211,6 +216,44 @@ class MlpBlock(nn.Module):
         return x
 
 
+class MemoryAdaLNFiLM(nn.Module):
+    cfg: DirectDecoderConfig
+
+    @nn.compact
+    def __call__(self, x: jnp.ndarray, memory_cond: Optional[jnp.ndarray]) -> jnp.ndarray:
+        mode = str(self.cfg.memory_conditioning_mode).strip().lower()
+        if mode in ('', 'none', 'off', 'false'):
+            return x
+        if memory_cond is None:
+            return x
+        if mode not in ('film', 'adaln'):
+            raise ValueError(
+                "memory_conditioning_mode must be one of: 'none', 'film', 'adaln'. "
+                f"Got {self.cfg.memory_conditioning_mode!r}."
+            )
+        d = int(self.cfg.d_model)
+        dtype = self.cfg.dtype
+        param_dtype = self.cfg.param_dtype
+        cond = nn.LayerNorm(dtype=dtype, param_dtype=param_dtype, name='memory_cond_ln')(memory_cond.astype(dtype))
+        ss = nn.Dense(
+            2 * d,
+            dtype=dtype,
+            param_dtype=param_dtype,
+            kernel_init=nn.initializers.zeros,
+            bias_init=nn.initializers.zeros,
+            name='memory_cond_out',
+        )(cond)
+        scale, shift = jnp.split(ss[:, None, :], 2, axis=-1)
+        strength = jnp.asarray(float(self.cfg.memory_conditioning_strength), dtype=x.dtype)
+        if mode == 'film':
+            return x * (1.0 + strength * scale) + strength * shift
+        h = nn.LayerNorm(dtype=dtype, param_dtype=param_dtype, name='memory_adaln_x_ln')(x)
+        modulated = h * (1.0 + scale) + shift
+        # Residual form preserves the identity at initialization while still
+        # giving memory a direct AdaLN/FiLM path into every decoder block.
+        return x + strength * (modulated - h)
+
+
 class DirectChunkBlockTwoCtx(nn.Module):
     cfg: DirectDecoderConfig
 
@@ -224,6 +267,7 @@ class DirectChunkBlockTwoCtx(nn.Module):
         query_mask: Optional[jnp.ndarray],
         support_tokens: Optional[jnp.ndarray],
         support_mask: Optional[jnp.ndarray],
+        memory_cond: Optional[jnp.ndarray],
         train: bool,
     ) -> jnp.ndarray:
         d = int(self.cfg.d_model)
@@ -238,7 +282,15 @@ class DirectChunkBlockTwoCtx(nn.Module):
 
         h = IdentityContextAdaLN(d, d, dtype=dtype, param_dtype=param_dtype, name='adaln_q')(x, cond)
         x = x + drop(
-            CrossAttention(d, n_heads, dropout, dtype=dtype, param_dtype=param_dtype, name='cross_attn_q')(
+            CrossAttention(
+                d,
+                n_heads,
+                dropout,
+                dtype=dtype,
+                param_dtype=param_dtype,
+                log_attention_weights=bool(self.cfg.log_attention_weights),
+                name='cross_attn_q',
+            )(
                 h,
                 query_tokens,
                 kv_mask=query_mask,
@@ -248,16 +300,52 @@ class DirectChunkBlockTwoCtx(nn.Module):
         if support_tokens is not None:
             h = IdentityContextAdaLN(d, d, dtype=dtype, param_dtype=param_dtype, name='adaln_s')(x, cond)
             x = x + drop(
-                CrossAttention(d, n_heads, dropout, dtype=dtype, param_dtype=param_dtype, name='cross_attn_s')(
+                CrossAttention(
+                    d,
+                    n_heads,
+                    dropout,
+                    dtype=dtype,
+                    param_dtype=param_dtype,
+                    log_attention_weights=bool(self.cfg.log_attention_weights),
+                    name='cross_attn_s',
+                )(
                     h,
                     support_tokens,
                     kv_mask=support_mask,
                     train=train,
                 )
             )
+        x = MemoryAdaLNFiLM(self.cfg, name='memory_adaln_film')(x, memory_cond)
         h = IdentityContextAdaLN(d, d, dtype=dtype, param_dtype=param_dtype, name='adaln3')(x, cond)
         x = x + drop(MlpBlock(d, int(self.cfg.decoder_mlp_mult), dropout, dtype, param_dtype, name='mlp')(h, train=train))
         return x
+
+
+class GoalPredictionHead(nn.Module):
+    cfg: DirectDecoderConfig
+
+    @nn.compact
+    def __call__(
+        self,
+        *,
+        query_tokens: Optional[jnp.ndarray],
+        query_mask: Optional[jnp.ndarray],
+        support_tokens: Optional[jnp.ndarray],
+        support_mask: Optional[jnp.ndarray],
+    ) -> jnp.ndarray:
+        dtype = self.cfg.dtype
+        param_dtype = self.cfg.param_dtype
+        x = PooledContextConditioner(self.cfg, name='goal_context_conditioner')(
+            query_tokens=query_tokens,
+            query_mask=query_mask,
+            support_tokens=support_tokens,
+            support_mask=support_mask,
+        )
+        hidden = max(int(self.cfg.d_model), int(self.cfg.goal_prediction_mlp_mult) * int(self.cfg.d_model))
+        x = nn.LayerNorm(dtype=dtype, param_dtype=param_dtype, name='goal_ln')(x)
+        x = nn.Dense(hidden, dtype=dtype, param_dtype=param_dtype, name='goal_mlp_in')(x)
+        x = nn.silu(x)
+        return nn.Dense(3, dtype=dtype, param_dtype=param_dtype, name='goal_xyz_out')(x)
 
 
 class DirectDecoderCore(nn.Module):
@@ -278,16 +366,16 @@ class DirectDecoderCore(nn.Module):
         write_chunk_start: Optional[jnp.ndarray] = None,
     ) -> jnp.ndarray:
         mode = str(mode).lower()
-        if mode not in ('read', 'write'):
-            raise ValueError(f"mode must be 'read' or 'write', got {mode!r}.")
-        if mode == 'read':
+        if mode not in ('read', 'write', 'goal'):
+            raise ValueError(f"mode must be one of: 'read', 'write', 'goal'. Got {mode!r}.")
+        if mode in ('read', 'goal'):
             if query_tokens is None:
-                raise ValueError('READ mode requires query_tokens.')
+                raise ValueError(f'{mode.upper()} mode requires query_tokens.')
             B = int(query_tokens.shape[0])
             # Touch WRITE-only parameters when the new WRITE/READ mode is
             # enabled so model.init from a READ call still initializes the full
             # checkpoint parameter tree.
-            if bool(self.cfg.separate_write_read_heads) or bool(self.cfg.use_decoder_mode_embed):
+            if mode == 'read' and (bool(self.cfg.separate_write_read_heads) or bool(self.cfg.use_decoder_mode_embed)):
                 _unused_write_tokens, _unused_write_mask = WriteQueryTokenBuilder(
                     self.cfg,
                     name='write_query_builder',
@@ -298,6 +386,21 @@ class DirectDecoderCore(nn.Module):
                     train=train,
                 )
                 del _unused_write_tokens, _unused_write_mask
+            if mode == 'goal':
+                return GoalPredictionHead(self.cfg, name='goal_prediction_head')(
+                    query_tokens=query_tokens,
+                    query_mask=query_mask,
+                    support_tokens=support_tokens,
+                    support_mask=support_mask,
+                )
+            if bool(self.cfg.use_goal_prediction_head):
+                _unused_goal = GoalPredictionHead(self.cfg, name='goal_prediction_head')(
+                    query_tokens=query_tokens,
+                    query_mask=query_mask,
+                    support_tokens=support_tokens,
+                    support_mask=support_mask,
+                )
+                del _unused_goal
         else:
             if support_tokens is None:
                 raise ValueError('WRITE mode requires support_tokens/memory_tokens.')
@@ -326,6 +429,12 @@ class DirectDecoderCore(nn.Module):
             support_tokens=support_tokens,
             support_mask=support_mask,
         )
+        memory_cond = PooledContextConditioner(self.cfg, name='memory_context_conditioner')(
+            query_tokens=None,
+            query_mask=None,
+            support_tokens=support_tokens,
+            support_mask=support_mask,
+        ) if str(self.cfg.memory_conditioning_mode).strip().lower() not in ('', 'none', 'off', 'false') else None
         if bool(self.cfg.use_decoder_mode_embed):
             mode_embed = self.param(
                 'mode_embed',
@@ -346,6 +455,7 @@ class DirectDecoderCore(nn.Module):
                 query_mask=query_mask,
                 support_tokens=support_tokens,
                 support_mask=support_mask,
+                memory_cond=memory_cond,
                 train=train,
             )
         if bool(self.cfg.shared_write_read_head) or not bool(self.cfg.separate_write_read_heads):

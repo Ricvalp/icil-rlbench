@@ -6,6 +6,7 @@ from typing import Any, Dict, Tuple
 import jax
 import jax.numpy as jnp
 import optax
+from flax.traverse_util import flatten_dict
 from flax.training import train_state
 
 from icil_jax_query_memory.models.query_memory_direct_regression import QueryMemoryDirectRegressionConfig, QueryMemoryDirectRegressionModel
@@ -114,6 +115,69 @@ def _read_predict(
     )
 
 
+def _attention_metrics_from_intermediates(intermediates: Any) -> Dict[str, jnp.ndarray]:
+    zero = jnp.array(0.0, dtype=jnp.float32)
+    query_weights = []
+    memory_weights = []
+    flat = flatten_dict(intermediates, sep='/') if intermediates else {}
+    for path, value in flat.items():
+        if 'attention_weights' not in str(path):
+            continue
+        x = value[-1] if isinstance(value, tuple) and value else value
+        if not hasattr(x, 'shape') or len(x.shape) < 4:
+            continue
+        if 'cross_attn_q' in str(path):
+            query_weights.append(x)
+        elif 'cross_attn_s' in str(path):
+            memory_weights.append(x)
+
+    def _stats(values):
+        if not values:
+            return zero, zero
+        entropies = []
+        maxes = []
+        for weights in values:
+            w = jnp.asarray(weights, dtype=jnp.float32)
+            p = jnp.clip(w, jnp.asarray(1e-8, dtype=jnp.float32), jnp.asarray(1.0, dtype=jnp.float32))
+            entropy = -jnp.sum(p * jnp.log(p), axis=-1)
+            denom = jnp.log(jnp.asarray(max(2, int(w.shape[-1])), dtype=jnp.float32))
+            entropies.append(jnp.mean(entropy / denom))
+            maxes.append(jnp.mean(jnp.max(w, axis=-1)))
+        return jnp.mean(jnp.stack(entropies)), jnp.mean(jnp.stack(maxes))
+
+    query_entropy, query_max = _stats(query_weights)
+    memory_entropy, memory_max = _stats(memory_weights)
+    return {
+        'attn_query_entropy': query_entropy,
+        'attn_query_max': query_max,
+        'attn_memory_entropy': memory_entropy,
+        'attn_memory_max': memory_max,
+    }
+
+
+def _read_predict_with_attention_metrics(
+    params: Any,
+    *,
+    model: QueryMemoryDirectRegressionModel,
+    batch: Dict[str, jnp.ndarray],
+    memory_tokens: jnp.ndarray,
+    train: bool,
+) -> Tuple[jnp.ndarray, Dict[str, jnp.ndarray]]:
+    pred, mutable = model.apply(
+        {'params': params},
+        query_xyz=batch['query_xyz'],
+        query_state=batch['query_state'],
+        query_valid=batch.get('query_valid', None),
+        query_rgb=batch.get('query_rgb', None),
+        query_mask_id=batch.get('query_mask_id', None),
+        memory_tokens=memory_tokens,
+        mode='read',
+        train=train,
+        mutable=['intermediates'],
+    )
+    return pred, _attention_metrics_from_intermediates(mutable.get('intermediates', {}))
+
+
 def _read_loss(
     params: Any,
     *,
@@ -138,6 +202,64 @@ def _read_loss(
         gripper_weight=float(model.cfg.decoder.gripper_loss_weight),
         chunk_decay=float(model.cfg.decoder.chunk_decay),
     )
+
+
+def _goal_predict(
+    params: Any,
+    *,
+    model: QueryMemoryDirectRegressionModel,
+    batch: Dict[str, jnp.ndarray],
+    memory_tokens: jnp.ndarray,
+    train: bool,
+) -> jnp.ndarray:
+    return model.apply(
+        {'params': params},
+        query_xyz=batch['query_xyz'],
+        query_state=batch['query_state'],
+        query_valid=batch.get('query_valid', None),
+        query_rgb=batch.get('query_rgb', None),
+        query_mask_id=batch.get('query_mask_id', None),
+        memory_tokens=memory_tokens,
+        mode='goal',
+        train=train,
+    )
+
+
+def _goal_prediction_loss(
+    params: Any,
+    *,
+    model: QueryMemoryDirectRegressionModel,
+    batch: Dict[str, jnp.ndarray],
+    memory_tokens: jnp.ndarray,
+    train: bool,
+    loss_type: str,
+) -> Tuple[jnp.ndarray, Dict[str, jnp.ndarray]]:
+    zero = jnp.array(0.0, dtype=jnp.float32)
+    if 'target_goal' not in batch:
+        return zero, {
+            'goal_prediction_loss': zero,
+            'goal_prediction_l1': zero,
+            'goal_prediction_l2': zero,
+        }
+    pred = _goal_predict(params, model=model, batch=batch, memory_tokens=memory_tokens, train=train)
+    target = jnp.asarray(batch['target_goal'], dtype=jnp.float32)
+    pred = jnp.asarray(pred, dtype=jnp.float32)
+    diff = pred - target
+    loss_name = str(loss_type).strip().lower()
+    if loss_name == 'mse':
+        loss = jnp.mean(jnp.square(diff))
+    elif loss_name == 'l1':
+        loss = jnp.mean(jnp.abs(diff))
+    elif loss_name == 'huber':
+        abs_diff = jnp.abs(diff)
+        loss = jnp.mean(jnp.where(abs_diff <= 1.0, 0.5 * jnp.square(diff), abs_diff - 0.5))
+    else:
+        raise ValueError(f"goal_prediction_loss_type must be 'mse', 'l1', or 'huber', got {loss_type!r}.")
+    return loss, {
+        'goal_prediction_loss': loss,
+        'goal_prediction_l1': jnp.mean(jnp.abs(diff)),
+        'goal_prediction_l2': jnp.sqrt(jnp.mean(jnp.square(diff)) + jnp.asarray(1e-8, dtype=jnp.float32)),
+    }
 
 
 def _metadata_or_zeros(batch: Dict[str, jnp.ndarray], primary: str, fallback: str) -> jnp.ndarray:
@@ -212,6 +334,27 @@ def _inner_loss(
     if mode == 'write':
         return _write_loss(params, model=model, batch=batch, memory_tokens=memory_tokens, train=train)
     raise ValueError(f"inner_loss_mode must be 'read' or 'write', got {inner_loss_mode!r}.")
+
+
+def _apply_query_goal_dropout(
+    batch: Dict[str, jnp.ndarray],
+    *,
+    rng: jnp.ndarray,
+    rate: float,
+    state_start: int,
+) -> Dict[str, jnp.ndarray]:
+    rate = float(rate)
+    if rate <= 0.0 or 'query_state' not in batch:
+        return batch
+    q = batch['query_state']
+    start = int(state_start)
+    if start < 0 or q.shape[-1] < start + 3:
+        return batch
+    keep_prob = max(0.0, min(1.0, 1.0 - rate))
+    mask_shape = tuple(q.shape[:-2]) + (1, 1)
+    keep = jax.random.bernoulli(rng, p=keep_prob, shape=mask_shape).astype(q.dtype)
+    q = q.at[..., start : start + 3].set(q[..., start : start + 3] * keep)
+    return {**batch, 'query_state': q}
 
 
 def _adapt_one_task(
@@ -345,6 +488,7 @@ def _task_meta_objective(
     task_query: Dict[str, jnp.ndarray],
     task_wrong_inner: Dict[str, jnp.ndarray],
     task_contrast_inner: Dict[str, jnp.ndarray],
+    rng: jnp.ndarray,
     inner_steps: int,
     inner_lr: float,
     max_grad_norm: float,
@@ -361,8 +505,20 @@ def _task_meta_objective(
     wrong_support_margin_weight: float,
     use_memory_contrast: bool,
     memory_contrast_on_delta: bool,
+    query_goal_dropout_rate: float,
+    query_goal_dropout_state_start: int,
+    log_attention_metrics: bool,
+    goal_prediction_loss_weight: float,
+    goal_prediction_loss_type: str,
 ) -> Tuple[jnp.ndarray, Dict[str, jnp.ndarray]]:
     initial_memory = params['memory_token_init']
+    rng_query_dropout, _rng_aux = jax.random.split(rng)
+    task_query_for_read = _apply_query_goal_dropout(
+        task_query,
+        rng=rng_query_dropout,
+        rate=float(query_goal_dropout_rate),
+        state_start=int(query_goal_dropout_state_start),
+    )
     adapted_memory, inner_stats = _adapt_one_task(
         params,
         model=model,
@@ -374,7 +530,7 @@ def _task_meta_objective(
         inner_loss_mode=inner_loss_mode,
         memory_layer_norm_after_update=memory_layer_norm_after_update,
     )
-    read_loss_after = _read_loss(params, model=model, batch=task_query, memory_tokens=adapted_memory, train=True)
+    read_loss_after = _read_loss(params, model=model, batch=task_query_for_read, memory_tokens=adapted_memory, train=True)
     meta_loss = read_loss_after
     need_read_before = (
         bool(use_read_improvement_margin)
@@ -382,7 +538,7 @@ def _task_meta_objective(
         or not bool(training_mode_metrics_only)
     )
     if need_read_before:
-        read_loss_before = _read_loss(params, model=model, batch=task_query, memory_tokens=initial_memory, train=True)
+        read_loss_before = _read_loss(params, model=model, batch=task_query_for_read, memory_tokens=initial_memory, train=True)
     else:
         read_loss_before = jax.lax.stop_gradient(read_loss_after)
 
@@ -413,7 +569,7 @@ def _task_meta_objective(
             inner_loss_mode=inner_loss_mode,
             memory_layer_norm_after_update=memory_layer_norm_after_update,
         )
-        read_loss_wrong = _read_loss(params, model=model, batch=task_query, memory_tokens=wrong_memory, train=True)
+        read_loss_wrong = _read_loss(params, model=model, batch=task_query_for_read, memory_tokens=wrong_memory, train=True)
         wrong_minus_correct = read_loss_wrong - read_loss_after
         margin = jnp.asarray(wrong_support_margin, dtype=read_loss_after.dtype)
         weight = jnp.asarray(wrong_support_margin_weight, dtype=read_loss_after.dtype)
@@ -437,11 +593,43 @@ def _task_meta_objective(
         )
 
     if bool(log_output_delta):
-        pred_before = _read_predict(params, model=model, batch=task_query, memory_tokens=initial_memory, train=True)
-        pred_after = _read_predict(params, model=model, batch=task_query, memory_tokens=adapted_memory, train=True)
+        pred_before = _read_predict(params, model=model, batch=task_query_for_read, memory_tokens=initial_memory, train=True)
+        pred_after = _read_predict(params, model=model, batch=task_query_for_read, memory_tokens=adapted_memory, train=True)
         action_output_delta = jnp.mean(jnp.abs(pred_after - pred_before))
     else:
         action_output_delta = jnp.array(0.0, dtype=jnp.float32)
+
+    goal_loss = jnp.array(0.0, dtype=jnp.float32)
+    goal_metrics = {
+        'goal_prediction_loss': goal_loss,
+        'goal_prediction_l1': goal_loss,
+        'goal_prediction_l2': goal_loss,
+    }
+    if float(goal_prediction_loss_weight) > 0.0:
+        goal_loss, goal_metrics = _goal_prediction_loss(
+            params,
+            model=model,
+            batch=task_query_for_read,
+            memory_tokens=adapted_memory,
+            train=True,
+            loss_type=str(goal_prediction_loss_type),
+        )
+        meta_loss = meta_loss + jnp.asarray(float(goal_prediction_loss_weight), dtype=meta_loss.dtype) * goal_loss
+
+    attention_metrics = {
+        'attn_query_entropy': jnp.array(0.0, dtype=jnp.float32),
+        'attn_query_max': jnp.array(0.0, dtype=jnp.float32),
+        'attn_memory_entropy': jnp.array(0.0, dtype=jnp.float32),
+        'attn_memory_max': jnp.array(0.0, dtype=jnp.float32),
+    }
+    if bool(log_attention_metrics):
+        _, attention_metrics = _read_predict_with_attention_metrics(
+            params,
+            model=model,
+            batch=task_query_for_read,
+            memory_tokens=adapted_memory,
+            train=True,
+        )
 
     metrics = {
         'meta_loss': meta_loss,
@@ -467,6 +655,8 @@ def _task_meta_objective(
         'wrong_memory_delta_norm': wrong_memory_delta_norm,
         'wrong_memory_relative_delta_norm': wrong_memory_relative_delta_norm,
     }
+    metrics.update(goal_metrics)
+    metrics.update(attention_metrics)
     if bool(use_memory_contrast):
         metrics['memory_contrast_z_a'] = _memory_embedding(
             adapted_memory,
@@ -502,20 +692,30 @@ def create_train_step(
     memory_contrast_weight: float = 0.0,
     memory_contrast_temperature: float = 0.1,
     memory_contrast_on_delta: bool = True,
+    query_goal_dropout_rate: float = 0.0,
+    query_goal_dropout_state_start: int = 36,
+    log_attention_metrics: bool = False,
+    goal_prediction_loss_weight: float = 0.0,
+    goal_prediction_loss_type: str = 'mse',
+    rng_seed: int = 0,
 ):
     @partial(jax.pmap, axis_name='device')
     def train_step(state: TrainState, batch: Dict[str, Any]):
         def loss_fn(params: Any):
             task_wrong_inner = batch['wrong_inner'] if bool(use_wrong_support_margin) else batch['inner']
             task_contrast_inner = batch['contrast_inner'] if bool(use_memory_contrast) else batch['inner']
+            base_rng = jax.random.fold_in(jax.random.PRNGKey(int(rng_seed)), state.step)
+            base_rng = jax.random.fold_in(base_rng, jax.lax.axis_index('device'))
+            task_rngs = jax.random.split(base_rng, batch['inner']['target_action'].shape[0])
             task_losses, task_aux = jax.vmap(
-                lambda task_inner, task_query, wrong_inner, contrast_inner: _task_meta_objective(
+                lambda task_inner, task_query, wrong_inner, contrast_inner, task_rng: _task_meta_objective(
                     params,
                     model=model,
                     task_inner=task_inner,
                     task_query=task_query,
                     task_wrong_inner=wrong_inner,
                     task_contrast_inner=contrast_inner,
+                    rng=task_rng,
                     inner_steps=int(inner_steps),
                     inner_lr=float(inner_lr),
                     max_grad_norm=float(max_grad_norm),
@@ -532,9 +732,14 @@ def create_train_step(
                     wrong_support_margin_weight=float(wrong_support_margin_weight),
                     use_memory_contrast=bool(use_memory_contrast),
                     memory_contrast_on_delta=bool(memory_contrast_on_delta),
+                    query_goal_dropout_rate=float(query_goal_dropout_rate),
+                    query_goal_dropout_state_start=int(query_goal_dropout_state_start),
+                    log_attention_metrics=bool(log_attention_metrics),
+                    goal_prediction_loss_weight=float(goal_prediction_loss_weight),
+                    goal_prediction_loss_type=str(goal_prediction_loss_type),
                 ),
-                in_axes=(0, 0, 0, 0),
-            )(batch['inner'], batch['query'], task_wrong_inner, task_contrast_inner)
+                in_axes=(0, 0, 0, 0, 0),
+            )(batch['inner'], batch['query'], task_wrong_inner, task_contrast_inner, task_rngs)
             meta_loss = jnp.mean(task_losses)
             contrast_metrics = {
                 'memory_contrast_loss': jnp.array(0.0, dtype=jnp.float32),

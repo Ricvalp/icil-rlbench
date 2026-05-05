@@ -262,7 +262,9 @@ class MetaWorldQueryMemoryTaskBuilder:
         obs_idx, act_idx = self._indices_for_t0(t0=int(t0), episode_length=T)
         obs = self.store.load_episode_slices(task_name, int(episode_id), obs_idx)
         act = self.store.load_episode_slices(task_name, int(episode_id), act_idx)
-        query_state = self._maybe_zero_goal(torch.from_numpy(obs['obs_model']).float(), zero_goal=bool(zero_goal))
+        raw_query_state = torch.from_numpy(obs['obs_model']).float()
+        target_goal = raw_query_state[-1, -3:].clone() if raw_query_state.shape[-1] >= 3 else torch.zeros(3, dtype=torch.float32)
+        query_state = self._maybe_zero_goal(raw_query_state, zero_goal=bool(zero_goal))
         target_action = torch.from_numpy(act['action']).float()
         ep_meta = self.store.episode_metadata(int(episode_id))
         sample: Dict[str, Any] = {
@@ -270,6 +272,7 @@ class MetaWorldQueryMemoryTaskBuilder:
             'query_state': query_state,
             'query_valid': torch.ones((int(self.cfg.T_obs), 1), dtype=torch.bool),
             'target_action': target_action,
+            'target_goal': target_goal,
             'meta': {
                 'task_name': str(task_name),
                 'episode_id': int(episode_id),
@@ -292,7 +295,7 @@ class MetaWorldQueryMemoryTaskBuilder:
             raise ValueError('samples must be non-empty.')
         keys = ('query_xyz', 'query_state', 'query_valid', 'target_action')
         batch: Dict[str, Any] = {key: torch.stack([sample[key] for sample in samples], 0) for key in keys}
-        for key in ('demo_id', 'support_demo_id', 'chunk_start', 'support_chunk_start'):
+        for key in ('target_goal', 'demo_id', 'support_demo_id', 'chunk_start', 'support_chunk_start'):
             if all(key in sample for sample in samples):
                 batch[key] = torch.stack([sample[key] for sample in samples], 0)
         batch['meta'] = [sample['meta'] for sample in samples]

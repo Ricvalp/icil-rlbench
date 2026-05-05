@@ -150,6 +150,11 @@ def _resolve_memory_cfg(cfg: ConfigDict) -> QueryMemoryMetaConfig:
         memory_contrast_weight=float(getattr(cfg.maml, 'memory_contrast_weight', 0.0)),
         memory_contrast_temperature=float(getattr(cfg.maml, 'memory_contrast_temperature', 0.1)),
         memory_contrast_on_delta=bool(getattr(cfg.maml, 'memory_contrast_on_delta', True)),
+        query_goal_dropout_rate=float(getattr(cfg.maml, 'query_goal_dropout_rate', 0.0)),
+        query_goal_dropout_state_start=int(getattr(cfg.maml, 'query_goal_dropout_state_start', 36)),
+        log_attention_metrics=bool(getattr(cfg.maml, 'log_attention_metrics', False)),
+        goal_prediction_loss_weight=float(getattr(cfg.maml, 'goal_prediction_loss_weight', 0.0)),
+        goal_prediction_loss_type=str(getattr(cfg.maml, 'goal_prediction_loss_type', 'mse')),
     )
 
 
@@ -378,6 +383,10 @@ def train(cfg: ConfigDict) -> None:
         raise ValueError(f"Unsupported data.source={source!r}. Expected 'rlbench' or 'metaworld'.")
     memory_cfg = _resolve_memory_cfg(cfg)
     model_cfg_raw = cfg.model
+    if bool(memory_cfg.log_attention_metrics):
+        model_cfg_raw.query_memory_direct_regression.log_attention_weights = True
+    if float(memory_cfg.goal_prediction_loss_weight) > 0.0:
+        model_cfg_raw.query_memory_direct_regression.use_goal_prediction_head = True
     use_mask_id = _resolve_use_mask_id(model_cfg_raw)
     use_rgb = _resolve_use_rgb(model_cfg_raw)
 
@@ -473,6 +482,12 @@ def train(cfg: ConfigDict) -> None:
         memory_contrast_weight=float(memory_cfg.memory_contrast_weight),
         memory_contrast_temperature=float(memory_cfg.memory_contrast_temperature),
         memory_contrast_on_delta=bool(memory_cfg.memory_contrast_on_delta),
+        query_goal_dropout_rate=float(memory_cfg.query_goal_dropout_rate),
+        query_goal_dropout_state_start=int(memory_cfg.query_goal_dropout_state_start),
+        log_attention_metrics=bool(memory_cfg.log_attention_metrics),
+        goal_prediction_loss_weight=float(memory_cfg.goal_prediction_loss_weight),
+        goal_prediction_loss_type=str(memory_cfg.goal_prediction_loss_type),
+        rng_seed=int(seed),
     )
     adapt_fn = create_adapt_fn(
         model=model,

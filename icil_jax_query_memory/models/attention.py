@@ -39,6 +39,7 @@ class CrossAttention(nn.Module):
     dropout: float = 0.0
     dtype: jnp.dtype = jnp.float32
     param_dtype: jnp.dtype = jnp.float32
+    log_attention_weights: bool = False
 
     @nn.compact
     def __call__(
@@ -61,7 +62,7 @@ class CrossAttention(nn.Module):
             dropout_rate=float(self.dropout),
             dtype=self.dtype,
             param_dtype=self.param_dtype,
-        )(q, kv, mask=mask, deterministic=not train)
+        )(q, kv, mask=mask, deterministic=not train, sow_weights=bool(self.log_attention_weights))
 
 
 class SelfAttention(nn.Module):

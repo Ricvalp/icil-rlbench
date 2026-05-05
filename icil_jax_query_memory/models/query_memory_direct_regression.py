@@ -37,12 +37,12 @@ class QueryMemoryDirectRegressionModel(nn.Module):
         train: bool = False,
     ) -> jnp.ndarray:
         mode = str(mode).lower()
-        if mode not in ('read', 'write'):
-            raise ValueError(f"mode must be 'read' or 'write', got {mode!r}.")
+        if mode not in ('read', 'write', 'goal'):
+            raise ValueError(f"mode must be one of: 'read', 'write', 'goal'. Got {mode!r}.")
 
-        if mode == 'read':
+        if mode in ('read', 'goal'):
             if query_xyz is None or query_state is None:
-                raise ValueError('READ mode requires query_xyz and query_state.')
+                raise ValueError(f'{mode.upper()} mode requires query_xyz and query_state.')
             encoder = SimpleQueryPointEncoder(cfg=self.cfg.query_encoder, state_dim=int(self.cfg.state_dim), name='context_encoder')
             query_tokens, query_mask = encoder(
                 query_xyz=query_xyz,

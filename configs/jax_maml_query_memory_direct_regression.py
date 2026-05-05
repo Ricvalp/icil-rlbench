@@ -46,6 +46,11 @@ def get_config():
     cfg.model.query_memory_direct_regression.conditioner_mlp_mult = 2
     cfg.model.query_memory_direct_regression.conditioner_dropout = 0.0
     cfg.model.query_memory_direct_regression.memory_num_tokens = 128
+    cfg.model.query_memory_direct_regression.memory_conditioning_mode = 'none'
+    cfg.model.query_memory_direct_regression.memory_conditioning_strength = 1.0
+    cfg.model.query_memory_direct_regression.log_attention_weights = False
+    cfg.model.query_memory_direct_regression.use_goal_prediction_head = False
+    cfg.model.query_memory_direct_regression.goal_prediction_mlp_mult = 2
 
     cfg.model.simple_query_point_encoder = ConfigDict()
     cfg.model.simple_query_point_encoder.d_model = 512
@@ -84,6 +89,11 @@ def get_config():
     cfg.maml.holdout_index = -1
     cfg.maml.reuse_diffusion_noise = False
     cfg.maml.grad_accum_steps = 1
+    cfg.maml.query_goal_dropout_rate = 0.0
+    cfg.maml.query_goal_dropout_state_start = 36
+    cfg.maml.log_attention_metrics = False
+    cfg.maml.goal_prediction_loss_weight = 0.0
+    cfg.maml.goal_prediction_loss_type = 'mse'
 
     cfg.wandb = ConfigDict()
     cfg.wandb.enable = False
