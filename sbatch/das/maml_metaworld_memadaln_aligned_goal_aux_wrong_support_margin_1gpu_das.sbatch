@@ -6,7 +6,7 @@
 #SBATCH --gres=gpu:1
 #SBATCH --mem=96G
 #SBATCH --cpus-per-task=8
-#SBATCH --time=2-00:00
+#SBATCH --time=1-00:00
 #SBATCH --output=/home/valperga/icil-rlbench/sbatch/das/logs/mw_memadaln_goalaux-%j.out
 #SBATCH --error=/home/valperga/icil-rlbench/sbatch/das/logs/mw_memadaln_goalaux-%j.err
 
