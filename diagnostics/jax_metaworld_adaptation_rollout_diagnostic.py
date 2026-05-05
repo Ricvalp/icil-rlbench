@@ -224,7 +224,13 @@ def evaluate(cfg: ConfigDict) -> None:
     results: Dict[str, List[Dict[str, Any]]] = {label: [] for label in labels}
     try:
         for episode_idx in range(int(cfg.rollout.num_episodes)):
-            target_task_name = resolve_task_name(store, str(cfg.task.name), rng)
+            target_task_name = resolve_task_name(
+                store,
+                str(cfg.task.name),
+                rng,
+                task_names=tuple(cfg.data.tasks),
+                exclude_tasks=tuple(cfg.data.exclude_tasks),
+            )
             wrong_task_name = sample_wrong_family(store, target_task_name, str(cfg.adaptation.different_task_name), rng)
             target_builder = make_builder(store, data_cfg, seed=seed + 1000 + episode_idx, task_names=(target_task_name,))
             wrong_builder = make_builder(store, data_cfg, seed=seed + 2000 + episode_idx, task_names=(wrong_task_name,))

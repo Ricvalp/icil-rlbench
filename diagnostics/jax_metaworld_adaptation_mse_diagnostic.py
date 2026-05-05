@@ -37,6 +37,54 @@ def _adaptation_summary(adaptation: Dict[str, Any]) -> Dict[str, Any]:
     return {key: value for key, value in adaptation.items() if key != 'memory_tokens'}
 
 
+def _best_condition_counts(per_batch: Sequence[Dict[str, Any]], *, metric_name: str = 'mse') -> Dict[str, int]:
+    counts: Dict[str, int] = {}
+    for item in per_batch:
+        metrics = item.get('metrics', {})
+        values: Dict[str, float] = {}
+        for condition in ('no_adaptation', 'same_family_adaptation', 'wrong_family_adaptation'):
+            value = metrics.get(condition, {}).get('metrics', {}).get(metric_name, None)
+            if value is not None:
+                values[condition] = float(value)
+        if values:
+            best = min(values, key=values.get)
+            counts[best] = counts.get(best, 0) + 1
+    return counts
+
+
+def _per_target_task_breakdown(per_batch: Sequence[Dict[str, Any]], *, metric_name: str = 'mse') -> Dict[str, Any]:
+    buckets: Dict[str, Dict[str, List[float]]] = {}
+    for item in per_batch:
+        task_name = str(item.get('target_task_name', ''))
+        task_bucket = buckets.setdefault(
+            task_name,
+            {
+                'no_adaptation': [],
+                'same_family_adaptation': [],
+                'wrong_family_adaptation': [],
+            },
+        )
+        metrics = item.get('metrics', {})
+        for condition in task_bucket:
+            value = metrics.get(condition, {}).get('metrics', {}).get(metric_name, None)
+            if value is not None:
+                task_bucket[condition].append(float(value))
+
+    out: Dict[str, Any] = {}
+    for task_name, values in sorted(buckets.items()):
+        means = {condition: float(np.mean(vals)) for condition, vals in values.items() if vals}
+        entry: Dict[str, Any] = {
+            'count': int(max((len(vals) for vals in values.values()), default=0)),
+            'mean': means,
+        }
+        if 'same_family_adaptation' in means and 'no_adaptation' in means:
+            entry['same_minus_no'] = float(means['same_family_adaptation'] - means['no_adaptation'])
+        if 'wrong_family_adaptation' in means and 'same_family_adaptation' in means:
+            entry['wrong_minus_same'] = float(means['wrong_family_adaptation'] - means['same_family_adaptation'])
+        out[task_name] = entry
+    return out
+
+
 def diagnose(cfg: ConfigDict) -> None:
     seed = int(cfg.seed)
     set_seed(seed)
@@ -68,7 +116,13 @@ def diagnose(cfg: ConfigDict) -> None:
 
     try:
         for batch_idx in range(int(cfg.mse.num_batches)):
-            target_task_name = resolve_task_name(store, str(cfg.task.name), rng)
+            target_task_name = resolve_task_name(
+                store,
+                str(cfg.task.name),
+                rng,
+                task_names=tuple(cfg.data.tasks),
+                exclude_tasks=tuple(cfg.data.exclude_tasks),
+            )
             wrong_task_name = sample_wrong_family(store, target_task_name, str(cfg.adaptation.different_task_name), rng)
             target_builder = make_builder(
                 store,
@@ -189,6 +243,8 @@ def diagnose(cfg: ConfigDict) -> None:
                 'mean': mean_metrics,
                 'same_minus_no': {k: float(same[k] - no[k]) for k in sorted(same.keys() & no.keys())},
                 'wrong_minus_same': {k: float(wrong[k] - same[k]) for k in sorted(wrong.keys() & same.keys())},
+                'best_condition_counts': _best_condition_counts(per_batch, metric_name='mse'),
+                'per_target_task': _per_target_task_breakdown(per_batch, metric_name='mse'),
                 'prediction_deltas_mean_abs': {k: float(np.mean(v)) for k, v in sorted(deltas.items())},
                 'per_batch': per_batch,
             },
@@ -202,6 +258,7 @@ def diagnose(cfg: ConfigDict) -> None:
         logging.info('no adaptation: %s', no)
         logging.info('same-family adaptation: %s', same)
         logging.info('wrong-family adaptation: %s', wrong)
+        logging.info('best condition counts: %s', summary['mse']['best_condition_counts'])
         logging.info('diagnostics written to %s', run_dir)
     finally:
         store.close()

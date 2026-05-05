@@ -31,10 +31,11 @@ def get_config():
     cfg.data.tasks = ()
     cfg.data.exclude_tasks = ()
     # None means infer from the checkpoint config. Pass true/false or a
-    # concrete string on the CLI to override for diagnostics.
+    # concrete string on the CLI to override for diagnostics. The default
+    # support sampling is family-level: same task name, different goal instance.
     cfg.data.task_sampling = None
-    cfg.data.sample_same_task_name = None
-    cfg.data.sample_same_task_instance = None
+    cfg.data.sample_same_task_name = True
+    cfg.data.sample_same_task_instance = False
     cfg.data.allow_support_query_same_episode = None
     cfg.data.support_zero_goal = None
     cfg.data.query_zero_goal = None

@@ -124,13 +124,12 @@ def _model_cfg_from_checkpoint(cfg: ConfigDict, ckpt: Dict[str, Any], *, compute
     action_dim = int(resolved.get('action_dim', getattr(cfg.model, 'action_dim', 4)))
 
     # Checkpoints trained during the transition to family-level MetaWorld WRITE
-    # support observation conditioning may not contain this knob. Infer the
-    # intended behavior from the data semantics unless the checkpoint/config has
-    # an explicit value.
+    # support observation conditioning may not contain this knob. Default to the
+    # corrected family-level semantics unless the checkpoint/config is explicit.
     decoder_raw = raw.query_memory_direct_regression
     if not hasattr(decoder_raw, 'write_use_support_obs'):
         data_cfg = _cfg_dict(ckpt, 'data')
-        family_level = not bool(data_cfg.get('sample_same_task_instance', True))
+        family_level = not bool(data_cfg.get('sample_same_task_instance', False))
         if family_level and bool(getattr(decoder_raw, 'separate_write_read_heads', False)):
             decoder_raw.write_use_support_obs = True
     return build_model_config_from_raw(raw, state_dim=state_dim, action_dim=action_dim, compute_dtype=compute_dtype)
@@ -188,7 +187,7 @@ def resolve_metaworld_data_cfg(cfg: ConfigDict, ckpt: Dict[str, Any]) -> MetaWor
         action_representation=_sdataset('action_representation', 'absolute'),
         task_sampling=_sdata('task_sampling', 'task_instance_uniform'),
         sample_same_task_name=_bdata('sample_same_task_name', True),
-        sample_same_task_instance=_bdata('sample_same_task_instance', True),
+        sample_same_task_instance=_bdata('sample_same_task_instance', False),
         allow_support_query_same_episode=_bdata('allow_support_query_same_episode', False),
         support_zero_goal=_bdata('support_zero_goal', False),
         query_zero_goal=_bdata('query_zero_goal', False),
@@ -330,13 +329,37 @@ def make_builder(
     )
 
 
-def resolve_task_name(store: MetaWorldEpisodeStore, requested: str, rng: np.random.Generator) -> str:
+def _normalised_task_filter(values: Sequence[str] | Any) -> Tuple[str, ...]:
+    if values is None:
+        return ()
+    if isinstance(values, str):
+        raw = [values]
+    else:
+        raw = list(values)
+    return tuple(normalize_env_name(str(v)) for v in raw if str(v).strip())
+
+
+def resolve_task_name(
+    store: MetaWorldEpisodeStore,
+    requested: str,
+    rng: np.random.Generator,
+    *,
+    task_names: Sequence[str] = (),
+    exclude_tasks: Sequence[str] = (),
+) -> str:
     value = str(requested or '').strip()
+    include = set(_normalised_task_filter(task_names))
+    exclude = set(_normalised_task_filter(exclude_tasks))
     if value:
-        return normalize_env_name(value)
-    names = store.list_task_names()
+        task_name = normalize_env_name(value)
+        if include and task_name not in include:
+            raise ValueError(f'Requested task {task_name!r} is not in cfg.data.tasks={sorted(include)}.')
+        if task_name in exclude:
+            raise ValueError(f'Requested task {task_name!r} is excluded by cfg.data.exclude_tasks.')
+        return task_name
+    names = [name for name in store.list_task_names() if (not include or name in include) and name not in exclude]
     if not names:
-        raise RuntimeError('MetaWorld store has no tasks.')
+        raise RuntimeError('MetaWorld store has no tasks after cfg.data.tasks/exclude_tasks filtering.')
     return str(names[int(rng.integers(0, len(names)))])
 
 
