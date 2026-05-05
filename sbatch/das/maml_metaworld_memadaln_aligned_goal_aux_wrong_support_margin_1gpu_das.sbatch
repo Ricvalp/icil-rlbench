@@ -4,7 +4,7 @@
 #SBATCH --job-name=mw_memadaln_goalaux
 #SBATCH --partition=defq
 #SBATCH --gres=gpu:1
-#SBATCH --mem=64G
+#SBATCH --mem=40G
 #SBATCH --cpus-per-task=16
 #SBATCH --time=1-00:00
 #SBATCH --output=/home/valperga/icil-rlbench/sbatch/das/logs/mw_memadaln_goalaux-%j.out
