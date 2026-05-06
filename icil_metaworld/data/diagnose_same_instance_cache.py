@@ -40,12 +40,16 @@ def diagnose(cache_root: str, *, tol: float, max_instances: int) -> Dict[str, An
                 'all_pairs_identical': None,
                 'max_obs_abs_diff': None,
                 'max_action_abs_diff': None,
+                'max_goal_abs_diff': None,
+                'max_first_obs_abs_diff': None,
             }
             if episode_ids.shape[0] >= 2:
                 comparable_instances += 1
                 ref_obs, ref_action = _episode_arrays(store, task_name, int(episode_ids[0]))
                 max_obs = 0.0
                 max_action = 0.0
+                max_goal = 0.0
+                max_first_obs = 0.0
                 all_identical = True
                 for episode_id in episode_ids[1:].tolist():
                     obs, action = _episode_arrays(store, task_name, int(episode_id))
@@ -53,16 +57,28 @@ def diagnose(cache_root: str, *, tol: float, max_instances: int) -> Dict[str, An
                         all_identical = False
                         max_obs = float('inf')
                         max_action = float('inf')
+                        max_goal = float('inf')
+                        max_first_obs = float('inf')
                         break
                     obs_diff = float(np.max(np.abs(obs - ref_obs))) if obs.size else 0.0
                     action_diff = float(np.max(np.abs(action - ref_action))) if action.size else 0.0
+                    goal_diff = (
+                        float(np.max(np.abs(obs[:, -3:] - ref_obs[:, -3:])))
+                        if obs.ndim == 2 and obs.shape[-1] >= 3 and ref_obs.shape == obs.shape
+                        else float('nan')
+                    )
+                    first_obs_diff = float(np.max(np.abs(obs[0] - ref_obs[0]))) if obs.ndim >= 2 and obs.shape[0] else 0.0
                     max_obs = max(max_obs, obs_diff)
                     max_action = max(max_action, action_diff)
+                    max_goal = max(max_goal, goal_diff)
+                    max_first_obs = max(max_first_obs, first_obs_diff)
                     if obs_diff > float(tol) or action_diff > float(tol):
                         all_identical = False
                 row['all_pairs_identical'] = bool(all_identical)
                 row['max_obs_abs_diff'] = max_obs
                 row['max_action_abs_diff'] = max_action
+                row['max_goal_abs_diff'] = max_goal
+                row['max_first_obs_abs_diff'] = max_first_obs
                 if all_identical:
                     identical_instances += 1
             rows.append(row)

@@ -44,6 +44,191 @@ def _reset_env(env: Any, *, seed: int) -> tuple[np.ndarray, Dict[str, Any]]:
     return np.asarray(obs, dtype=np.float32), dict(info or {})
 
 
+def _jsonable_array(value: Any) -> Any:
+    if value is None:
+        return None
+    arr = np.asarray(value)
+    return arr.astype(float).tolist()
+
+
+def _target_reference(env: Any, obs: np.ndarray | None = None) -> np.ndarray | None:
+    target = getattr(env, '_target_pos', None)
+    if target is not None:
+        return np.asarray(target, dtype=np.float64).reshape(-1).copy()
+    if obs is not None and np.asarray(obs).shape[-1] >= 3:
+        return np.asarray(obs, dtype=np.float64).reshape(-1)[-3:].copy()
+    return None
+
+
+def _goal_slice_from_name(name: str, *, rand_vec_dim: int, goal_dims: int) -> slice:
+    name = str(name).lower()
+    goal_dims = max(1, min(int(goal_dims), int(rand_vec_dim)))
+    if name == 'last':
+        return slice(int(rand_vec_dim) - goal_dims, int(rand_vec_dim))
+    if name == 'first':
+        return slice(0, goal_dims)
+    if name == 'all':
+        return slice(0, int(rand_vec_dim))
+    raise ValueError(f'Unsupported fixed_goal_random_start_goal_slice={name!r}.')
+
+
+def _sample_reset_rand_vec(env: Any, rng: np.random.Generator) -> np.ndarray:
+    space = getattr(env, '_random_reset_space', None)
+    if space is None:
+        raise RuntimeError('MetaWorld env does not expose _random_reset_space; cannot resample starts.')
+    low = np.asarray(space.low, dtype=np.float64).reshape(-1)
+    high = np.asarray(space.high, dtype=np.float64).reshape(-1)
+    return rng.uniform(low, high, size=low.shape).astype(np.float64)
+
+
+def _reset_env_with_fixed_goal_random_start(
+    env: Any,
+    *,
+    seed: int,
+    base_rand_vec: np.ndarray,
+    goal_slice: slice,
+    goal_reference: np.ndarray | None,
+    validate_goal: bool,
+    goal_tolerance: float,
+    max_resample_calls: int,
+) -> tuple[np.ndarray, Dict[str, Any]]:
+    rng = np.random.default_rng(int(seed))
+    original_get_state_rand_vec = env._get_state_rand_vec
+    base_rand_vec = np.asarray(base_rand_vec, dtype=np.float64).reshape(-1)
+    goal_reference_arr = None if goal_reference is None else np.asarray(goal_reference, dtype=np.float64).reshape(-1)
+    call_count = 0
+
+    def _patched_get_state_rand_vec() -> np.ndarray:
+        nonlocal call_count
+        call_count += 1
+        if call_count > int(max_resample_calls):
+            mixed = base_rand_vec.copy()
+        else:
+            mixed = _sample_reset_rand_vec(env, rng)
+            if mixed.shape != base_rand_vec.shape:
+                raise RuntimeError(f'Resampled rand_vec shape {mixed.shape} differs from base {base_rand_vec.shape}.')
+            mixed[goal_slice] = base_rand_vec[goal_slice]
+        env._last_rand_vec = mixed
+        return mixed
+
+    try:
+        env._get_state_rand_vec = _patched_get_state_rand_vec
+        env._freeze_rand_vec = False
+        obs, info = _reset_env(env, seed=seed)
+    finally:
+        env._get_state_rand_vec = original_get_state_rand_vec
+        env._freeze_rand_vec = True
+
+    actual_rand_vec = np.asarray(getattr(env, '_last_rand_vec', base_rand_vec), dtype=np.float64).reshape(-1).copy()
+    current_goal = _target_reference(env, obs)
+    goal_diff = 0.0
+    if goal_reference_arr is not None and current_goal is not None:
+        if goal_reference_arr.shape != current_goal.shape:
+            goal_diff = float('inf')
+        else:
+            goal_diff = float(np.max(np.abs(current_goal - goal_reference_arr)))
+    if validate_goal and goal_diff > float(goal_tolerance):
+        raise RuntimeError(
+            'fixed_goal_random_start changed the target goal: '
+            f'max_abs_diff={goal_diff:.6g}, tolerance={float(goal_tolerance):.6g}.'
+        )
+    info = dict(info or {})
+    info['fixed_goal_random_start'] = {
+        'enabled': True,
+        'goal_slice_start': None if goal_slice.start is None else int(goal_slice.start),
+        'goal_slice_stop': None if goal_slice.stop is None else int(goal_slice.stop),
+        'resample_calls': int(call_count),
+        'base_rand_vec': _jsonable_array(base_rand_vec),
+        'actual_rand_vec': _jsonable_array(actual_rand_vec),
+        'goal_reference': _jsonable_array(goal_reference_arr),
+        'actual_goal_reference': _jsonable_array(current_goal),
+        'goal_max_abs_diff': float(goal_diff),
+    }
+    return obs, info
+
+
+def _candidate_goal_slices(name: str, *, rand_vec_dim: int, goal_dims: int) -> List[slice]:
+    name = str(name).lower()
+    if name != 'auto':
+        return [_goal_slice_from_name(name, rand_vec_dim=rand_vec_dim, goal_dims=goal_dims)]
+    candidates: List[slice] = []
+    for candidate_name in ('last', 'first', 'all'):
+        candidate = _goal_slice_from_name(candidate_name, rand_vec_dim=rand_vec_dim, goal_dims=goal_dims)
+        if not any(candidate.start == other.start and candidate.stop == other.stop for other in candidates):
+            candidates.append(candidate)
+    return candidates
+
+
+def _prepare_fixed_goal_random_start(env: Any, cfg: ConfigDict, *, seed: int) -> Dict[str, Any]:
+    base_rand_vec = np.asarray(getattr(env, '_last_rand_vec', None), dtype=np.float64).reshape(-1)
+    if base_rand_vec.size == 0:
+        raise RuntimeError('MetaWorld task did not set _last_rand_vec; cannot fix goal while resampling starts.')
+
+    # Materialize the original task goal once. This is not written to the cache;
+    # it gives us a target-position reference for validating mixed rand vectors.
+    env._last_rand_vec = base_rand_vec.copy()
+    env._freeze_rand_vec = True
+    base_obs, _ = _reset_env(env, seed=seed)
+    goal_reference = _target_reference(env, base_obs)
+
+    goal_slice_name = str(getattr(cfg.metaworld, 'fixed_goal_random_start_goal_slice', 'auto'))
+    goal_dims = int(getattr(cfg.metaworld, 'fixed_goal_random_start_goal_dims', 3))
+    validate_goal = bool(getattr(cfg.metaworld, 'fixed_goal_random_start_validate_goal', True))
+    goal_tolerance = float(getattr(cfg.metaworld, 'fixed_goal_random_start_goal_tolerance', 1e-5))
+    max_resample_calls = int(getattr(cfg.metaworld, 'fixed_goal_random_start_max_resample_calls', 256))
+
+    for i, goal_slice in enumerate(_candidate_goal_slices(goal_slice_name, rand_vec_dim=base_rand_vec.size, goal_dims=goal_dims)):
+        try:
+            obs, info = _reset_env_with_fixed_goal_random_start(
+                env,
+                seed=int(seed) + 17 + i,
+                base_rand_vec=base_rand_vec,
+                goal_slice=goal_slice,
+                goal_reference=goal_reference,
+                validate_goal=validate_goal,
+                goal_tolerance=goal_tolerance,
+                max_resample_calls=max_resample_calls,
+            )
+        except Exception as exc:
+            logging.debug('Rejected fixed-goal random-start slice %s for %s: %s', goal_slice, env.__class__.__name__, exc)
+            continue
+        del obs
+        meta = dict(info.get('fixed_goal_random_start', {}))
+        actual = np.asarray(meta.get('actual_rand_vec', []), dtype=np.float64)
+        outside = np.ones(base_rand_vec.shape[0], dtype=bool)
+        outside[goal_slice] = False
+        changed_outside = bool(np.any(np.abs(actual[outside] - base_rand_vec[outside]) > 1e-9)) if actual.shape == base_rand_vec.shape else False
+        if goal_slice.stop - goal_slice.start >= base_rand_vec.size:
+            changed_outside = False
+        if goal_slice_name.lower() != 'auto' or changed_outside or goal_slice.stop - goal_slice.start >= base_rand_vec.size:
+            return {
+                'enabled': True,
+                'base_rand_vec': base_rand_vec.copy(),
+                'goal_slice': goal_slice,
+                'goal_reference': None if goal_reference is None else goal_reference.copy(),
+                'validate_goal': validate_goal,
+                'goal_tolerance': goal_tolerance,
+                'max_resample_calls': max_resample_calls,
+            }
+
+    # Safe fallback: preserve the full task rand_vec. This keeps generation
+    # correct for tasks whose target is not separable from the reset vector,
+    # but those instances will remain duplicate demos and show up in diagnostics.
+    logging.warning(
+        'Falling back to fixed full rand_vec for %s; goal/start may not be separable for this task instance.',
+        env.__class__.__name__,
+    )
+    return {
+        'enabled': True,
+        'base_rand_vec': base_rand_vec.copy(),
+        'goal_slice': slice(0, base_rand_vec.size),
+        'goal_reference': None if goal_reference is None else goal_reference.copy(),
+        'validate_goal': validate_goal,
+        'goal_tolerance': goal_tolerance,
+        'max_resample_calls': max_resample_calls,
+    }
+
+
 def _step_env(env: Any, action: np.ndarray) -> tuple[np.ndarray, float, bool, bool, Dict[str, Any]]:
     out = env.step(action)
     if isinstance(out, tuple) and len(out) == 5:
@@ -145,8 +330,21 @@ def _rollout_expert_episode(
     max_path_length: int,
     obs_cfg: ObservationFilterConfig,
     clip_action: bool,
+    fixed_goal_random_start: Dict[str, Any] | None = None,
 ) -> Dict[str, Any]:
-    obs, _ = _reset_env(env, seed=seed)
+    if fixed_goal_random_start is None:
+        obs, reset_info = _reset_env(env, seed=seed)
+    else:
+        obs, reset_info = _reset_env_with_fixed_goal_random_start(
+            env,
+            seed=seed,
+            base_rand_vec=fixed_goal_random_start['base_rand_vec'],
+            goal_slice=fixed_goal_random_start['goal_slice'],
+            goal_reference=fixed_goal_random_start.get('goal_reference'),
+            validate_goal=bool(fixed_goal_random_start.get('validate_goal', True)),
+            goal_tolerance=float(fixed_goal_random_start.get('goal_tolerance', 1e-5)),
+            max_resample_calls=int(fixed_goal_random_start.get('max_resample_calls', 256)),
+        )
     obs_raw: List[np.ndarray] = []
     obs_model: List[np.ndarray] = []
     actions: List[np.ndarray] = []
@@ -194,6 +392,7 @@ def _rollout_expert_episode(
         'success_any': bool(np.any(success_arr)),
         'success_final': bool(success_arr[-1]),
         'filter_notes': filter_notes,
+        'reset_metadata': dict(reset_info or {}).get('fixed_goal_random_start', {}),
     }
 
 
@@ -236,6 +435,7 @@ def generate(cfg: ConfigDict) -> Path:
     clip_action = bool(getattr(cfg.action, 'clip', False))
     keep_successful_only = bool(getattr(cfg.metaworld, 'keep_successful_only', True)) if hasattr(cfg.metaworld, 'keep_successful_only') else True
     skip_failed_task_instances = bool(getattr(cfg.metaworld, 'skip_failed_task_instances', False))
+    fixed_goal_random_start_enabled = bool(getattr(cfg.metaworld, 'fixed_goal_random_start', False))
     debug_limit_episodes = int(getattr(cfg.debug, 'limit_episodes', 0))
     if debug_limit_episodes > 0:
         required_successes = min(required_successes, debug_limit_episodes)
@@ -248,6 +448,7 @@ def generate(cfg: ConfigDict) -> Path:
         'split': str(getattr(cfg.metaworld, 'train_or_test', 'train')),
         'obs': cfg.obs.to_dict(),
         'action': cfg.action.to_dict(),
+        'fixed_goal_random_start': bool(fixed_goal_random_start_enabled),
         'skipped_task_instances': [],
         'tasks': {},
         'episodes': {},
@@ -287,6 +488,13 @@ def generate(cfg: ConfigDict) -> Path:
                         env.action_space.seed(int(cfg.seed) + 7919 * task_index + task_instance_id)
                     except Exception:
                         pass
+                    fixed_goal_random_start_state = None
+                    if fixed_goal_random_start_enabled:
+                        fixed_goal_random_start_state = _prepare_fixed_goal_random_start(
+                            env,
+                            cfg,
+                            seed=int(cfg.seed) + 31_337 * task_index + task_instance_id,
+                        )
                     instance_episode_ids: List[int] = []
                     attempts = 0
                     successes = 0
@@ -300,6 +508,7 @@ def generate(cfg: ConfigDict) -> Path:
                             max_path_length=max_path_length,
                             obs_cfg=obs_cfg,
                             clip_action=clip_action,
+                            fixed_goal_random_start=fixed_goal_random_start_state,
                         )
                         if keep_successful_only and not bool(episode['success_any']):
                             continue
@@ -331,6 +540,9 @@ def generate(cfg: ConfigDict) -> Path:
                         ep_group.attrs['success_any'] = bool(episode['success_any'])
                         ep_group.attrs['success_final'] = bool(episode['success_final'])
                         ep_group.attrs['length'] = int(episode['obs_raw'].shape[0])
+                        reset_metadata = dict(episode.get('reset_metadata', {}))
+                        if reset_metadata:
+                            ep_group.attrs['reset_metadata'] = json.dumps(reset_metadata)
 
                         index['episodes'][str(episode_id)] = {
                             'episode_id': int(episode_id),
@@ -344,6 +556,8 @@ def generate(cfg: ConfigDict) -> Path:
                             'success_final': bool(episode['success_final']),
                             'attempt': int(attempts),
                         }
+                        if reset_metadata:
+                            index['episodes'][str(episode_id)]['reset_metadata'] = reset_metadata
                         instance_episode_ids.append(episode_id)
                         successes += 1
                     if successes < required_successes:

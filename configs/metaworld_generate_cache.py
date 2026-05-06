@@ -32,6 +32,19 @@ def get_config():
     # ML benchmarks hide the goal in obs by default. Scripted policies need the
     # goal for several tasks, so goal-kept caches should override this.
     cfg.metaworld.force_goal_observable = False
+    # If enabled, each episode for the same MetaWorld task instance keeps the
+    # task-instance goal fixed but resamples the non-goal part of the reset
+    # random vector. This is intended for Setting A caches with multiple
+    # non-identical demonstrations for one fixed goal.
+    cfg.metaworld.fixed_goal_random_start = False
+    # "auto" tries last/first/all goal slices and keeps the first one that
+    # preserves env._target_pos after reset. "all" is a safe fallback that
+    # reproduces the original frozen task instance.
+    cfg.metaworld.fixed_goal_random_start_goal_slice = 'auto'
+    cfg.metaworld.fixed_goal_random_start_goal_dims = 3
+    cfg.metaworld.fixed_goal_random_start_validate_goal = True
+    cfg.metaworld.fixed_goal_random_start_goal_tolerance = 1e-5
+    cfg.metaworld.fixed_goal_random_start_max_resample_calls = 256
 
     cfg.obs = ConfigDict()
     cfg.obs.variant = 'no_task_no_goal'
