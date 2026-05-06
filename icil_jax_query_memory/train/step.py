@@ -760,7 +760,10 @@ def create_train_step(
             task_contrast_inner = batch['contrast_inner'] if bool(use_memory_contrast) else batch['inner']
             base_rng = jax.random.fold_in(jax.random.PRNGKey(int(rng_seed)), state.step)
             base_rng = jax.random.fold_in(base_rng, jax.lax.axis_index('device'))
-            task_rngs = jax.random.split(base_rng, batch['inner']['target_action'].shape[0])
+            # Query-only baselines intentionally have inner_steps=0, so the
+            # sharded inner batch is empty. The query batch is always present
+            # and carries the task axis for every meta-objective variant.
+            task_rngs = jax.random.split(base_rng, batch['query']['target_action'].shape[0])
             task_losses, task_aux = jax.vmap(
                 lambda task_inner, task_query, wrong_inner, contrast_inner, task_rng: _task_meta_objective(
                     params,
