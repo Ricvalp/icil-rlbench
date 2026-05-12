@@ -22,6 +22,14 @@ def get_config():
     # goal-observable 39D states and query_zero_goal=False.
     cfg.sim.force_goal_observable = 'auto'
     cfg.sim.benchmark_seed = int(os.environ.get('ICIL_METAWORLD_BENCHMARK_SEED', '0'))
+    # Setting A only: preserve the MetaWorld task goal while resampling starts
+    # at evaluation time, matching the fixed-goal/random-start cache generator.
+    cfg.sim.fixed_goal_random_start = False
+    cfg.sim.fixed_goal_random_start_goal_slice = 'auto'
+    cfg.sim.fixed_goal_random_start_goal_dims = 3
+    cfg.sim.fixed_goal_random_start_validate_goal = True
+    cfg.sim.fixed_goal_random_start_goal_tolerance = 1e-5
+    cfg.sim.fixed_goal_random_start_max_resample_calls = 256
 
     cfg.video = ConfigDict()
     cfg.video.enable = True

@@ -1,0 +1,145 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+  cat <<'EOF'
+Usage:
+  ./eval_objectcentric_rollout SETTING CHECKPOINT [NUM_EPISODES]
+
+Examples:
+  ./eval_objectcentric_rollout A eval_checkpoints/izt0zuhl/step_0008000.pkl 20
+  ./eval_objectcentric_rollout B eval_checkpoints/gbzubxl9/step_0016000.pkl 20
+  ./eval_objectcentric_rollout C eval_checkpoints/gbzubxl9/step_0016000.pkl 20
+
+SETTING:
+  A  fixed goal, random-start cache, 16 non-identical task families
+  B  ML45 train families, same task family, different goal instance
+  C  ML45 held-out/test families, same task family, different goal instance
+
+Environment overrides:
+  ICIL_ROLLOUT_VIDEOS       true/false, default false
+  ICIL_ROLLOUT_MAX_STEPS    default 200
+  ICIL_ROLLOUT_EXECUTE      actions executed per predicted chunk, default 4
+  ICIL_ROLLOUT_OUTPUT_ROOT  default $ICIL_METAWORLD_OUTPUT_PARENT_DIR/objectcentric_rollout_eval
+  PYTHON                    default python
+EOF
+}
+
+if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
+  usage
+  exit 0
+fi
+
+if [[ $# -lt 2 || $# -gt 3 ]]; then
+  usage >&2
+  exit 2
+fi
+
+setting="$(printf '%s' "$1" | tr '[:lower:]' '[:upper:]')"
+checkpoint="$2"
+num_episodes="${3:-10}"
+
+if [[ ! -f "$checkpoint" ]]; then
+  echo "error: checkpoint not found: $checkpoint" >&2
+  exit 1
+fi
+
+if [[ ! "$num_episodes" =~ ^[0-9]+$ || "$num_episodes" -le 0 ]]; then
+  echo "error: NUM_EPISODES must be a positive integer; got $num_episodes" >&2
+  exit 2
+fi
+
+set +u
+if [[ -f env.sh ]]; then
+  source env.sh >/tmp/icil_eval_objectcentric_env.log 2>&1
+fi
+set -u
+
+A_TASKS='("basketball-v3","coffee-pull-v3","coffee-push-v3","peg-insert-side-v3","pick-place-v3","pick-place-wall-v3","push-back-v3","push-v3","push-wall-v3","reach-v3","reach-wall-v3","shelf-place-v3","soccer-v3","stick-pull-v3","stick-push-v3","sweep-into-v3")'
+
+case "$setting" in
+  A)
+    cache_root="${ICIL_METAWORLD_ML45_FIXED_GOAL_RANDOM_START_CACHE_ROOT:?ICIL_METAWORLD_ML45_FIXED_GOAL_RANDOM_START_CACHE_ROOT is not set}"
+    tasks="$A_TASKS"
+    sample_same_task_instance=True
+    fixed_goal_random_start=True
+    ;;
+  B)
+    cache_root="${ICIL_METAWORLD_ML45_GOAL_CACHE_ROOT:?ICIL_METAWORLD_ML45_GOAL_CACHE_ROOT is not set}"
+    tasks='()'
+    sample_same_task_instance=False
+    fixed_goal_random_start=False
+    ;;
+  C)
+    cache_root="${ICIL_METAWORLD_ML45_GOAL_TEST_CACHE_ROOT:?ICIL_METAWORLD_ML45_GOAL_TEST_CACHE_ROOT is not set}"
+    tasks='()'
+    sample_same_task_instance=False
+    fixed_goal_random_start=False
+    ;;
+  *)
+    echo "error: SETTING must be A, B, or C; got $setting" >&2
+    exit 2
+    ;;
+esac
+
+if [[ ! -d "$cache_root" ]]; then
+  echo "error: cache root not found: $cache_root" >&2
+  exit 1
+fi
+
+videos="${ICIL_ROLLOUT_VIDEOS:-false}"
+max_steps="${ICIL_ROLLOUT_MAX_STEPS:-200}"
+execute="${ICIL_ROLLOUT_EXECUTE:-4}"
+output_root="${ICIL_ROLLOUT_OUTPUT_ROOT:-${ICIL_METAWORLD_OUTPUT_PARENT_DIR:-output_metaworld}/objectcentric_rollout_eval}"
+python_bin="${PYTHON:-python}"
+
+export MUJOCO_GL="${MUJOCO_GL:-egl}"
+export XLA_PYTHON_CLIENT_PREALLOCATE="${XLA_PYTHON_CLIENT_PREALLOCATE:-false}"
+export PYTHONPATH="${PYTHONPATH:-.}"
+
+mkdir -p "$output_root"
+
+echo "[eval_objectcentric_rollout] setting=${setting}"
+echo "[eval_objectcentric_rollout] checkpoint=${checkpoint}"
+echo "[eval_objectcentric_rollout] cache=${cache_root}"
+echo "[eval_objectcentric_rollout] num_episodes=${num_episodes}"
+echo "[eval_objectcentric_rollout] videos=${videos}"
+
+"$python_bin" diagnostics/jax_metaworld_adaptation_rollout_diagnostic.py \
+  --config=configs/jax_metaworld_adaptation_rollout_diagnostic.py \
+  --config.checkpoint_path="$checkpoint" \
+  --config.data.cache_root="$cache_root" \
+  --config.data.tasks="$tasks" \
+  --config.data.sample_same_task_instance="$sample_same_task_instance" \
+  --config.data.preload_to_memory=True \
+  --config.sim.fixed_goal_random_start="$fixed_goal_random_start" \
+  --config.rollout.num_episodes="$num_episodes" \
+  --config.rollout.max_steps="$max_steps" \
+  --config.rollout.execute_actions_per_plan="$execute" \
+  --config.video.enable="$videos" \
+  --config.output.root_dir="$output_root"
+
+latest_summary="$(
+  find "$output_root/jax_metaworld_adaptation_rollout" -mindepth 2 -maxdepth 2 -name summary.json -printf '%T@ %p\n' 2>/dev/null \
+    | sort -n \
+    | tail -n 1 \
+    | cut -d' ' -f2-
+)"
+
+if [[ -n "$latest_summary" ]]; then
+  "$python_bin" - "$latest_summary" <<'PY'
+import json
+import sys
+
+path = sys.argv[1]
+with open(path, 'r', encoding='utf-8') as f:
+    summary = json.load(f)
+print(f"[eval_objectcentric_rollout] summary={path}")
+for label, item in summary.get('summary', {}).items():
+    print(
+        f"{label}: success_rate={item.get('success_rate', 0.0):.3f} "
+        f"mean_return={item.get('mean_return', 0.0):.3f} "
+        f"num_episodes={item.get('num_episodes', 0)}"
+    )
+PY
+fi

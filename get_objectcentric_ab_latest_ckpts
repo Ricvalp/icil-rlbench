@@ -1,0 +1,99 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+  cat <<'EOF'
+Usage:
+  ./get_objectcentric_ab_latest_ckpts
+
+Copies the latest step_*.pkl checkpoint for the hardcoded object-centric
+MetaWorld Setting A/B runs into:
+  eval_checkpoints/<wandb_run_id>/step_*.pkl
+
+Environment overrides:
+  ICIL_JAX_CKPT_REMOTE_HOST  Remote SSH host.
+                             Default: rvalperga@snellius.surf.nl
+  ICIL_JAX_CKPT_REMOTE_DIR   Remote checkpoint root.
+                             Default: /projects/prjs1905/robotics/metaworld/icil_runs/checkpoints
+  ICIL_EVAL_CKPT_DIR         Local output root.
+                             Default: eval_checkpoints
+
+Hardcoded runs:
+  A0 7hy5ph2l
+  A1 zrcu9r0y
+  A2 psa4nu0u
+  A3 izt0zuhl
+  A4 63f7osmk
+  B0 o6emiqtj
+  B1 gbzubxl9
+  B2 5rxlzxyl
+  B3 j6vptohf
+  B4 pb093u2p
+EOF
+}
+
+if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
+  usage
+  exit 0
+fi
+
+if [[ $# -ne 0 ]]; then
+  usage >&2
+  exit 2
+fi
+
+if ! command -v rsync >/dev/null 2>&1; then
+  echo "error: rsync not found in PATH" >&2
+  exit 1
+fi
+
+if ! command -v ssh >/dev/null 2>&1; then
+  echo "error: ssh not found in PATH" >&2
+  exit 1
+fi
+
+remote_host="${ICIL_JAX_CKPT_REMOTE_HOST:-rvalperga@snellius.surf.nl}"
+remote_dir="${ICIL_JAX_CKPT_REMOTE_DIR:-/projects/prjs1905/robotics/metaworld/icil_runs/checkpoints}"
+local_root="${ICIL_EVAL_CKPT_DIR:-eval_checkpoints}"
+
+runs=(
+  "A0:7hy5ph2l"
+  "A1:zrcu9r0y"
+  "A2:psa4nu0u"
+  "A3:izt0zuhl"
+  "A4:63f7osmk"
+  "B0:o6emiqtj"
+  "B1:gbzubxl9"
+  "B2:5rxlzxyl"
+  "B3:j6vptohf"
+  "B4:pb093u2p"
+)
+
+echo "[get_objectcentric_ab_latest_ckpts] remote: ${remote_host}:${remote_dir}"
+echo "[get_objectcentric_ab_latest_ckpts] local:  ${local_root}"
+
+for item in "${runs[@]}"; do
+  label="${item%%:*}"
+  run_id="${item#*:}"
+  remote_run_dir="${remote_dir%/}/${run_id}"
+
+  echo
+  echo "[${label}] resolving latest checkpoint for run ${run_id}"
+  latest="$(
+    ssh "$remote_host" "set -euo pipefail; find '$remote_run_dir' -maxdepth 1 -type f -name 'step_*.pkl' -printf '%f\n' | sort | tail -n 1"
+  )"
+
+  if [[ -z "$latest" ]]; then
+    echo "[${label}] no step_*.pkl found under ${remote_run_dir}" >&2
+    exit 1
+  fi
+
+  local_dir="${local_root%/}/${run_id}"
+  mkdir -p "$local_dir"
+
+  echo "[${label}] copying ${latest}"
+  rsync -rL --progress "${remote_host}:${remote_run_dir}/${latest}" "${local_dir}/"
+done
+
+echo
+echo "[get_objectcentric_ab_latest_ckpts] done"

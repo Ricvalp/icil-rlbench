@@ -397,16 +397,18 @@ def prepare_support_inner(
     memory_cfg: QueryMemoryMetaConfig,
     rng: np.random.Generator,
 ) -> Dict[str, np.ndarray]:
-    if int(memory_cfg.inner_steps) <= 0:
-        return {}
-    num_inner_batches = int(memory_cfg.inner_steps) if int(memory_cfg.num_inner_batches) <= 0 else min(
-        int(memory_cfg.num_inner_batches), int(memory_cfg.inner_steps)
+    # Support-encoder checkpoints still need support tensors when we override
+    # inner_steps=0: there are zero gradient updates, but M0 is constructed from
+    # support chunks. Build one support batch for memory initialization.
+    stack_steps = max(1, int(memory_cfg.inner_steps))
+    num_inner_batches = stack_steps if int(memory_cfg.num_inner_batches) <= 0 else min(
+        int(memory_cfg.num_inner_batches), stack_steps
     )
     batches = [
         builder.build_support_batch(task, count=int(memory_cfg.num_queries_per_step), rng=rng)
         for _ in range(max(1, num_inner_batches))
     ]
-    return stack_inner_batches(batches, inner_steps=int(memory_cfg.inner_steps))
+    return stack_inner_batches(batches, inner_steps=stack_steps)
 
 
 def adapt_memory_for_task(
